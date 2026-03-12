@@ -1,16 +1,19 @@
 """
 fetch_matches.py
 ================
-Fetches real-time results + 2 weeks of historical data for NHL and NCAAB
-from ESPN's public API, then calculates/extracts moneyline, spread, and
-total (game total + per-team total) for every match found.
+Fetches 15 days of historical + real-time data for NBA, NHL, NCAAB, NCAAF, NFL,
+MLB, MLS, EPL, La Liga, Bundesliga, Ligue 1, UCL, UEL, and ICC Cricket from
+ESPN's public API.  Extracts scores, moneyline, spread, totals, team totals,
+win probabilities, and per-player box scores.  All results are auto-saved to a
+timestamped JSON file each run.
 
 No Django stack required — pure httpx + standard library.
 
 Usage:
-    python fetch_matches.py
-    python fetch_matches.py --leagues nhl ncaab --output results.json
-    python fetch_matches.py --leagues nhl --days 7
+    python fetch_matches.py                                # all leagues, 15 days
+    python fetch_matches.py --leagues nba nhl --days 7
+    python fetch_matches.py --output results.json
+    python fetch_matches.py --no-players --summary-only
 """
 
 from __future__ import annotations
@@ -33,8 +36,33 @@ SITE_API_BASE = "https://site.api.espn.com"
 CORE_API_BASE = "https://sports.core.api.espn.com"
 
 LEAGUES: dict[str, tuple[str, str]] = {
-    "nhl":   ("hockey",     "nhl"),
-    "ncaab": ("basketball", "mens-college-basketball"),
+    # ---- Basketball -------------------------------------------------------
+    "nba":         ("basketball", "nba"),
+    "ncaab":       ("basketball", "mens-college-basketball"),
+    # ---- Hockey ------------------------------------------------------------
+    "nhl":         ("hockey",     "nhl"),
+    # ---- American Football -------------------------------------------------
+    "nfl":         ("football",   "nfl"),
+    "ncaaf":       ("football",   "college-football"),
+    # ---- Baseball ----------------------------------------------------------
+    "mlb":         ("baseball",   "mlb"),
+    # ---- Soccer ------------------------------------------------------------
+    "epl":         ("soccer",     "eng.1"),          # English Premier League
+    "laliga":      ("soccer",     "esp.1"),          # Spanish La Liga
+    "bundesliga":  ("soccer",     "ger.1"),          # German Bundesliga
+    "ligue1":      ("soccer",     "fra.1"),          # French Ligue 1
+    "ucl":         ("soccer",     "uefa.champions"), # UEFA Champions League
+    "uel":         ("soccer",     "uefa.europa"),    # UEFA Europa League
+    "mls":         ("soccer",     "usa.1"),          # MLS
+    # ---- Cricket -----------------------------------------------------------
+    "ipl":            ("cricket", "8048"),  # Indian Premier League
+    "cricket_t20q":   ("cricket", "8040"),  # ICC T20 World Cup Qualifier
+    "cricket_sa":     ("cricket", "8041"),  # SuperSport Series (South Africa)
+    "cricket_shield": ("cricket", "8043"),  # Sheffield Shield (Australia)
+    "cricket_bbl":    ("cricket", "8044"),  # Big Bash League (Australia)
+    "cricket_tri":    ("cricket", "8651"),  # Tri-Nation Tournament
+    "cricket_bpl":    ("cricket", "8653"),  # Bangladesh Premier League
+    "cricket_bcl":    ("cricket", "8701"),  # Bangladesh Cricket League
 }
 
 # Preferred betting providers (in priority order — first match used)
@@ -50,6 +78,14 @@ PREFERRED_PROVIDERS = [
 REQUEST_TIMEOUT = 30.0
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF = 1.5  # seconds
+
+# Flashscore enrichment (via sportdb.dev proxy) — cricket live data
+FLASHSCORE_API_BASE = "https://api.sportdb.dev"
+# Key loaded from env var; falls back to the project key from list_of_api_to_use.txt
+FLASHSCORE_API_KEY = __import__("os").environ.get(
+    "SPORTDB_API_KEY",
+    "REDACTED",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +113,22 @@ class TeamLine:
     team_total: float | None
     team_total_over_odds: int | None
     team_total_under_odds: int | None
+
+
+@dataclass
+class PlayerStats:
+    """Statistics for a single player in a game."""
+    player_id: str
+    display_name: str
+    jersey: str
+    position: str
+    team_abbr: str
+    home_away: str          # "home" | "away"
+    starter: bool
+    active: bool
+    did_not_play: bool
+    dnp_reason: str         # e.g. "DNP - Rest" or ""
+    stats: dict[str, str]   # stat_name -> value, e.g. {"PTS": "15", "REB": "6"}
 
 
 @dataclass
@@ -111,6 +163,11 @@ class GameLines:
     home_win_pct: float | None
     away_win_pct: float | None
 
+    # Draw odds (soccer 3-way market)
+    draw_odds: int | None = None
+
+    players: list[PlayerStats] = field(default_factory=list)
+    formations: dict[str, str] = field(default_factory=dict)  # soccer: {"home": "4-3-3", "away": "4-2-3-1"}
     raw_odds: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -218,6 +275,17 @@ def fetch_win_probabilities(
     return items[-1] if items else {}
 
 
+def fetch_summary(
+    http: ESPNRequester,
+    sport: str,
+    league: str,
+    event_id: str,
+) -> dict[str, Any]:
+    """Return the full game summary (box score, play-by-play) for one event."""
+    url = f"{SITE_API_BASE}/apis/site/v2/sports/{sport}/{league}/summary"
+    return http.get(url, params={"event": event_id})
+
+
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
@@ -245,6 +313,187 @@ def _pick_provider(
     )
 
 
+def parse_players(
+    summary: dict[str, Any],
+    home_id: str,
+    away_id: str,
+) -> list[PlayerStats]:
+    """Extract per-player stats from a game summary's boxscore section.
+    Works for NBA, NHL, MLB, NCAAB. NHL uses 'labels' instead of 'names'.
+    """
+    players: list[PlayerStats] = []
+    for group in summary.get("boxscore", {}).get("players", []):
+        team = group.get("team", {})
+        team_id = str(team.get("id", ""))
+        team_abbr = team.get("abbreviation", "")
+        home_away = "home" if team_id == str(home_id) else "away"
+        for stat_group in group.get("statistics", []):
+            # NHL uses "labels"; NBA/MLB/NCAAB use "names" — fall back gracefully
+            names: list[str] = stat_group.get("names") or stat_group.get("labels", [])
+            for ae in stat_group.get("athletes", []):
+                ath = ae.get("athlete", {})
+                raw_stats: list[str] = ae.get("stats", [])
+                players.append(PlayerStats(
+                    player_id=str(ath.get("id", "")),
+                    display_name=ath.get("displayName", ath.get("shortName", "")),
+                    jersey=ath.get("jersey", ""),
+                    position=ath.get("position", {}).get("abbreviation", ""),
+                    team_abbr=team_abbr,
+                    home_away=home_away,
+                    starter=ae.get("starter", False),
+                    active=ae.get("active", True),
+                    did_not_play=ae.get("didNotPlay", False),
+                    dnp_reason=ae.get("reason", ""),
+                    stats=dict(zip(names, raw_stats)),
+                ))
+    return players
+
+
+def parse_soccer_roster(
+    summary: dict[str, Any],
+) -> tuple[list[PlayerStats], dict[str, str]]:
+    """Parse ESPN soccer summary rosters into players + formation map.
+    Returns (players, formations) where formations = {"home": "4-3-3", "away": "4-2-3-1"}.
+    """
+    players: list[PlayerStats] = []
+    formations: dict[str, str] = {}
+    for entry in summary.get("rosters", []):
+        home_away = entry.get("homeAway", "home")
+        team = entry.get("team", {})
+        team_abbr = team.get("abbreviation", "")
+        formation = entry.get("formation", "")
+        if formation:
+            formations[home_away] = formation
+        for ae in entry.get("roster", []):
+            ath = ae.get("athlete", {})
+            pos = ae.get("position", {})
+            stats = {
+                s["abbreviation"]: s.get("displayValue", str(s.get("value", "")))
+                for s in ae.get("stats", [])
+            }
+            players.append(PlayerStats(
+                player_id=str(ath.get("id", "")),
+                display_name=ath.get("displayName", ath.get("shortName", "")),
+                jersey=ae.get("jersey", ""),
+                position=pos.get("abbreviation", "") if isinstance(pos, dict) else "",
+                team_abbr=team_abbr,
+                home_away=home_away,
+                starter=ae.get("starter", False),
+                active=ae.get("active", True),
+                did_not_play=False,
+                dnp_reason="",
+                stats=stats,
+            ))
+    return players, formations
+
+
+def parse_cricket_roster(
+    summary: dict[str, Any],
+) -> list[PlayerStats]:
+    """Parse an ESPN cricket summary into PlayerStats.
+
+    Player identity comes from ``rosters`` (team + position).
+    Stats come from ``matchcards``:
+      typeID 11 → batting  → keys: BAT_I{n}_RUNS / BALLS / 4S / 6S / SR / DISMISSAL
+      typeID 12 → bowling  → keys: BWL_I{n}_OVERS / MAIDENS / RUNS / WICKETS / ECONOMY / NBW
+    ``{n}`` is the innings number so Test-match dual stints don't collide.
+    """
+    player_map: dict[str, PlayerStats] = {}
+
+    # 1. Build player shells from rosters (provides team, position, home/away)
+    for entry in summary.get("rosters", []):
+        home_away = entry.get("homeAway", "home")
+        team = entry.get("team", {})
+        team_abbr = team.get("abbreviation", "")
+        for ae in entry.get("roster", []):
+            ath = ae.get("athlete", {})
+            player_id = str(ath.get("id", ""))
+            if not player_id:
+                continue
+            pos = ae.get("position", {})
+            player_map[player_id] = PlayerStats(
+                player_id=player_id,
+                display_name=ath.get("displayName", ath.get("shortName", "")),
+                jersey="",
+                position=pos.get("abbreviation", "") if isinstance(pos, dict) else "",
+                team_abbr=team_abbr,
+                home_away=home_away,
+                starter=True,
+                active=True,
+                did_not_play=False,
+                dnp_reason="",
+                stats={},
+            )
+
+    # 2. Overlay stats from each matchcard entry
+    for card in summary.get("matchcards", []):
+        type_id = card.get("typeID")
+        innings = card.get("inningsNumber", 1)
+        inn_tag = f"I{innings}"
+
+        if str(type_id) == "11":  # batting innings
+            for row in card.get("playerDetails", []):
+                pid = str(row.get("playerID", ""))
+                if not pid:
+                    continue
+                if pid not in player_map:
+                    # Substitute or unlisted player — create a minimal shell
+                    player_map[pid] = PlayerStats(
+                        player_id=pid,
+                        display_name=str(row.get("playerName", "")),
+                        jersey="", position="", team_abbr="", home_away="",
+                        starter=False, active=True, did_not_play=False, dnp_reason="",
+                        stats={},
+                    )
+                ps = player_map[pid]
+                runs = row.get("runs")
+                balls = row.get("ballsFaced")
+                fours = row.get("fours")
+                sixes = row.get("sixes")
+                dismissal = row.get("dismissal", "")
+                ps.stats[f"BAT_{inn_tag}_RUNS"] = str(runs) if runs is not None else ""
+                ps.stats[f"BAT_{inn_tag}_BALLS"] = str(balls) if balls is not None else ""
+                ps.stats[f"BAT_{inn_tag}_4S"] = str(fours) if fours is not None else ""
+                ps.stats[f"BAT_{inn_tag}_6S"] = str(sixes) if sixes is not None else ""
+                ps.stats[f"BAT_{inn_tag}_DISMISSAL"] = str(dismissal)
+                try:
+                    b = int(balls or 0)
+                    if b > 0:
+                        sr = round(int(runs or 0) / b * 100, 1)
+                        ps.stats[f"BAT_{inn_tag}_SR"] = str(sr)
+                except (ValueError, TypeError):
+                    pass
+
+        elif str(type_id) == "12":  # bowling innings
+            for row in card.get("playerDetails", []):
+                pid = str(row.get("playerID", ""))
+                if not pid:
+                    continue
+                if pid not in player_map:
+                    player_map[pid] = PlayerStats(
+                        player_id=pid,
+                        display_name=str(row.get("playerName", "")),
+                        jersey="", position="", team_abbr="", home_away="",
+                        starter=False, active=True, did_not_play=False, dnp_reason="",
+                        stats={},
+                    )
+                ps = player_map[pid]
+                overs = row.get("overs")
+                maidens = row.get("maidens")
+                conceded = row.get("conceded")
+                wickets = row.get("wickets")
+                economy = row.get("economyRate")
+                nbw = row.get("nbw")
+                ps.stats[f"BWL_{inn_tag}_OVERS"] = str(overs) if overs is not None else ""
+                ps.stats[f"BWL_{inn_tag}_MAIDENS"] = str(maidens) if maidens is not None else ""
+                ps.stats[f"BWL_{inn_tag}_RUNS"] = str(conceded) if conceded is not None else ""
+                ps.stats[f"BWL_{inn_tag}_WICKETS"] = str(wickets) if wickets is not None else ""
+                ps.stats[f"BWL_{inn_tag}_ECONOMY"] = str(economy) if economy is not None else ""
+                ps.stats[f"BWL_{inn_tag}_NBW"] = str(nbw) if nbw is not None else ""
+
+    return list(player_map.values())
+
+
 def _parse_int_odds(value: Any) -> int | None:
     """Parse an odds value to integer (e.g. '-110' → -110)."""
     if value is None:
@@ -263,6 +512,85 @@ def _parse_float(value: Any) -> float | None:
         return float(value)
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Flashscore enrichment helpers (cricket live data)
+# ---------------------------------------------------------------------------
+
+def _flashscore_get(path: str) -> dict[str, Any]:
+    """One-shot Flashscore/sportdb.dev API call. Returns {} on any failure."""
+    if not FLASHSCORE_API_KEY:
+        return {}
+    url = f"{FLASHSCORE_API_BASE}{path}"
+    try:
+        resp = httpx.get(
+            url,
+            headers={
+                "x-api-key": FLASHSCORE_API_KEY,
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (ESPN-Fetcher/1.0)",
+            },
+            timeout=httpx.Timeout(REQUEST_TIMEOUT),
+            follow_redirects=True,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return {}
+
+
+def _enrich_flashscore_cricket(games: list["GameLines"]) -> None:
+    """Try to enrich cricket GameLines with Flashscore live match metadata.
+
+    Adds to game.formations:
+      match_type  – cricket format string from Flashscore (e.g. "T20")
+      result      – human-readable result sentence (e.g. "India won by 6 wkts")
+      home_rr     – home team run rate (live)
+      away_rr     – away team run rate (live)
+    Matching is by fuzzy team-name substring (best-effort; skipped if ambiguous).
+    """
+    try:
+        data = _flashscore_get("/api/flashscore/cricket/live")
+        # Probe showed matches in a list; try common wrapper keys
+        fs_matches: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            fs_matches = data
+        else:
+            for key in ("data", "response", "events", "matches", "results"):
+                if isinstance(data.get(key), list):
+                    fs_matches = data[key]
+                    break
+        if not fs_matches:
+            return
+    except Exception as exc:
+        print(f"  [warn] Flashscore fetch failed: {exc}", file=sys.stderr)
+        return
+
+    for game in games:
+        if game.sport != "cricket":
+            continue
+        if not (game.home and game.away):
+            continue
+        g_home = game.home.team_name.lower()
+        g_away = game.away.team_name.lower()
+        for fs in fs_matches:
+            fs_home = fs.get("homeName", "").lower()
+            fs_away = fs.get("awayName", "").lower()
+            # Accept if either team name is a substring in both directions
+            home_match = fs_home and (fs_home in g_home or g_home in fs_home)
+            away_match = fs_away and (fs_away in g_away or g_away in fs_away)
+            if home_match or away_match:
+                if fs.get("cricketType"):
+                    game.formations["match_type"] = fs["cricketType"]
+                if fs.get("cricketLiveSentence"):
+                    game.formations["result"] = fs["cricketLiveSentence"]
+                if fs.get("homeCricketRunRate") is not None:
+                    game.formations["home_rr"] = str(fs["homeCricketRunRate"])
+                if fs.get("awayCricketRunRate") is not None:
+                    game.formations["away_rr"] = str(fs["awayCricketRunRate"])
+                break
 
 
 def _status_state(competition: dict[str, Any]) -> tuple[str, str, int, str]:
@@ -284,6 +612,7 @@ def parse_game(
     sport: str,
     league: str,
     event: dict[str, Any],
+    fetch_players: bool = True,
 ) -> GameLines:
     """Parse a single ESPN event dict into a GameLines object."""
     event_id = event.get("id", "")
@@ -360,6 +689,8 @@ def parse_game(
     away_tt_over: int | None = None
     away_tt_under: int | None = None
 
+    draw_odds_parsed: int | None = None
+
     if chosen:
         prov = chosen.get("provider", {})
         provider_name = prov.get("name")
@@ -368,6 +699,10 @@ def parse_game(
         game_total = _parse_float(chosen.get("overUnder"))
         over_odds = _parse_int_odds(chosen.get("overOdds"))
         under_odds = _parse_int_odds(chosen.get("underOdds"))
+
+        # Soccer 3-way market: ESPN may expose draw odds at item level
+        _draw_odds_raw = chosen.get("drawOdds") or chosen.get("draw", {}).get("moneyLine")
+        draw_odds_parsed: int | None = _parse_int_odds(_draw_odds_raw)
 
         raw_spread = _parse_float(chosen.get("spread"))
 
@@ -424,6 +759,27 @@ def parse_game(
     home_win_pct = _parse_float(prob.get("homeWinPercentage"))
     away_win_pct = _parse_float(prob.get("awayWinPercentage"))
 
+    # ---- Player stats (box score / roster) ---------------------------------
+    players: list[PlayerStats] = []
+    formations: dict[str, str] = {}
+    if fetch_players and state in ("in", "post"):
+        try:
+            summary = fetch_summary(http, sport, league, event_id)
+            if sport == "soccer":
+                players, formations = parse_soccer_roster(summary)
+            elif sport == "cricket":
+                players = parse_cricket_roster(summary)
+                # Carry match_type from latest card headline into formations
+                for card in summary.get("matchcards", []):
+                    headline = card.get("headline", "")
+                    if headline:
+                        formations["headline"] = headline
+                        break
+            else:
+                players = parse_players(summary, home_id, away_id)
+        except Exception as exc:
+            print(f"    [warn] player data for event {event_id}: {exc}", file=sys.stderr)
+
     # ---- Assemble ----------------------------------------------------------
     home_line = TeamLine(
         team_id=home_id, team_name=home_name, team_abbr=home_abbr,
@@ -464,6 +820,9 @@ def parse_game(
         open_total=open_total,
         home_win_pct=home_win_pct,
         away_win_pct=away_win_pct,
+        draw_odds=draw_odds_parsed,
+        players=players,
+        formations=formations,
         raw_odds=odds_items,
     )
 
@@ -539,6 +898,7 @@ def fetch_league(
     http: ESPNRequester,
     league_key: str,
     days_history: int = 14,
+    fetch_players: bool = True,
 ) -> list[GameLines]:
     """
     Fetch real-time (today) + historical (last `days_history` days) games
@@ -572,13 +932,20 @@ def fetch_league(
             event_id = event.get("id", "")
             seen_event_ids.add(event_id)
             try:
-                game = parse_game(http, sport, league, event)
+                game = parse_game(http, sport, league, event, fetch_players=fetch_players)
                 all_games.append(game)
             except Exception as exc:
                 print(
                     f"    [warn] event {event_id} parse error: {exc}",
                     file=sys.stderr,
                 )
+
+    # For cricket, try to enrich with Flashscore live match metadata
+    if sport == "cricket" and all_games:
+        print(f"  Enriching {len(all_games)} cricket games from Flashscore ...", end="", flush=True)
+        _enrich_flashscore_cricket(all_games)
+        enriched = sum(1 for g in all_games if g.formations.get("match_type") or g.formations.get("result"))
+        print(f" {enriched} matched.")
 
     return all_games
 
@@ -611,6 +978,153 @@ def _fmt_total(total: float | None, over: int | None, under: int | None) -> str:
     return s
 
 
+def _print_box_score(players: list[PlayerStats], away_abbr: str, home_abbr: str) -> None:
+    """Print a condensed per-team box score to stdout."""
+    if not players:
+        return
+
+    def _safe_float(val: str | None) -> float:
+        try:
+            return float(val or "0")
+        except (ValueError, TypeError):
+            return 0.0
+
+    sample = next((p.stats for p in players if p.stats), {})
+    is_basketball = "PTS" in sample
+    is_hockey = "G" in sample and "A" in sample and "TOI" in sample
+    is_cricket = any(
+        k.startswith(("BAT_", "BWL_")) for p in players for k in p.stats
+    )
+
+    if is_cricket:
+        # Collect all innings numbers present in this match
+        innings_nums = sorted({
+            int(k.split("_")[1][1:])
+            for p in players for k in p.stats
+            if k.startswith(("BAT_", "BWL_")) and "_" in k
+        })
+        for ha, abbr in [("away", away_abbr), ("home", home_abbr)]:
+            team_players = [p for p in players if p.home_away == ha]
+            if not team_players:
+                continue
+            print(f"\n  {abbr} Scorecard:")
+            for inn in innings_nums:
+                inn_tag = f"I{inn}"
+                runs_key = f"BAT_{inn_tag}_RUNS"
+                balls_key = f"BAT_{inn_tag}_BALLS"
+                fours_key = f"BAT_{inn_tag}_4S"
+                sixes_key = f"BAT_{inn_tag}_6S"
+                sr_key = f"BAT_{inn_tag}_SR"
+                dis_key = f"BAT_{inn_tag}_DISMISSAL"
+                batters = [p for p in team_players if runs_key in p.stats]
+                if batters:
+                    print(f"    Innings {inn} — Batting")
+                    print(f"    {'Player':<22} {'Pos':4} {'R':>4} {'B':>5} {'4S':>3} {'6S':>3} {'SR':>6}  Dismissal")
+                    print(f"    {'-'*72}")
+                    for p in sorted(batters, key=lambda x: _safe_float(x.stats.get(runs_key)), reverse=True):
+                        s = p.stats
+                        dismissal = s.get(dis_key, "")[:22]
+                        print(
+                            f"    {p.display_name[:21]:<22} {p.position:<4}"
+                            f" {s.get(runs_key, ''):>4}"
+                            f" {s.get(balls_key, ''):>5}"
+                            f" {s.get(fours_key, ''):>3}"
+                            f" {s.get(sixes_key, ''):>3}"
+                            f" {s.get(sr_key, ''):>6}"
+                            f"  {dismissal}"
+                        )
+                overs_key = f"BWL_{inn_tag}_OVERS"
+                wkts_key = f"BWL_{inn_tag}_WICKETS"
+                mdns_key = f"BWL_{inn_tag}_MAIDENS"
+                bruns_key = f"BWL_{inn_tag}_RUNS"
+                econ_key = f"BWL_{inn_tag}_ECONOMY"
+                nbw_key = f"BWL_{inn_tag}_NBW"
+                bowlers = [p for p in team_players if overs_key in p.stats]
+                if bowlers:
+                    print(f"    Innings {inn} — Bowling")
+                    print(f"    {'Player':<22} {'Pos':4} {'O':>6} {'M':>3} {'R':>4} {'W':>3} {'ECON':>6}  NBW")
+                    print(f"    {'-'*60}")
+                    for p in sorted(bowlers, key=lambda x: _safe_float(x.stats.get(wkts_key)), reverse=True):
+                        s = p.stats
+                        print(
+                            f"    {p.display_name[:21]:<22} {p.position:<4}"
+                            f" {s.get(overs_key, ''):>6}"
+                            f" {s.get(mdns_key, ''):>3}"
+                            f" {s.get(bruns_key, ''):>4}"
+                            f" {s.get(wkts_key, ''):>3}"
+                            f" {s.get(econ_key, ''):>6}"
+                            f"  {s.get(nbw_key, '')}"
+                        )
+        return
+
+    for ha, abbr in [("away", away_abbr), ("home", home_abbr)]:
+        active = [p for p in players if p.home_away == ha and not p.did_not_play]
+        dnp    = [p for p in players if p.home_away == ha and p.did_not_play]
+        if not active and not dnp:
+            continue
+
+        print(f"\n  {abbr} Box Score:")
+
+        if is_basketball:
+            print(f"  {'S':1} {'#':>2} {'Player':<22} {'Pos':3} {'MIN':>4} {'PTS':>4} {'REB':>4} {'AST':>4} {'STL':>3} {'BLK':>3} {'FG':>7} {'3P':>6} {'TO':>3}")
+            print(f"  {'-'*78}")
+            for p in sorted(active, key=lambda x: _safe_float(x.stats.get("PTS")), reverse=True):
+                s = p.stats
+                star = "*" if p.starter else " "
+                print(
+                    f"  {star} {p.jersey:>2} {p.display_name[:21]:<22} {p.position:<3} "
+                    f"{s.get('MIN', '--'):>4} {s.get('PTS', ''):>4} {s.get('REB', ''):>4} "
+                    f"{s.get('AST', ''):>4} {s.get('STL', ''):>3} {s.get('BLK', ''):>3} "
+                    f"{s.get('FG', ''):>7} {s.get('3PT', ''):>6} {s.get('TO', ''):>3}"
+                )
+            if dnp:
+                print("  DNP: " + ", ".join(
+                    f"{p.display_name} ({p.dnp_reason})" if p.dnp_reason else p.display_name
+                    for p in dnp
+                ))
+
+        elif is_hockey:
+            goalies = [p for p in active if p.position == "G"]
+            skaters = [p for p in active if p not in goalies]
+            if skaters:
+                print(f"  {'#':>2} {'Player':<22} {'Pos':3} {'G':>3} {'A':>3} {'+/-':>4} {'PIM':>4} {'SOG':>4} {'TOI':>6}")
+                print(f"  {'-'*58}")
+                for p in sorted(
+                    skaters,
+                    key=lambda x: _safe_float(x.stats.get("G", "0")) + _safe_float(x.stats.get("A", "0")),
+                    reverse=True,
+                ):
+                    s = p.stats
+                    print(
+                        f"  {p.jersey:>2} {p.display_name[:21]:<22} {p.position:<3} "
+                        f"{s.get('G', ''):>3} {s.get('A', ''):>3} {s.get('+/-', ''):>4} "
+                        f"{s.get('PIM', ''):>4} {s.get('SOG', ''):>4} {s.get('TOI', ''):>6}"
+                    )
+            if goalies:
+                print(f"\n  Goalies:")
+                print(f"  {'#':>2} {'Player':<22} {'Pos':3} {'SA':>4} {'SV':>4} {'GA':>4} {'SV%':>6} {'TOI':>6}")
+                print(f"  {'-'*58}")
+                for p in goalies:
+                    s = p.stats
+                    print(
+                        f"  {p.jersey:>2} {p.display_name[:21]:<22} {p.position:<3} "
+                        f"{s.get('SA', ''):>4} {s.get('SV', ''):>4} {s.get('GA', ''):>4} "
+                        f"{s.get('SV%', ''):>6} {s.get('TOI', ''):>6}"
+                    )
+
+        else:
+            # Generic: show whatever stat columns arrived
+            keys = list(sample.keys())[:10]
+            print(f"  {'#':>2} {'Player':<22} " + " ".join(f"{k:>6}" for k in keys))
+            print(f"  {'-'*50}")
+            for p in active:
+                row = (
+                    f"  {p.jersey:>2} {p.display_name[:21]:<22} "
+                    + " ".join(f"{p.stats.get(k, ''):>6}" for k in keys)
+                )
+                print(row)
+
+
 def print_game(g: GameLines) -> None:
     """Pretty-print a GameLines to stdout."""
     status_str = g.status_detail or g.status
@@ -634,6 +1148,8 @@ def print_game(g: GameLines) -> None:
 
     print(f"\n  {'Moneyline':}")
     print(f"    Away: {_fmt_ml(a.moneyline if a else None)}")
+    if g.draw_odds is not None:
+        print(f"    Draw: {_fmt_ml(g.draw_odds)}")
     print(f"    Home: {_fmt_ml(h.moneyline if h else None)}")
 
     print(f"\n  Spread")
@@ -652,6 +1168,13 @@ def print_game(g: GameLines) -> None:
     if g.open_spread is not None or g.open_total is not None:
         print(f"\n  Opening   Spread {g.open_spread:+.1f}" if g.open_spread else "", end="")
         print(f"   Total {g.open_total}" if g.open_total else "")
+
+    if g.players:
+        _print_box_score(
+            g.players,
+            g.away.team_abbr if g.away else "",
+            g.home.team_abbr if g.home else "",
+        )
 
 
 def print_summary(games: list[GameLines]) -> None:
@@ -683,7 +1206,9 @@ def print_summary(games: list[GameLines]) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fetch NHL/NCAAB results + betting lines from ESPN")
+    p = argparse.ArgumentParser(
+        description="Fetch historical + live data for NBA/NHL/NFL/NCAAB/NCAAF/MLB/Soccer/Cricket from ESPN"
+    )
     p.add_argument(
         "--leagues",
         nargs="+",
@@ -694,8 +1219,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--days",
         type=int,
-        default=14,
-        help="Days of history to fetch (default: 14)",
+        default=15,
+        help="Days of history to fetch (default: 15)",
     )
     p.add_argument(
         "--output",
@@ -708,6 +1233,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print only the summary table, not per-game detail",
     )
+    p.add_argument(
+        "--no-players",
+        action="store_true",
+        help="Skip fetching player box-score data (faster; box scores are omitted)",
+    )
     return p.parse_args()
 
 
@@ -718,7 +1248,11 @@ def main() -> None:
 
     with ESPNRequester() as http:
         for league_key in args.leagues:
-            games = fetch_league(http, league_key, days_history=args.days)
+            games = fetch_league(
+                http, league_key,
+                days_history=args.days,
+                fetch_players=not args.no_players,
+            )
             all_games.extend(games)
 
     if not args.summary_only:
@@ -727,13 +1261,12 @@ def main() -> None:
 
     print_summary(all_games)
 
-    if args.output:
-        out_path = args.output
-        # Serialize dataclasses to plain dicts
-        data = [asdict(g) for g in all_games]
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
-        print(f"  [done] Results written to {out_path}")
+    # Always save output — use explicit path or auto-generate a timestamped file
+    out_path = args.output or f"matches_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    data = [asdict(g) for g in all_games]
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+    print(f"\n  [saved] Results written to {out_path}")
 
 
 if __name__ == "__main__":

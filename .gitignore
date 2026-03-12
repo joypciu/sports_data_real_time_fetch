@@ -1,0 +1,36 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ── Database ─────────────────────────────────────────────────────────────────
+# DuckDB files (regeneratable via build_db.py)
+db/*.db
+db/*.wal
+# Historical game data (large, regeneratable via daily_ingest.py)
+data/
+
+# Live monitor output (regeneratable via realtime_monitor.py)
+live/
+
+# Atomic write temp files
+*.tmp
+*.json.tmp
+
+# Stray output / scratch files
+matches_*.json
+
+# ── Environment / tooling ─────────────────────────────────────────────────────
+.env
+.venv/
+venv/
+.vscode/
+*.log
+
+# ── Private / reference docs ──────────────────────────────────────────────────
+list_of_api_to_use.txt
