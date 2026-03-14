@@ -63,6 +63,7 @@ jobs:
       DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
       DEPLOY_REPO_URL: ${{ secrets.DEPLOY_REPO_URL }}
       DEPLOY_REPO_SLUG: ${{ secrets.DEPLOY_REPO_SLUG }}
+      GH_PAT: ${{ secrets.GH_PAT }}
 
     steps:
       - name: Checkout code
@@ -96,7 +97,8 @@ jobs:
             cd "${SERVICE_DIR}"
 
             if [ ! -d ".git" ]; then
-              git clone "${REPO_URL}" .
+              CLONE_URL="https://x-access-token:${GH_PAT}@github.com/${REPO_SLUG}.git"
+              git clone "${CLONE_URL}" .
             fi
 
             export SERVICE_NAME="${SERVICE_NAME}"
@@ -138,6 +140,11 @@ jobs:
             REPO_SLUG="${DEPLOY_REPO_SLUG}"
 
             cd "${SERVICE_DIR}"
+
+            if [ ! -d ".git" ]; then
+              CLONE_URL="https://x-access-token:${GH_PAT}@github.com/${REPO_SLUG}.git"
+              git clone "${CLONE_URL}" .
+            fi
 
             export SERVICE_NAME="${SERVICE_NAME}"
             export SERVICE_DIR="${SERVICE_DIR}"
