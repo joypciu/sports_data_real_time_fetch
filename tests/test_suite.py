@@ -1134,6 +1134,1022 @@ class TestRoundTripEnrichment(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 15. build_db — scalar helper functions
+# ════════════════════════════════════════════════════════════════════════════
+
+import build_db as bdb
+
+
+class TestBuildDbHelpers(unittest.TestCase):
+    """Unit tests for _ts(), _int(), _float(), _score() in build_db."""
+
+    # ── _ts : timestamp normalisation ───────────────────────────────────────
+
+    def test_ts_z_suffix_stripped(self):
+        """ESPN 'Z' suffix must produce a plain UTC string without tz offset."""
+        result = bdb._ts("2026-02-28T15:15Z")
+        self.assertEqual(result, "2026-02-28T15:15:00")
+
+    def test_ts_z_with_seconds_stripped(self):
+        result = bdb._ts("2026-03-10T20:00:00Z")
+        self.assertEqual(result, "2026-03-10T20:00:00")
+
+    def test_ts_missing_seconds_padded(self):
+        """HH:MM-only timestamps (no seconds) must have :00 padded before offset strip."""
+        result = bdb._ts("2026-03-07T20:00Z")
+        self.assertEqual(result, "2026-03-07T20:00:00")
+
+    def test_ts_plus_offset_stripped(self):
+        result = bdb._ts("2026-03-11T20:00:00+00:00")
+        self.assertEqual(result, "2026-03-11T20:00:00")
+
+    def test_ts_minus_offset_stripped(self):
+        result = bdb._ts("2026-01-01T13:30:00-05:00")
+        self.assertEqual(result, "2026-01-01T13:30:00")
+
+    def test_ts_none_returns_none(self):
+        self.assertIsNone(bdb._ts(None))
+
+    def test_ts_empty_string_returns_none(self):
+        self.assertIsNone(bdb._ts(""))
+
+    def test_ts_no_dhaka_shift(self):
+        """Stored value must NOT be shifted by any timezone (old TIMESTAMPTZ bug)."""
+        result = bdb._ts("2026-02-22T15:15Z")  # Barcelona vs Levante
+        # Old bug: would shift to 21:15 (Asia/Dhaka +06:00)
+        self.assertTrue(result.startswith("2026-02-22T15:15"),
+                        f"Expected UTC 15:15, got {result}")
+
+    # ── _int ────────────────────────────────────────────────────────────────
+
+    def test_int_valid_int(self):
+        self.assertEqual(bdb._int(42), 42)
+
+    def test_int_valid_str(self):
+        self.assertEqual(bdb._int("7"), 7)
+
+    def test_int_float_string(self):
+        self.assertIsNone(bdb._int("3.7"))  # not a castable int
+
+    def test_int_none(self):
+        self.assertIsNone(bdb._int(None))
+
+    def test_int_non_numeric(self):
+        self.assertIsNone(bdb._int("N/A"))
+
+    def test_int_negative(self):
+        self.assertEqual(bdb._int("-150"), -150)
+
+    def test_int_zero(self):
+        self.assertEqual(bdb._int("0"), 0)
+
+    # ── _float ──────────────────────────────────────────────────────────────
+
+    def test_float_valid(self):
+        self.assertAlmostEqual(bdb._float("3.5"), 3.5)
+
+    def test_float_int_input(self):
+        self.assertAlmostEqual(bdb._float(7), 7.0)
+
+    def test_float_none(self):
+        self.assertIsNone(bdb._float(None))
+
+    def test_float_empty(self):
+        self.assertIsNone(bdb._float(""))
+
+    def test_float_non_numeric(self):
+        self.assertIsNone(bdb._float("abc"))
+
+    def test_float_negative(self):
+        self.assertAlmostEqual(bdb._float("-2.5"), -2.5)
+
+    # ── _score ───────────────────────────────────────────────────────────────
+
+    def test_score_integer_string(self):
+        self.assertEqual(bdb._score("3"), 3)
+
+    def test_score_float_string(self):
+        """Scores like '3.0' from some APIs must be accepted."""
+        self.assertEqual(bdb._score("3.0"), 3)
+
+    def test_score_none(self):
+        self.assertIsNone(bdb._score(None))
+
+    def test_score_non_numeric(self):
+        self.assertIsNone(bdb._score("N/A"))
+
+    def test_score_zero(self):
+        self.assertEqual(bdb._score("0"), 0)
+
+    def test_score_integer(self):
+        self.assertEqual(bdb._score(110), 110)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 16. build_db — load_file (in-memory DuckDB)
+# ════════════════════════════════════════════════════════════════════════════
+
+import duckdb
+
+
+def _make_in_memory_db() -> duckdb.DuckDBPyConnection:
+    """Return a fresh in-memory DuckDB connection with the sports schema."""
+    con = duckdb.connect(":memory:")
+    con.execute(bdb.DDL)
+    return con
+
+
+def _write_json(path: str, data: list) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def _minimal_game(**kw) -> dict:
+    """Build a minimal game dict that load_file can consume."""
+    return {
+        "event_id":      kw.get("event_id", "EVT001"),
+        "name":          kw.get("name", "Home vs Away"),
+        "short_name":    kw.get("short_name", "HOM @ AWY"),
+        "date":          kw.get("date", "2026-03-01T18:00Z"),
+        "status":        kw.get("status", "post"),
+        "status_detail": kw.get("status_detail", "Final"),
+        "sport":         kw.get("sport", "basketball"),
+        "league":        kw.get("league", "nba"),
+        "period":        kw.get("period", 4),
+        "clock":         kw.get("clock", "0:00"),
+        "home": {
+            "team_id":   kw.get("home_id", "T1"),
+            "team_name": kw.get("home_name", "Home Team"),
+            "team_abbr": kw.get("home_abbr", "HOM"),
+            "score":     kw.get("home_score", "110"),
+            "is_winner": kw.get("home_winner", True),
+        },
+        "away": {
+            "team_id":   kw.get("away_id", "T2"),
+            "team_name": kw.get("away_name", "Away Team"),
+            "team_abbr": kw.get("away_abbr", "AWY"),
+            "score":     kw.get("away_score", "105"),
+            "is_winner": kw.get("away_winner", False),
+        },
+        "players":    kw.get("players", []),
+        "formations": kw.get("formations", {}),
+        "home_win_pct": kw.get("home_win_pct", None),
+        "away_win_pct": kw.get("away_win_pct", None),
+        "game_total":   kw.get("game_total", None),
+        "over_odds":    kw.get("over_odds", None),
+        "under_odds":   kw.get("under_odds", None),
+        "open_spread":  kw.get("open_spread", None),
+        "open_total":   kw.get("open_total", None),
+        "draw_odds":    kw.get("draw_odds", None),
+        "provider":     kw.get("provider", None),
+        "moneyline":    kw.get("moneyline", None),
+    }
+
+
+def _minimal_player(**kw) -> dict:
+    return {
+        "player_id":    kw.get("player_id", "P1"),
+        "display_name": kw.get("display_name", "Test Player"),
+        "position":     kw.get("position", "G"),
+        "home_away":    kw.get("home_away", "home"),
+        "starter":      kw.get("starter", True),
+        "active":       kw.get("active", True),
+        "did_not_play": kw.get("did_not_play", False),
+        "dnp_reason":   kw.get("dnp_reason", ""),
+        "subbed_in":    kw.get("subbed_in", False),
+        "subbed_out":   kw.get("subbed_out", False),
+        "formation_place": kw.get("formation_place", None),
+        "stats":        kw.get("stats", {"PTS": "20", "REB": "5"}),
+    }
+
+
+class TestLoadFileInMemory(unittest.TestCase):
+    """Tests for build_db.load_file() using an in-memory DuckDB."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.con = _make_in_memory_db()
+
+    def tearDown(self):
+        self.con.close()
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _path(self, name="test.json"):
+        return os.path.join(self.tmpdir, name)
+
+    def _write(self, data, name="test.json"):
+        p = self._path(name)
+        _write_json(p, data)
+        return p
+
+    # ── Basic inserts ────────────────────────────────────────────────────────
+
+    def test_single_game_inserted(self):
+        p = self._write([_minimal_game()])
+        games, players, stats = bdb.load_file(self.con, p)
+        self.assertEqual(games, 1)
+        n = self.con.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+        self.assertEqual(n, 1)
+
+    def test_returns_correct_counts_no_players(self):
+        p = self._write([_minimal_game()])
+        g, pl, st = bdb.load_file(self.con, p)
+        self.assertEqual(g, 1)
+        self.assertEqual(pl, 0)
+        self.assertEqual(st, 0)
+
+    def test_returns_correct_counts_with_players(self):
+        player = _minimal_player(stats={"PTS": "15", "REB": "4", "AST": "3"})
+        game = _minimal_game(players=[player])
+        p = self._write([game])
+        g, pl, st = bdb.load_file(self.con, p)
+        self.assertEqual(g, 1)
+        self.assertEqual(pl, 1)
+        self.assertEqual(st, 3)  # PTS, REB, AST
+
+    def test_empty_file_returns_zeros(self):
+        p = self._write([])
+        g, pl, st = bdb.load_file(self.con, p)
+        self.assertEqual((g, pl, st), (0, 0, 0))
+
+    # ── Deduplication ────────────────────────────────────────────────────────
+
+    def test_duplicate_event_id_skipped(self):
+        game = _minimal_game(event_id="DUP001")
+        p = self._write([game])
+        bdb.load_file(self.con, p)         # first load
+        g2, _, _ = bdb.load_file(self.con, p)  # second load — same event_id
+        self.assertEqual(g2, 0, "Duplicate event_id should be skipped")
+        n = self.con.execute("SELECT COUNT(*) FROM games WHERE event_id='DUP001'").fetchone()[0]
+        self.assertEqual(n, 1)
+
+    def test_new_event_in_second_load_is_ingested(self):
+        p1 = self._write([_minimal_game(event_id="E1")], "file1.json")
+        p2 = self._write([_minimal_game(event_id="E2")], "file2.json")
+        bdb.load_file(self.con, p1)
+        g2, _, _ = bdb.load_file(self.con, p2)
+        self.assertEqual(g2, 1)
+        n = self.con.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+        self.assertEqual(n, 2)
+
+    # ── game_teams ───────────────────────────────────────────────────────────
+
+    def test_game_teams_created(self):
+        p = self._write([_minimal_game()])
+        bdb.load_file(self.con, p)
+        n = self.con.execute("SELECT COUNT(*) FROM game_teams WHERE event_id='EVT001'").fetchone()[0]
+        self.assertEqual(n, 2, "Each game should produce exactly 2 game_team rows")
+
+    def test_game_teams_home_away_labels(self):
+        p = self._write([_minimal_game()])
+        bdb.load_file(self.con, p)
+        sides = set(r[0] for r in self.con.execute(
+            "SELECT home_away FROM game_teams WHERE event_id='EVT001'"
+        ).fetchall())
+        self.assertEqual(sides, {"home", "away"})
+
+    def test_game_teams_scores_match_game(self):
+        p = self._write([_minimal_game(home_score="110", away_score="105")])
+        bdb.load_file(self.con, p)
+        home_score = self.con.execute(
+            "SELECT score FROM game_teams WHERE event_id='EVT001' AND home_away='home'"
+        ).fetchone()[0]
+        away_score = self.con.execute(
+            "SELECT score FROM game_teams WHERE event_id='EVT001' AND home_away='away'"
+        ).fetchone()[0]
+        self.assertEqual(home_score, 110)
+        self.assertEqual(away_score, 105)
+
+    def test_missing_team_id_skips_game_team(self):
+        """A side with no team_id should not produce a game_teams row."""
+        game = _minimal_game()
+        game["home"]["team_id"] = ""
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM game_teams WHERE event_id='EVT001'"
+        ).fetchone()[0]
+        self.assertEqual(n, 1, "Only the away side should be inserted since home has no team_id")
+
+    # ── game_players & player_stats ──────────────────────────────────────────
+
+    def test_player_inserted_into_game_players(self):
+        player = _minimal_player(player_id="PX", home_away="home")
+        game = _minimal_game(players=[player])
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM game_players WHERE event_id='EVT001'"
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+
+    def test_player_stats_inserted(self):
+        player = _minimal_player(stats={"PTS": "25", "REB": "10"})
+        game = _minimal_game(players=[player])
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        keys = set(r[0] for r in self.con.execute(
+            "SELECT stat_key FROM player_stats"
+        ).fetchall())
+        self.assertIn("PTS", keys)
+        self.assertIn("REB", keys)
+
+    def test_player_stat_values_stored_as_strings(self):
+        player = _minimal_player(stats={"PTS": "42"})
+        game = _minimal_game(players=[player])
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        val = self.con.execute(
+            "SELECT stat_value FROM player_stats WHERE stat_key='PTS'"
+        ).fetchone()[0]
+        self.assertIsInstance(val, str)
+        self.assertEqual(val, "42")
+
+    def test_player_with_no_player_id_skipped(self):
+        player = _minimal_player(player_id="")
+        game = _minimal_game(players=[player])
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        n = self.con.execute("SELECT COUNT(*) FROM game_players").fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_multiple_players_inserted(self):
+        players = [
+            _minimal_player(player_id="PA", home_away="home"),
+            _minimal_player(player_id="PB", home_away="away"),
+            _minimal_player(player_id="PC", home_away="home"),
+        ]
+        game = _minimal_game(players=players)
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        n = self.con.execute("SELECT COUNT(*) FROM game_players").fetchone()[0]
+        self.assertEqual(n, 3)
+
+    # ── game_date storage ─────────────────────────────────────────────────────
+
+    def test_game_date_stored_as_utc_without_tz_shift(self):
+        """The fixed _ts() must store the bare UTC time, not shifted to local tz."""
+        game = _minimal_game(event_id="TZTEST", date="2026-02-22T15:15Z")
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        row = self.con.execute(
+            "SELECT game_date FROM games WHERE event_id='TZTEST'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        dt = row[0]
+        # Must be 15:15, not 21:15 (old Asia/Dhaka +06 offset bug)
+        self.assertEqual(dt.hour, 15, f"Expected 15:15 UTC, got {dt}")
+        self.assertEqual(dt.minute, 15)
+
+    def test_game_date_column_is_timestamp_not_timestamptz(self):
+        """Schema must use TIMESTAMP, not TIMESTAMPTZ — no pytz dependency."""
+        col_info = self.con.execute("DESCRIBE games").fetchall()
+        date_col = next(c for c in col_info if c[0] == "game_date")
+        self.assertNotIn("WITH TIME ZONE", date_col[1].upper(),
+                         "game_date should be plain TIMESTAMP, not TIMESTAMPTZ")
+
+    # ── teams master table ────────────────────────────────────────────────────
+
+    def test_teams_inserted(self):
+        p = self._write([_minimal_game()])
+        bdb.load_file(self.con, p)
+        n = self.con.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+        self.assertEqual(n, 2)
+
+    def test_team_deduplication_across_games(self):
+        """Same team across two games should appear only once in teams."""
+        g1 = _minimal_game(event_id="E1", home_id="SAME_TEAM")
+        g2 = _minimal_game(event_id="E2", home_id="SAME_TEAM")
+        p = self._write([g1, g2])
+        bdb.load_file(self.con, p)
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM teams WHERE team_id='SAME_TEAM'"
+        ).fetchone()[0]
+        self.assertEqual(n, 1)
+
+    # ── soccer extras ─────────────────────────────────────────────────────────
+
+    def test_soccer_formation_stored(self):
+        game = _minimal_game(
+            event_id="SOC01", sport="soccer", league="esp.1",
+            formations={"home": "4-3-3", "away": "4-2-3-1"}
+        )
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        row = self.con.execute(
+            "SELECT home_formation, away_formation FROM games WHERE event_id='SOC01'"
+        ).fetchone()
+        self.assertEqual(row[0], "4-3-3")
+        self.assertEqual(row[1], "4-2-3-1")
+
+    def test_draw_odds_stored(self):
+        game = _minimal_game(
+            event_id="DRAW01", sport="soccer", league="esp.1",
+            draw_odds=-115
+        )
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        val = self.con.execute(
+            "SELECT draw_odds FROM games WHERE event_id='DRAW01'"
+        ).fetchone()[0]
+        self.assertEqual(val, -115)
+
+    # ── None / edge values ────────────────────────────────────────────────────
+
+    def test_null_score_stored_as_null(self):
+        game = _minimal_game(home_score=None, away_score=None)
+        game["home"]["score"] = None
+        game["away"]["score"] = None
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        row = self.con.execute(
+            "SELECT home_score, away_score FROM games WHERE event_id='EVT001'"
+        ).fetchone()
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
+
+    def test_missing_event_id_not_inserted(self):
+        game = _minimal_game()
+        game["event_id"] = ""
+        p = self._write([game])
+        g, _, _ = bdb.load_file(self.con, p)
+        self.assertEqual(g, 0)
+
+    def test_win_probability_stored(self):
+        game = _minimal_game(home_win_pct=0.72, away_win_pct=0.28)
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        row = self.con.execute(
+            "SELECT home_win_pct, away_win_pct FROM games WHERE event_id='EVT001'"
+        ).fetchone()
+        self.assertAlmostEqual(row[0], 0.72, places=4)
+        self.assertAlmostEqual(row[1], 0.28, places=4)
+
+    def test_multiple_games_in_one_file(self):
+        games = [_minimal_game(event_id=f"EVT{i:03d}") for i in range(5)]
+        p = self._write(games)
+        g, _, _ = bdb.load_file(self.con, p)
+        self.assertEqual(g, 5)
+
+    def test_player_starter_and_dnp_flags(self):
+        player = _minimal_player(starter=True, did_not_play=False)
+        dnp    = _minimal_player(player_id="DNP1", starter=False, did_not_play=True,
+                                  active=False, stats={})
+        game = _minimal_game(players=[player, dnp])
+        p = self._write([game])
+        bdb.load_file(self.con, p)
+        row = self.con.execute(
+            "SELECT starter, did_not_play FROM game_players WHERE player_id='DNP1'"
+        ).fetchone()
+        self.assertFalse(row[0])
+        self.assertTrue(row[1])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 17. Database Integration — live sports.db edge cases
+# ════════════════════════════════════════════════════════════════════════════
+
+_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "db", "sports.db"
+)
+
+
+@unittest.skipUnless(os.path.exists(_DB_PATH), "sports.db not found — run build_db.py first")
+class TestDatabaseIntegrity(unittest.TestCase):
+    """Integration tests against the real sports.db database."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.con = duckdb.connect(_DB_PATH, read_only=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.con.close()
+
+    # ── Table non-empty ───────────────────────────────────────────────────────
+
+    def test_games_table_populated(self):
+        n = self.con.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+        self.assertGreater(n, 0, "games table must not be empty")
+
+    def test_teams_table_populated(self):
+        n = self.con.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+        self.assertGreater(n, 0)
+
+    def test_players_table_populated(self):
+        n = self.con.execute("SELECT COUNT(*) FROM players").fetchone()[0]
+        self.assertGreater(n, 0)
+
+    def test_game_players_populated(self):
+        n = self.con.execute("SELECT COUNT(*) FROM game_players").fetchone()[0]
+        self.assertGreater(n, 0)
+
+    def test_player_stats_populated(self):
+        n = self.con.execute("SELECT COUNT(*) FROM player_stats").fetchone()[0]
+        self.assertGreater(n, 0)
+
+    # ── Schema correctness ────────────────────────────────────────────────────
+
+    def test_game_date_is_plain_timestamp(self):
+        """After the TIMESTAMPTZ → TIMESTAMP fix, column type must have no tz."""
+        col_info = self.con.execute("DESCRIBE games").fetchall()
+        date_col = next(c for c in col_info if c[0] == "game_date")
+        self.assertNotIn("WITH TIME ZONE", date_col[1].upper(),
+                         "game_date must be TIMESTAMP, not TIMESTAMPTZ")
+
+    def test_games_columns_present(self):
+        cols = {c[0] for c in self.con.execute("DESCRIBE games").fetchall()}
+        required = {"event_id", "sport", "league", "name", "short_name",
+                    "game_date", "status", "home_score", "away_score",
+                    "home_win_pct", "away_win_pct", "home_formation", "away_formation",
+                    "draw_odds", "provider", "game_total"}
+        self.assertTrue(required.issubset(cols), f"Missing columns: {required - cols}")
+
+    def test_game_teams_columns_present(self):
+        cols = {c[0] for c in self.con.execute("DESCRIBE game_teams").fetchall()}
+        required = {"id", "event_id", "team_id", "sport", "home_away",
+                    "score", "is_winner", "moneyline", "spread"}
+        self.assertTrue(required.issubset(cols))
+
+    # ── Foreign key integrity ─────────────────────────────────────────────────
+
+    def test_no_orphaned_game_teams(self):
+        n = self.con.execute("""
+            SELECT COUNT(*) FROM game_teams gt
+            WHERE NOT EXISTS (SELECT 1 FROM games g WHERE g.event_id = gt.event_id)
+        """).fetchone()[0]
+        self.assertEqual(n, 0, f"{n} orphaned game_teams rows")
+
+    def test_no_orphaned_game_players(self):
+        n = self.con.execute("""
+            SELECT COUNT(*) FROM game_players gp
+            WHERE NOT EXISTS (SELECT 1 FROM games g WHERE g.event_id = gp.event_id)
+        """).fetchone()[0]
+        self.assertEqual(n, 0, f"{n} orphaned game_players rows")
+
+    def test_no_orphaned_player_stats(self):
+        n = self.con.execute("""
+            SELECT COUNT(*) FROM player_stats ps
+            WHERE NOT EXISTS (
+                SELECT 1 FROM game_players gp WHERE gp.id = ps.game_player_id
+            )
+        """).fetchone()[0]
+        self.assertEqual(n, 0, f"{n} orphaned player_stats rows")
+
+    def test_no_orphaned_game_players_to_players(self):
+        n = self.con.execute("""
+            SELECT COUNT(*) FROM game_players gp
+            WHERE NOT EXISTS (
+                SELECT 1 FROM players p
+                WHERE p.player_id = gp.player_id AND p.sport = gp.sport
+            )
+        """).fetchone()[0]
+        self.assertEqual(n, 0, f"{n} game_players without a matching player row")
+
+    # ── Uniqueness / no duplicates ────────────────────────────────────────────
+
+    def test_no_duplicate_event_ids(self):
+        dups = self.con.execute("""
+            SELECT event_id FROM games GROUP BY event_id HAVING COUNT(*) > 1
+        """).fetchall()
+        self.assertEqual(len(dups), 0, f"Duplicate event_ids: {[d[0] for d in dups]}")
+
+    def test_no_duplicate_game_player_ids(self):
+        dups = self.con.execute("""
+            SELECT id FROM game_players GROUP BY id HAVING COUNT(*) > 1
+        """).fetchall()
+        self.assertEqual(len(dups), 0)
+
+    def test_no_duplicate_player_stat_ids(self):
+        dups = self.con.execute("""
+            SELECT id FROM player_stats GROUP BY id HAVING COUNT(*) > 1
+        """).fetchall()
+        self.assertEqual(len(dups), 0)
+
+    # ── Sports coverage ───────────────────────────────────────────────────────
+
+    def test_nba_games_present(self):
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE league='nba'"
+        ).fetchone()[0]
+        self.assertGreater(n, 0, "No NBA games found")
+
+    def test_mlb_games_present(self):
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE league='mlb'"
+        ).fetchone()[0]
+        self.assertGreater(n, 0)
+
+    def test_nhl_games_present(self):
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE league='nhl'"
+        ).fetchone()[0]
+        self.assertGreater(n, 0)
+
+    def test_laliga_games_present(self):
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE league='esp.1'"
+        ).fetchone()[0]
+        self.assertGreaterEqual(n, 32, f"Expected ≥32 La Liga games, found {n}")
+
+    def test_ucl_games_present(self):
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE league='uefa.champions'"
+        ).fetchone()[0]
+        self.assertGreater(n, 0)
+
+    def test_cricket_games_present(self):
+        """Cricket was broken (0 rows) before the pandas import fix."""
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE sport='cricket'"
+        ).fetchone()[0]
+        self.assertEqual(n, 5, f"Expected 5 cricket games (Sheffield Shield), found {n}")
+
+    # ── Barcelona specific ────────────────────────────────────────────────────
+
+    def test_barcelona_in_teams_table(self):
+        row = self.con.execute(
+            "SELECT team_id, team_abbr FROM teams WHERE team_name='Barcelona' AND sport='soccer'"
+        ).fetchone()
+        self.assertIsNotNone(row, "Barcelona must be in teams table")
+        self.assertEqual(row[0], "83")
+        self.assertEqual(row[1], "BAR")
+
+    def test_barcelona_has_laliga_games(self):
+        n = self.con.execute("""
+            SELECT COUNT(*) FROM games g
+            JOIN game_teams gt ON gt.event_id = g.event_id
+            WHERE gt.team_id = '83' AND g.league = 'esp.1'
+        """).fetchone()[0]
+        self.assertGreaterEqual(n, 3, f"Expected ≥3 Barcelona La Liga games, found {n}")
+
+    def test_barcelona_has_ucl_game(self):
+        n = self.con.execute("""
+            SELECT COUNT(*) FROM games g
+            JOIN game_teams gt ON gt.event_id = g.event_id
+            WHERE gt.team_id = '83' AND g.league = 'uefa.champions'
+        """).fetchone()[0]
+        self.assertGreaterEqual(n, 1, "Barcelona must have ≥1 UCL game")
+
+    def test_barcelona_players_present(self):
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM game_players WHERE team_id='83'"
+        ).fetchone()[0]
+        self.assertGreater(n, 0, "Barcelona should have player data")
+
+    def test_barcelona_known_players_in_db(self):
+        """Key Barcelona players must appear in the players table."""
+        known = ["Raphinha", "Pedri", "Lamine Yamal"]
+        for name in known:
+            row = self.con.execute(
+                "SELECT player_id FROM players WHERE display_name=? AND sport='soccer'",
+                [name]
+            ).fetchone()
+            self.assertIsNotNone(row, f"Barcelona player '{name}' not found in players table")
+
+    def test_barcelona_levante_correct_score(self):
+        """Levante vs Barcelona: Barcelona won 3-0 at home."""
+        row = self.con.execute("""
+            SELECT g.home_score, g.away_score, gt_home.team_id
+            FROM games g
+            JOIN game_teams gt_home ON gt_home.event_id = g.event_id AND gt_home.home_away = 'home'
+            WHERE g.event_id = '748391'
+        """).fetchone()
+        self.assertIsNotNone(row, "Event 748391 (Levante at Barcelona) must exist")
+        self.assertEqual(row[0], 3)   # Barcelona scored 3
+        self.assertEqual(row[1], 0)   # Levante scored 0
+        self.assertEqual(row[2], "83")  # Home team is Barcelona
+
+    def test_barcelona_villarreal_correct_score(self):
+        """Villarreal at Barcelona: Barcelona 4-1."""
+        row = self.con.execute("""
+            SELECT g.home_score, g.away_score
+            FROM games g
+            WHERE g.event_id = '748402'
+        """).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 4)
+        self.assertEqual(row[1], 1)
+
+    # ── Timezone correctness (core fix validation) ────────────────────────────
+
+    def test_laliga_dates_not_shifted_by_six_hours(self):
+        """Old bug: TIMESTAMPTZ shifted all UTC times by +6h (Asia/Dhaka).
+        Barcelona vs Levante was at 15:15 UTC — must NOT read back as 21:15."""
+        row = self.con.execute(
+            "SELECT game_date FROM games WHERE event_id='748391'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        dt = row[0]
+        self.assertEqual(dt.hour, 15,
+                         f"Expected 15:15 UTC (not Dhaka-shifted {dt.hour}:15)")
+        self.assertEqual(dt.minute, 15)
+
+    def test_ucl_barca_newcastle_date_correct(self):
+        """Barcelona vs Newcastle UCL was at 20:00 UTC — must not be shifted."""
+        row = self.con.execute(
+            "SELECT game_date FROM games WHERE event_id='401862577'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        dt = row[0]
+        self.assertEqual(dt.hour, 20,
+                         f"Expected 20:00 UTC, got {dt.hour}:00")
+
+    def test_no_game_dates_in_1970(self):
+        """Epoch (1970-01-01) dates indicate a parsing failure."""
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE CAST(game_date AS DATE) < '2020-01-01'"
+        ).fetchone()[0]
+        self.assertEqual(n, 0, f"{n} games have suspiciously old dates")
+
+    def test_no_future_dates_beyond_season(self):
+        """No game date should be more than 1 year in the future."""
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE game_date > '2027-12-31'"
+        ).fetchone()[0]
+        self.assertEqual(n, 0, f"{n} games have implausibly future dates")
+
+    # ── Score & result consistency ────────────────────────────────────────────
+
+    def test_finished_games_have_scores(self):
+        # Cricket uses innings-string scores in game_teams.score rather than
+        # a simple numeric home_score/away_score, so exclude it from this check.
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM games
+            WHERE status='post' AND sport != 'cricket'
+              AND (home_score IS NULL OR away_score IS NULL)
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} finished non-cricket games have NULL scores")
+
+    def test_cricket_scores_are_innings_strings(self):
+        """Cricket uses innings-string scoring; no numeric scores are stored.
+
+        The ESPN Sheffield Shield data doesn't provide parseable numeric scores
+        (_score() can't convert '238 & 114 (44.5 ov)' to int), so both
+        games.home_score and game_teams.score are NULL for cricket.
+        """
+        null_home = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE sport='cricket' AND home_score IS NULL"
+        ).fetchone()[0]
+        total = self.con.execute(
+            "SELECT COUNT(*) FROM games WHERE sport='cricket'"
+        ).fetchone()[0]
+        self.assertGreater(total, 0, "There should be cricket games in the DB")
+        self.assertEqual(null_home, total,
+                         "All cricket games should have NULL home_score (innings format)")
+
+    def test_home_score_matches_game_teams_score(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM games g
+            JOIN game_teams gt ON gt.event_id = g.event_id AND gt.home_away = 'home'
+            WHERE g.home_score IS NOT NULL AND gt.score IS NOT NULL
+              AND g.home_score != gt.score
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} home score mismatches between games and game_teams")
+
+    def test_away_score_matches_game_teams_score(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM games g
+            JOIN game_teams gt ON gt.event_id = g.event_id AND gt.home_away = 'away'
+            WHERE g.away_score IS NOT NULL AND gt.score IS NOT NULL
+              AND g.away_score != gt.score
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} away score mismatches between games and game_teams")
+
+    def test_no_game_has_two_winners(self):
+        """is_winner=TRUE must appear at most once per game."""
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT event_id, COUNT(*) c FROM game_teams
+                WHERE is_winner = TRUE
+                GROUP BY event_id HAVING c > 1
+            )
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} games have two winners")
+
+    def test_all_finished_soccer_games_have_two_sides(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT g.event_id, COUNT(gt.id) n
+                FROM games g
+                LEFT JOIN game_teams gt ON gt.event_id = g.event_id
+                WHERE g.sport='soccer' AND g.status='post'
+                GROUP BY g.event_id HAVING n != 2
+            )
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} finished soccer games don't have exactly 2 sides")
+
+    # ── Odds sanity ───────────────────────────────────────────────────────────
+
+    def test_moneylines_within_sane_range(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM game_teams
+            WHERE moneyline IS NOT NULL
+              AND (moneyline < -999999 OR moneyline > 999999)
+        """).fetchone()[0]
+        self.assertEqual(bad, 0)
+
+    def test_draw_odds_only_on_soccer(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM games
+            WHERE draw_odds IS NOT NULL AND sport != 'soccer'
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} non-soccer games have draw_odds")
+
+    def test_win_probability_sums_to_one(self):
+        """Where both win_pcts are populated, they must sum to ~1.0."""
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM games
+            WHERE home_win_pct IS NOT NULL AND away_win_pct IS NOT NULL
+              AND ABS((home_win_pct + away_win_pct) - 1.0) > 0.05
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} games where home+away win_pct ≠ 1.0")
+
+    # ── Stat type integrity ───────────────────────────────────────────────────
+
+    def test_nba_pts_all_numeric(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM player_stats ps
+            JOIN game_players gp ON gp.id = ps.game_player_id
+            WHERE gp.sport = 'basketball' AND ps.stat_key = 'PTS'
+              AND TRY_CAST(ps.stat_value AS DOUBLE) IS NULL
+              AND ps.stat_value NOT IN ('', '--', 'N/A')
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} NBA PTS values that can't be cast to DOUBLE")
+
+    def test_nba_min_all_numeric(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM player_stats ps
+            JOIN game_players gp ON gp.id = ps.game_player_id
+            WHERE gp.sport = 'basketball' AND ps.stat_key = 'MIN'
+              AND TRY_CAST(ps.stat_value AS DOUBLE) IS NULL
+              AND ps.stat_value NOT IN ('', '--', 'N/A')
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} NBA MIN values that can't be cast to DOUBLE")
+
+    def test_soccer_goals_all_numeric(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM player_stats ps
+            JOIN game_players gp ON gp.id = ps.game_player_id
+            WHERE gp.sport = 'soccer' AND ps.stat_key = 'G'
+              AND TRY_CAST(ps.stat_value AS DOUBLE) IS NULL
+              AND ps.stat_value NOT IN ('', '--', 'N/A')
+        """).fetchone()[0]
+        self.assertEqual(bad, 0)
+
+    def test_mlb_no_negative_hits(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM player_stats ps
+            JOIN game_players gp ON gp.id = ps.game_player_id
+            WHERE gp.sport = 'baseball' AND ps.stat_key = 'H'
+              AND TRY_CAST(ps.stat_value AS INTEGER) < 0
+        """).fetchone()[0]
+        self.assertEqual(bad, 0)
+
+    def test_hockey_toi_format(self):
+        """NHL Time-On-Ice must be in MM:SS format — not a raw float."""
+        bad = self.con.execute(r"""
+            SELECT COUNT(*) FROM player_stats ps
+            JOIN game_players gp ON gp.id = ps.game_player_id
+            WHERE gp.sport = 'hockey' AND ps.stat_key = 'TOI'
+              AND NOT REGEXP_MATCHES(ps.stat_value, '^\d+:\d{2}$')
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} TOI values not in MM:SS format")
+
+    def test_no_null_stat_keys(self):
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM player_stats WHERE stat_key IS NULL OR stat_key=''"
+        ).fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_no_null_stat_values(self):
+        n = self.con.execute(
+            "SELECT COUNT(*) FROM player_stats WHERE stat_value IS NULL"
+        ).fetchone()[0]
+        self.assertEqual(n, 0)
+
+    # ── DNP integrity ─────────────────────────────────────────────────────────
+
+    def test_dnp_players_have_no_nonzero_stats(self):
+        bad = self.con.execute("""
+            SELECT COUNT(*) FROM game_players gp
+            WHERE gp.did_not_play = TRUE
+              AND EXISTS (
+                  SELECT 1 FROM player_stats ps
+                  WHERE ps.game_player_id = gp.id
+                    AND TRY_CAST(ps.stat_value AS DOUBLE) > 0
+              )
+        """).fetchone()[0]
+        self.assertEqual(bad, 0, f"{bad} DNP players have non-zero stats")
+
+    # ── Soccer substitution & formation ──────────────────────────────────────
+
+    def test_soccer_subbed_in_and_out_roughly_equal(self):
+        sub_in  = self.con.execute(
+            "SELECT COUNT(*) FROM game_players WHERE subbed_in=TRUE"
+        ).fetchone()[0]
+        sub_out = self.con.execute(
+            "SELECT COUNT(*) FROM game_players WHERE subbed_out=TRUE"
+        ).fetchone()[0]
+        # Allow up to 20% divergence for partial data
+        if sub_in > 0 and sub_out > 0:
+            ratio = max(sub_in, sub_out) / min(sub_in, sub_out)
+            self.assertLess(ratio, 1.2,
+                            f"subbed_in ({sub_in}) and subbed_out ({sub_out}) diverge >20%")
+
+    def test_barcelona_games_have_formations(self):
+        """Barcelona's home games must have formation data."""
+        n = self.con.execute("""
+            SELECT COUNT(*) FROM games g
+            JOIN game_teams gt ON gt.event_id = g.event_id AND gt.home_away = 'home'
+            WHERE gt.team_id = '83' AND g.league = 'esp.1'
+              AND g.home_formation IS NOT NULL
+        """).fetchone()[0]
+        self.assertGreater(n, 0, "At least one Barcelona home game must have formation data")
+
+    # ── Multi-join query correctness ──────────────────────────────────────────
+
+    def test_nba_top_scorers_query(self):
+        """5-table join to find NBA top scorers must execute and return rows."""
+        rows = self.con.execute("""
+            SELECT p.display_name, t.team_name,
+                   SUM(CAST(ps.stat_value AS INTEGER)) total_pts
+            FROM player_stats ps
+            JOIN game_players gp ON gp.id = ps.game_player_id
+            JOIN players p ON p.player_id = gp.player_id AND p.sport = gp.sport
+            JOIN teams t   ON t.team_id   = gp.team_id   AND t.sport = gp.sport
+            JOIN games g   ON g.event_id  = gp.event_id
+            WHERE g.league = 'nba' AND ps.stat_key = 'PTS'
+              AND gp.did_not_play = FALSE
+            GROUP BY p.display_name, t.team_name
+            HAVING SUM(CAST(ps.stat_value AS INTEGER)) >= 50
+            ORDER BY total_pts DESC LIMIT 10
+        """).fetchall()
+        self.assertGreater(len(rows), 0, "No NBA 50+ total point scorers found")
+
+    def test_soccer_top_scorers_query(self):
+        """Barcelona goals query must return Raphinha or Lewandowski-style entries."""
+        rows = self.con.execute("""
+            SELECT p.display_name, SUM(CAST(ps.stat_value AS INTEGER)) goals
+            FROM player_stats ps
+            JOIN game_players gp ON gp.id = ps.game_player_id AND gp.team_id = '83'
+            JOIN players p ON p.player_id = gp.player_id AND p.sport = gp.sport
+            WHERE gp.sport = 'soccer' AND ps.stat_key = 'G'
+            GROUP BY p.display_name
+            HAVING goals > 0
+            ORDER BY goals DESC
+        """).fetchall()
+        self.assertGreater(len(rows), 0, "Barcelona should have players with recorded goals")
+
+    def test_nba_win_rate_cte(self):
+        """CTE computing NBA team win rates must execute without error."""
+        rows = self.con.execute("""
+            SELECT t.team_name,
+                   ROUND(100.0 * SUM(CASE WHEN gt.is_winner THEN 1 ELSE 0 END) / COUNT(*), 1)
+                     AS win_pct
+            FROM game_teams gt
+            JOIN teams t  ON t.team_id = gt.team_id AND t.sport = gt.sport
+            JOIN games g  ON g.event_id = gt.event_id
+            WHERE g.league = 'nba' AND g.status = 'post'
+            GROUP BY t.team_name HAVING COUNT(*) >= 3
+            ORDER BY win_pct DESC LIMIT 5
+        """).fetchall()
+        self.assertGreater(len(rows), 0)
+
+    def test_date_range_query(self):
+        """Date range query must return results without pytz crash."""
+        rows = self.con.execute("""
+            SELECT sport, league,
+                   MIN(CAST(game_date AS DATE)) first_game,
+                   MAX(CAST(game_date AS DATE)) last_game
+            FROM games GROUP BY sport, league ORDER BY sport
+        """).fetchall()
+        self.assertGreater(len(rows), 0)
+        # Confirm dates are reasonable (no 1970 epoch or 2027+ dates)
+        for r in rows:
+            self.assertGreater(str(r[2]), "2020-01-01", f"{r[0]}/{r[1]} has old start date")
+
+    def test_player_name_search(self):
+        """ILIKE player name search must return results."""
+        rows = self.con.execute("""
+            SELECT display_name, sport FROM players
+            WHERE display_name ILIKE '%james%' ORDER BY sport
+        """).fetchall()
+        self.assertGreater(len(rows), 0, "No players with 'james' in name found")
+
+    def test_cross_sport_player_pk_design(self):
+        """Players PK is (player_id, sport) — same numeric id can appear in 2 sports."""
+        cross = self.con.execute("""
+            SELECT player_id, COUNT(DISTINCT sport) n
+            FROM players GROUP BY player_id HAVING n > 1
+        """).fetchall()
+        # This is expected and by design — just verify no error executing the query
+        self.assertIsInstance(cross, list)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════════════════════════════════
 

@@ -23,9 +23,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 import duckdb
+import pandas as pd
 
 DATA_DIR = "historical_data"
 DEFAULT_DB = "db/sports.db"
@@ -60,7 +62,7 @@ CREATE TABLE IF NOT EXISTS games (
     league          VARCHAR,
     name            VARCHAR,
     short_name      VARCHAR,
-    game_date       TIMESTAMPTZ,
+    game_date       TIMESTAMP,          -- stored as UTC, no tz conversion
     status          VARCHAR,           -- pre / in / post
     status_detail   VARCHAR,
     period          INTEGER,
@@ -170,15 +172,18 @@ def _score(v) -> int | None:
 
 
 def _ts(v: str | None) -> str | None:
-    """Normalise ESPN ISO-8601 date strings to a format DuckDB accepts."""
+    """Normalise ESPN ISO-8601 date strings to a plain UTC TIMESTAMP string.
+
+    Strips any timezone offset so DuckDB TIMESTAMP stores the bare UTC value
+    without session-timezone conversion (avoids the pytz dependency entirely).
+    """
     if not v:
         return None
-    # ESPN uses 'Z' suffix and sometimes omits seconds: "2026-02-25T18:05Z"
-    # Replace Z with +00:00 and pad missing seconds
+    # Normalise 'Z' → '+00:00' then pad missing seconds
     v = v.replace("Z", "+00:00")
-    # If time part has only HH:MM (no seconds), add :00
-    import re
     v = re.sub(r"T(\d{2}:\d{2})([\+\-])", r"T\1:00\2", v)
+    # Strip timezone offset — all ESPN dates are UTC, store as plain timestamp
+    v = re.sub(r"[\+\-]\d{2}:\d{2}$", "", v)
     return v
 
 
@@ -254,7 +259,7 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
                 sport,
                 side,
                 _score(t.get("score")),
-                bool(t.get("is_winner")) if t.get("is_winner") is not None else None,
+                (str(t.get("is_winner")).strip().lower() == "true") if t.get("is_winner") is not None else None,
                 _int(t.get("moneyline")),
                 _float(t.get("spread")),
                 _int(t.get("spread_odds")),
@@ -309,8 +314,6 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
         return 0, 0, 0
 
     # DuckDB fastest bulk path: register pandas DataFrame, then INSERT SELECT
-    import pandas as pd
-
     def _bulk_ignore(table: str, cols: list[str], rows: list[tuple]) -> None:
         if not rows:
             return

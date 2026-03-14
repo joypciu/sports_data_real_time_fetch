@@ -368,7 +368,7 @@ _p("Win probabilities sum to ~1.0 (±5%)", bad_prob == 0,
 # ─────────────────────────────────────────────────────────────────────────────
 section("11. Score & Result Consistency")
 
-# Finished games should have scores
+# Finished games should have scores — cricket uses innings-string format so NULL is expected.
 no_score = con.execute("""
     SELECT sport, COUNT(*) n FROM games
     WHERE status = 'post' AND (home_score IS NULL OR away_score IS NULL)
@@ -376,7 +376,16 @@ no_score = con.execute("""
 """).fetchall()
 if no_score:
     for r in no_score:
-        _w(f"Finished {r[0]} games with NULL score", f"{r[1]} games")
+        if r[0] == "cricket":
+            # Sheffield Shield scores like '238 & 114 (44.5 ov)' can't be cast to INT;
+            # _score() returns NULL — this is expected, not a data error.
+            _i("cricket NULL home/away scores (expected — innings format, not numeric)",
+               f"{r[1]} games; innings stored in game_teams.score")
+        else:
+            _w(f"Finished {r[0]} games with NULL score (unexpected)", f"{r[1]} games")
+    non_cricket = sum(r[1] for r in no_score if r[0] != "cricket")
+    _p("All finished non-cricket games have numeric scores", non_cricket == 0,
+       f"{non_cricket} missing")
 else:
     _p("All finished games have both scores", True)
 
@@ -981,6 +990,319 @@ cs = con.execute("""
 _p("Soccer goalkeeper clean-sheet CTE executes", len(cs) > 0, f"{len(cs)} GKs with clean sheets")
 for r in cs:
     print(f"       {r[0]:<28} {r[1]:<25} {r[2]} clean sheet(s)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 26. CRICKET-SPECIFIC INTEGRITY
+# ─────────────────────────────────────────────────────────────────────────────
+section("26. Cricket-Specific Integrity")
+
+cricket_n = con.execute("SELECT COUNT(*) FROM games WHERE sport='cricket'").fetchone()[0]
+_p("Cricket games present in DB", cricket_n > 0, f"{cricket_n} Sheffield Shield games")
+
+# All cricket games should have game_teams rows
+cricket_no_sides = con.execute("""
+    SELECT COUNT(*) FROM games g
+    WHERE g.sport = 'cricket'
+      AND NOT EXISTS (SELECT 1 FROM game_teams gt WHERE gt.event_id = g.event_id)
+""").fetchone()[0]
+_p("All cricket games have game_team rows", cricket_no_sides == 0,
+   f"{cricket_no_sides} games without sides")
+
+# Cricket: no game should have BOTH sides marked as winner
+cricket_double_win = con.execute("""
+    SELECT COUNT(*) FROM (
+        SELECT gt.event_id FROM game_teams gt
+        JOIN games g ON g.event_id = gt.event_id
+        WHERE g.sport = 'cricket' AND gt.is_winner = TRUE
+        GROUP BY gt.event_id HAVING COUNT(*) > 1
+    )
+""").fetchone()[0]
+_p("No cricket game has two winners (draws handled correctly)", cricket_double_win == 0,
+   f"{cricket_double_win} games with dual winner")
+
+# Cricket: home/away scores should be NULL (innings strings are not numeric)
+cricket_null_score = con.execute(
+    "SELECT COUNT(*) FROM games WHERE sport='cricket' AND home_score IS NULL"
+).fetchone()[0]
+_i("Cricket home_score is NULL (innings format — expected)",
+   f"{cricket_null_score}/{cricket_n} games")
+
+# Cricket players present
+cricket_players = con.execute("""
+    SELECT COUNT(*) FROM game_players gp
+    JOIN games g ON g.event_id = gp.event_id
+    WHERE g.sport = 'cricket'
+""").fetchone()[0]
+_p("Cricket game_players populated", cricket_players > 0, f"{cricket_players:,} player-game rows")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 27. is_winner REGRESSION: STRING BOOL PARSING BUG
+# ─────────────────────────────────────────────────────────────────────────────
+section("27. is_winner Regression: String 'true'/'false' Parsing")
+
+# The original bug: bool("false") == True in Python (non-empty string is truthy).
+# After fix in build_db.py, str.lower() == "true" is used instead.
+# No game should have TRUE on both sides.
+double_winner = con.execute("""
+    SELECT COUNT(*) FROM (
+        SELECT event_id FROM game_teams
+        WHERE is_winner = TRUE
+        GROUP BY event_id HAVING COUNT(*) > 1
+    )
+""").fetchone()[0]
+_p("No game has two winners (is_winner string-bool fix)", double_winner == 0,
+   f"{double_winner} games with both sides marked TRUE")
+
+# Count distribution
+true_n  = con.execute("SELECT COUNT(*) FROM game_teams WHERE is_winner = TRUE").fetchone()[0]
+false_n = con.execute("SELECT COUNT(*) FROM game_teams WHERE is_winner = FALSE").fetchone()[0]
+null_n  = con.execute("SELECT COUNT(*) FROM game_teams WHERE is_winner IS NULL").fetchone()[0]
+_i("is_winner distribution", f"TRUE={true_n:,}  FALSE={false_n:,}  NULL={null_n:,}")
+
+# Sanity: roughly one winner per finished non-draw game
+finished_n = con.execute(
+    "SELECT COUNT(*) FROM games WHERE status='post' AND home_score IS NOT NULL"
+).fetchone()[0]
+draws_n = con.execute(
+    "SELECT COUNT(*) FROM games WHERE status='post' AND home_score = away_score"
+).fetchone()[0]
+expected_winners = finished_n - draws_n
+_p("TRUE count ≈ (finished - draws) i.e. one winner per decisive game",
+   abs(true_n - expected_winners) <= 20,
+   f"TRUE={true_n}  expected≈{expected_winners}  draws={draws_n}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 28. BARCELONA DATA REGRESSION (original user bug report)
+# ─────────────────────────────────────────────────────────────────────────────
+section("28. Barcelona Data Regression (Original Bug Report)")
+
+barca = con.execute(
+    "SELECT team_id, team_name, team_abbr FROM teams WHERE team_abbr='BAR' AND sport='soccer'"
+).fetchone()
+_p("Barcelona (BAR) in teams table", barca is not None,
+   f"id={barca[0]}" if barca else "NOT FOUND")
+
+if barca:
+    barca_id = barca[0]
+
+    laliga_n = con.execute(f"""
+        SELECT COUNT(*) FROM games g
+        JOIN game_teams gt ON gt.event_id = g.event_id AND gt.team_id = '{barca_id}'
+        WHERE g.league = 'esp.1'
+    """).fetchone()[0]
+    _p("Barcelona has ≥3 La Liga games (was 0 before TIMESTAMPTZ fix)", laliga_n >= 3,
+       f"{laliga_n} games")
+
+    ucl_n = con.execute(f"""
+        SELECT COUNT(*) FROM games g
+        JOIN game_teams gt ON gt.event_id = g.event_id AND gt.team_id = '{barca_id}'
+        WHERE g.league = 'uefa.champions'
+    """).fetchone()[0]
+    _p("Barcelona has ≥1 UCL game", ucl_n >= 1, f"{ucl_n} games")
+
+    # Known score anchor: event 748391 (Barca 3-0 Levante at home)
+    ev1 = con.execute(
+        "SELECT home_score, away_score FROM games WHERE event_id='748391'"
+    ).fetchone()
+    if ev1:
+        _p("Event 748391 (Barca 3-0 Levante): correct score",
+           ev1[0] == 3 and ev1[1] == 0, f"{ev1[0]}-{ev1[1]}")
+    else:
+        _w("Event 748391 (Barca vs Levante) not found", "")
+
+    # Timezone anchor: 748391 was at 15:00 UTC; old TIMESTAMPTZ bug shifted it to 21:00
+    ts1 = con.execute(
+        "SELECT EXTRACT(HOUR FROM game_date) FROM games WHERE event_id='748391'"
+    ).fetchone()
+    if ts1:
+        _p("Event 748391 game_date hour=15 UTC (not 21 — Dhaka +6h regression)",
+           int(ts1[0]) == 15, f"stored hour={int(ts1[0])}")
+
+    # UCL Barcelona vs Newcastle: 20:00 UTC
+    ts2 = con.execute(
+        "SELECT EXTRACT(HOUR FROM game_date) FROM games WHERE event_id='401862577'"
+    ).fetchone()
+    if ts2:
+        _p("Event 401862577 (Barca UCL) hour=20 UTC", int(ts2[0]) == 20,
+           f"stored hour={int(ts2[0])}")
+
+    # Known Barça players in DB
+    for pname in ["Raphinha", "Pedri"]:
+        found = con.execute(f"""
+            SELECT COUNT(*) FROM players p
+            WHERE p.sport = 'soccer' AND p.display_name ILIKE '%{pname}%'
+              AND EXISTS (
+                  SELECT 1 FROM game_players gp
+                  JOIN games g ON g.event_id = gp.event_id
+                  WHERE gp.player_id = p.player_id
+                    AND gp.team_id = '{barca_id}'
+              )
+        """).fetchone()[0]
+        _p(f"Barcelona player '{pname}' found", found > 0, f"{found} match(es)")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 29. TIMESTAMP TIMEZONE SAFETY
+# ─────────────────────────────────────────────────────────────────────────────
+section("29. TIMESTAMP Timezone Safety")
+
+# Schema: game_date must be TIMESTAMP, not TIMESTAMPTZ
+col_type = con.execute("""
+    SELECT data_type FROM information_schema.columns
+    WHERE table_schema = 'main'
+      AND table_name = 'games' AND column_name = 'game_date'
+""").fetchone()
+if col_type:
+    _p("games.game_date is TIMESTAMP not TIMESTAMPTZ (no pytz needed)",
+       "tz" not in col_type[0].lower(), f"actual type: {col_type[0]}")
+else:
+    _w("games.game_date not found in information_schema", "")
+
+# No epoch (1970) dates — indicate broken timestamp parsing
+epoch_n = con.execute(
+    "SELECT COUNT(*) FROM games WHERE CAST(game_date AS DATE) = '1970-01-01'"
+).fetchone()[0]
+_p("No epoch-default (1970-01-01) game dates", epoch_n == 0, f"{epoch_n} games")
+
+# No game dates implausibly far in future
+future_n = con.execute(
+    "SELECT COUNT(*) FROM games WHERE game_date > NOW() + INTERVAL '365' DAY"
+).fetchone()[0]
+_p("No game dates > 1 year in future", future_n == 0, f"{future_n} games")
+
+# La Liga kickoff hours in plausible UTC window (12-23h): rules out midnight
+# artifacts from date-only parsing (T00:00:00) or +6h Dhaka shift
+laliga_bad_hr = con.execute("""
+    SELECT COUNT(*) FROM games
+    WHERE league = 'esp.1' AND status = 'post'
+      AND (EXTRACT(HOUR FROM game_date) < 12 OR EXTRACT(HOUR FROM game_date) > 23)
+""").fetchone()[0]
+_p("La Liga stored hours in 12-23 UTC range (no timezone corruption)", laliga_bad_hr == 0,
+   f"{laliga_bad_hr} games outside window")
+
+# Date range query works without pytz crash
+try:
+    n = con.execute(
+        "SELECT COUNT(*) FROM games WHERE game_date >= '2024-01-01' AND game_date < '2027-01-01'"
+    ).fetchone()[0]
+    _p("Date range query on TIMESTAMP column succeeds (no pytz crash)", n > 0,
+       f"{n:,} games in 2024-2026")
+except Exception as exc:
+    _p("Date range query succeeds", False, str(exc))
+
+# Date grouping (GROUP BY date) — validates arithmetic on plain TIMESTAMP works
+rows = con.execute("""
+    SELECT CAST(game_date AS DATE) dt, COUNT(*) n
+    FROM games WHERE league='nba' AND status='post'
+    GROUP BY dt ORDER BY dt DESC LIMIT 5
+""").fetchall()
+_p("GROUP BY DATE on TIMESTAMP column executes", len(rows) > 0, f"{len(rows)} date buckets")
+for r in rows:
+    print(f"       {r[0]}  {r[1]} games")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 30. ADVANCED ANALYTICS: EFFICIENCY METRICS
+# ─────────────────────────────────────────────────────────────────────────────
+section("30. Advanced Analytics: Efficiency Metrics")
+
+# NBA: 20+ PPG scorers over 10+ games
+nba_ppg = con.execute("""
+    SELECT p.display_name, p.team_name,
+           ROUND(AVG(CAST(pts.stat_value AS DOUBLE)), 1) ppg,
+           COUNT(DISTINCT gp.event_id) gp
+    FROM game_players gp
+    JOIN players p       ON p.player_id = gp.player_id AND p.sport = gp.sport
+    JOIN player_stats pts ON pts.game_player_id = gp.id AND pts.stat_key = 'PTS'
+    JOIN games g          ON g.event_id = gp.event_id
+    WHERE g.league = 'nba' AND g.status = 'post' AND gp.did_not_play = FALSE
+    GROUP BY p.display_name, p.team_name
+    HAVING gp >= 10 AND AVG(CAST(pts.stat_value AS DOUBLE)) >= 20
+    ORDER BY ppg DESC LIMIT 6
+""").fetchall()
+_p("NBA 20+ PPG leaders (≥10 games) query executes",
+   True, f"{len(nba_ppg)} scorers")
+for r in nba_ppg:
+    print(f"       {r[0]:<28} {r[1]:<25} {r[2]:>5} PPG  ({r[3]} GP)")
+
+# Soccer: shot-to-goal conversion rate per team (shots ≥ 20)
+sg_rows = con.execute("""
+    SELECT t.team_name,
+           SUM(CAST(g_stat.stat_value AS INTEGER))  total_goals,
+           SUM(CAST(sh.stat_value     AS INTEGER))  total_shots,
+           ROUND(100.0 * SUM(CAST(g_stat.stat_value AS INTEGER))
+                 / NULLIF(SUM(CAST(sh.stat_value AS INTEGER)), 0), 1) conversion_pct
+    FROM player_stats g_stat
+    JOIN player_stats sh   ON sh.game_player_id = g_stat.game_player_id AND sh.stat_key = 'SH'
+    JOIN game_players gp   ON gp.id = g_stat.game_player_id
+    JOIN teams t           ON t.team_id = gp.team_id AND t.sport = gp.sport
+    WHERE gp.sport = 'soccer' AND g_stat.stat_key = 'G'
+    GROUP BY t.team_name
+    HAVING total_shots >= 20
+    ORDER BY conversion_pct DESC LIMIT 6
+""").fetchall()
+_p("Soccer shot-to-goal conversion per team executes",
+   True, f"{len(sg_rows)} teams with ≥20 shots")
+for r in sg_rows:
+    print(f"       {r[0]:<28} {r[1]:>3}G / {r[2]:>3}SH → {r[3]:>5}%")
+
+# Soccer: goalkeeper save percentage (SV / (SV + GA)), ≥ 3 GP and ≥ 5 SV
+sv_rows = con.execute("""
+    SELECT p.display_name, p.team_name,
+           SUM(CAST(sv.stat_value AS INTEGER)) total_sv,
+           SUM(CAST(ga.stat_value AS INTEGER)) total_ga,
+           ROUND(1.0 * SUM(CAST(sv.stat_value AS INTEGER))
+                 / NULLIF(SUM(CAST(sv.stat_value AS INTEGER))
+                          + SUM(CAST(ga.stat_value AS INTEGER)), 0), 3) sv_pct,
+           COUNT(DISTINCT gp.event_id) gp
+    FROM player_stats sv
+    JOIN player_stats ga ON ga.game_player_id = sv.game_player_id AND ga.stat_key = 'GA'
+    JOIN game_players gp ON gp.id = sv.game_player_id
+    JOIN players p       ON p.player_id = gp.player_id AND p.sport = gp.sport
+    JOIN games g         ON g.event_id  = gp.event_id
+    WHERE gp.sport = 'soccer' AND sv.stat_key = 'SV'
+      AND g.status = 'post' AND gp.did_not_play = FALSE
+    GROUP BY p.display_name, p.team_name
+    HAVING gp >= 3 AND total_sv >= 5
+    ORDER BY sv_pct DESC LIMIT 6
+""").fetchall()
+_p("Soccer GK save-percentage query executes",
+   True, f"{len(sv_rows)} keepers (≥3 GP, ≥5 SV)")
+for r in sv_rows:
+    print(f"       {r[0]:<28} {r[1]:<25} SV%:{r[4]:.3f}  {r[2]}sv/{r[3]}ga  ({r[5]}GP)")
+
+# MLB pitching: ERA / WHIP / K/9 for qualified starters (≥20 IP)
+era_rows = con.execute("""
+    WITH pitcher_agg AS (
+        SELECT gp.player_id, gp.sport,
+               SUM(TRY_CAST(ip.stat_value  AS DOUBLE))  total_ip,
+               SUM(TRY_CAST(er.stat_value  AS INTEGER)) total_er,
+               SUM(TRY_CAST(bb.stat_value  AS INTEGER)) total_bb,
+               SUM(TRY_CAST(h_stat.stat_value AS INTEGER)) total_h,
+               SUM(TRY_CAST(so.stat_value  AS INTEGER)) total_k,
+               COUNT(DISTINCT gp.event_id) gp
+        FROM game_players gp
+        JOIN player_stats ip     ON ip.game_player_id     = gp.id AND ip.stat_key     = 'IP'
+        JOIN player_stats er     ON er.game_player_id     = gp.id AND er.stat_key     = 'ER'
+        JOIN player_stats bb     ON bb.game_player_id     = gp.id AND bb.stat_key     = 'BB'
+        JOIN player_stats h_stat ON h_stat.game_player_id = gp.id AND h_stat.stat_key = 'H'
+        JOIN player_stats so     ON so.game_player_id     = gp.id AND so.stat_key     = 'SO'
+        JOIN games g             ON g.event_id            = gp.event_id
+        WHERE g.league = 'mlb' AND g.status = 'post' AND gp.did_not_play = FALSE
+        GROUP BY gp.player_id, gp.sport
+        HAVING total_ip >= 20
+    )
+    SELECT p.display_name, p.team_name,
+           ROUND(9.0 * total_er / NULLIF(total_ip, 0), 2)             era,
+           ROUND((total_bb + total_h) / NULLIF(total_ip, 0), 3)       whip,
+           ROUND(9.0 * total_k / NULLIF(total_ip, 0), 1)              k9,
+           gp
+    FROM pitcher_agg pa
+    JOIN players p ON p.player_id = pa.player_id AND p.sport = pa.sport
+    ORDER BY era LIMIT 8
+""").fetchall()
+_p("MLB ERA/WHIP/K9 pitching analytics executes",
+   True, f"{len(era_rows)} qualified starters (≥20 IP)")
+for r in era_rows:
+    print(f"       {r[0]:<28} {r[1]:<22} ERA:{r[2]:>5}  WHIP:{r[3]:.3f}  K/9:{r[4]:>5}  ({r[5]}GP)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SUMMARY

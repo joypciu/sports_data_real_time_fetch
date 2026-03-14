@@ -1,0 +1,206 @@
+name: Deploy Sports Data Pipeline to VPS
+
+on:
+  push:
+    branches:
+      - main # Deploy on push to main
+  pull_request:
+    branches:
+      - main # Validate only on PRs targeting main
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Syntax check + automated tests (every PR)
+  # ─────────────────────────────────────────────
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Check Python syntax (all scripts)
+        run: |
+          echo "=== Syntax check ==="
+          python -m py_compile \
+            build_db.py \
+            daily_ingest.py \
+            fetch_matches.py \
+            enrich_players.py \
+            enrich_flashscore.py \
+            realtime_monitor.py \
+            stats_api.py
+          echo "✅ All files passed syntax check"
+
+      - name: Run unit tests
+        run: |
+          echo "=== Running test suite ==="
+          pytest tests/test_suite.py -v --tb=short
+          echo "✅ All tests passed"
+
+  # ─────────────────────────────────────────────
+  # Deploy — only on pushes to main
+  # ─────────────────────────────────────────────
+  deploy:
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_SERVICE_NAME: ${{ secrets.DEPLOY_SERVICE_NAME }}
+      DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
+      DEPLOY_BRANCH: ${{ secrets.DEPLOY_BRANCH }}
+      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+      DEPLOY_REPO_URL: ${{ secrets.DEPLOY_REPO_URL }}
+      DEPLOY_REPO_SLUG: ${{ secrets.DEPLOY_REPO_SLUG }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy to VPS (attempt 1)
+        id: deploy_try_1
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          timeout: 60s
+          command_timeout: 5m
+          script: |
+            set -e
+            SERVICE_NAME="${DEPLOY_SERVICE_NAME:-sports-stats-api}"
+            SERVICE_DIR="${DEPLOY_DIR:-/home/ubuntu/services/${SERVICE_NAME}}"
+            BRANCH="${DEPLOY_BRANCH:-main}"
+            PORT="${DEPLOY_PORT:-8001}"
+            REPO_URL="${DEPLOY_REPO_URL}"
+            REPO_SLUG="${DEPLOY_REPO_SLUG}"
+
+            echo "Deploying service=${SERVICE_NAME} dir=${SERVICE_DIR} port=${PORT}"
+
+            if [ ! -d "${SERVICE_DIR}" ]; then
+              mkdir -p "${SERVICE_DIR}"
+            fi
+            cd "${SERVICE_DIR}"
+
+            if [ ! -d ".git" ]; then
+              git clone "${REPO_URL}" .
+            fi
+
+            export SERVICE_NAME="${SERVICE_NAME}"
+            export SERVICE_DIR="${SERVICE_DIR}"
+            export DEPLOY_BRANCH="${BRANCH}"
+            export API_PORT="${PORT}"
+            export REPO_URL="${REPO_URL}"
+            export EXPECTED_REPO_SLUG="${REPO_SLUG}"
+
+            chmod +x deploy.sh
+            ./deploy.sh
+
+            echo "=== Service status ==="
+            sudo systemctl status "${SERVICE_NAME}" --no-pager || true
+            echo "✅ Deployment completed"
+
+      - name: Wait before retry
+        if: steps.deploy_try_1.outcome == 'failure'
+        run: sleep 10
+
+      - name: Deploy to VPS (attempt 2)
+        id: deploy_try_2
+        if: steps.deploy_try_1.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          timeout: 60s
+          command_timeout: 5m
+          script: |
+            set -e
+            SERVICE_NAME="${DEPLOY_SERVICE_NAME:-sports-stats-api}"
+            SERVICE_DIR="${DEPLOY_DIR:-/home/ubuntu/services/${SERVICE_NAME}}"
+            BRANCH="${DEPLOY_BRANCH:-main}"
+            PORT="${DEPLOY_PORT:-8001}"
+            REPO_URL="${DEPLOY_REPO_URL}"
+            REPO_SLUG="${DEPLOY_REPO_SLUG}"
+
+            cd "${SERVICE_DIR}"
+
+            export SERVICE_NAME="${SERVICE_NAME}"
+            export SERVICE_DIR="${SERVICE_DIR}"
+            export DEPLOY_BRANCH="${BRANCH}"
+            export API_PORT="${PORT}"
+            export REPO_URL="${REPO_URL}"
+            export EXPECTED_REPO_SLUG="${REPO_SLUG}"
+
+            chmod +x deploy.sh
+            ./deploy.sh
+
+            echo "✅ Retry deployment completed"
+
+      - name: Fail if both deploy attempts failed
+        if: steps.deploy_try_1.outcome == 'failure' && steps.deploy_try_2.outcome == 'failure'
+        run: |
+          echo "❌ Deployment failed after 2 SSH attempts."
+          exit 1
+
+      - name: Post-deploy smoke test (health check via SSH)
+        if: steps.deploy_try_1.outcome == 'success' || steps.deploy_try_2.outcome == 'success'
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          timeout: 30s
+          command_timeout: 1m
+          script: |
+            set -e
+            PORT="${DEPLOY_PORT:-8001}"
+            echo "=== Smoke test: GET http://localhost:${PORT}/health ==="
+            RESPONSE=$(curl -sf "http://localhost:${PORT}/health")
+            echo "Response: $RESPONSE"
+            STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))")
+            if [ "$STATUS" != "ok" ]; then
+              echo "❌ Health check returned unexpected status: $STATUS"
+              exit 1
+            fi
+            echo "✅ Smoke test passed"
+
+      - name: Notify on smoke test failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_SENDER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          to: ${{ secrets.ADMIN_EMAIL }}
+          from: Sports Data CI <${{ secrets.GMAIL_SENDER }}>
+          subject: "🚨 Deploy/Smoke Test FAILED — realtime_data_fetch (${{ github.ref_name }})"
+          body: |
+            The post-deploy smoke test for realtime_data_fetch failed.
+
+            Repository   : ${{ github.repository }}
+            Branch       : ${{ github.ref_name }}
+            Commit       : ${{ github.sha }}
+            Triggered by : ${{ github.actor }}
+
+            View the full run log:
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Fix the issue and push again to trigger a new deployment.

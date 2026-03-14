@@ -1,0 +1,15 @@
+# Core data fetch & enrichment
+httpx
+
+# Database
+duckdb
+pandas
+
+# Stats API service (stats_api.py)
+fastapi
+uvicorn[standard]
+python-dotenv
+
+# Testing
+pytest
+pytest-asyncio
