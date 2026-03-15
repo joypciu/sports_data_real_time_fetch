@@ -56,122 +56,36 @@ jobs:
     needs: validate
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    env:
-      DEPLOY_SERVICE_NAME: ${{ secrets.DEPLOY_SERVICE_NAME }}
-      DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
-      DEPLOY_BRANCH: ${{ secrets.DEPLOY_BRANCH }}
-      DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
-      DEPLOY_REPO_URL: ${{ secrets.DEPLOY_REPO_URL }}
-      DEPLOY_REPO_SLUG: ${{ secrets.DEPLOY_REPO_SLUG }}
-      GH_PAT: ${{ secrets.GH_PAT }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Deploy to VPS (attempt 1)
-        id: deploy_try_1
-        continue-on-error: true
+      - name: Deploy to VPS
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USERNAME }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
-          timeout: 60s
           command_timeout: 5m
-          envs: GH_PAT,DEPLOY_SERVICE_NAME,DEPLOY_DIR,DEPLOY_BRANCH,DEPLOY_PORT,DEPLOY_REPO_URL,DEPLOY_REPO_SLUG
           script: |
             set -e
-            SERVICE_NAME="${DEPLOY_SERVICE_NAME:-sports-stats-api}"
-            SERVICE_DIR="${DEPLOY_DIR:-/home/ubuntu/services/${SERVICE_NAME}}"
-            BRANCH="${DEPLOY_BRANCH:-main}"
-            PORT="${DEPLOY_PORT:-8001}"
-            REPO_URL="${DEPLOY_REPO_URL}"
-            REPO_SLUG="${DEPLOY_REPO_SLUG}"
-            AUTH_URL="https://x-access-token:${GH_PAT}@github.com/${REPO_SLUG}.git"
+            cd /home/ubuntu/services/sports-stats-api
 
-            echo "Deploying service=${SERVICE_NAME} dir=${SERVICE_DIR} port=${PORT}"
+            # Pull latest code
+            git fetch origin
+            git reset --hard origin/main
 
-            if [ ! -d "${SERVICE_DIR}" ]; then
-              mkdir -p "${SERVICE_DIR}"
-            fi
-            cd "${SERVICE_DIR}"
-
-            if [ ! -d ".git" ]; then
-              git clone "${AUTH_URL}" .
-            else
-              git remote set-url origin "${AUTH_URL}"
-            fi
-
-            export SERVICE_NAME="${SERVICE_NAME}"
-            export SERVICE_DIR="${SERVICE_DIR}"
-            export DEPLOY_BRANCH="${BRANCH}"
-            export API_PORT="${PORT}"
-            export REPO_URL="${REPO_URL}"
-            export EXPECTED_REPO_SLUG="${REPO_SLUG}"
-
+            # Run deploy script (venv, deps, systemd units)
             chmod +x deploy.sh
             ./deploy.sh
 
             echo "=== Service status ==="
-            sudo systemctl status "${SERVICE_NAME}" --no-pager || true
+            sudo systemctl status sports-stats-api --no-pager || true
             echo "✅ Deployment completed"
 
-      - name: Wait before retry
-        if: steps.deploy_try_1.outcome == 'failure'
-        run: sleep 10
-
-      - name: Deploy to VPS (attempt 2)
-        id: deploy_try_2
-        if: steps.deploy_try_1.outcome == 'failure'
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USERNAME }}
-          key: ${{ secrets.VPS_SSH_KEY }}
-          port: ${{ secrets.VPS_PORT }}
-          timeout: 60s
-          command_timeout: 5m
-          envs: GH_PAT,DEPLOY_SERVICE_NAME,DEPLOY_DIR,DEPLOY_BRANCH,DEPLOY_PORT,DEPLOY_REPO_URL,DEPLOY_REPO_SLUG
-          script: |
-            set -e
-            SERVICE_NAME="${DEPLOY_SERVICE_NAME:-sports-stats-api}"
-            SERVICE_DIR="${DEPLOY_DIR:-/home/ubuntu/services/${SERVICE_NAME}}"
-            BRANCH="${DEPLOY_BRANCH:-main}"
-            PORT="${DEPLOY_PORT:-8001}"
-            REPO_URL="${DEPLOY_REPO_URL}"
-            REPO_SLUG="${DEPLOY_REPO_SLUG}"
-            AUTH_URL="https://x-access-token:${GH_PAT}@github.com/${REPO_SLUG}.git"
-
-            cd "${SERVICE_DIR}"
-
-            if [ ! -d ".git" ]; then
-              git clone "${AUTH_URL}" .
-            else
-              git remote set-url origin "${AUTH_URL}"
-            fi
-
-            export SERVICE_NAME="${SERVICE_NAME}"
-            export SERVICE_DIR="${SERVICE_DIR}"
-            export DEPLOY_BRANCH="${BRANCH}"
-            export API_PORT="${PORT}"
-            export REPO_URL="${REPO_URL}"
-            export EXPECTED_REPO_SLUG="${REPO_SLUG}"
-
-            chmod +x deploy.sh
-            ./deploy.sh
-
-            echo "✅ Retry deployment completed"
-
-      - name: Fail if both deploy attempts failed
-        if: steps.deploy_try_1.outcome == 'failure' && steps.deploy_try_2.outcome == 'failure'
-        run: |
-          echo "❌ Deployment failed after 2 SSH attempts."
-          exit 1
-
-      - name: Post-deploy smoke test (health check via SSH)
-        if: steps.deploy_try_1.outcome == 'success' || steps.deploy_try_2.outcome == 'success'
+      - name: Post-deploy smoke test
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -182,9 +96,8 @@ jobs:
           command_timeout: 1m
           script: |
             set -e
-            PORT="${DEPLOY_PORT:-8001}"
-            echo "=== Smoke test: GET http://localhost:${PORT}/health ==="
-            RESPONSE=$(curl -sf "http://localhost:${PORT}/health")
+            echo "=== Smoke test: GET http://localhost:8001/health ==="
+            RESPONSE=$(curl -sf "http://localhost:8001/health")
             echo "Response: $RESPONSE"
             STATUS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))")
             if [ "$STATUS" != "ok" ]; then
