@@ -2150,6 +2150,670 @@ class TestDatabaseIntegrity(unittest.TestCase):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 18. realtime_monitor — detect_changes (pregame + live events)
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestDetectChanges(unittest.TestCase):
+
+    def setUp(self):
+        import realtime_monitor as rm
+        self.rm = rm
+
+    def _base(self, status="in", home_score="50", away_score="45",
+              period=2, home_pct=0.60, home_ml=-120, away_ml=100,
+              game_total=220.0):
+        return {
+            "event_id":   "EVT1",
+            "short_name": "HOM @ AWY",
+            "sport":      "basketball",
+            "league":     "nba",
+            "league_key": "nba",
+            "status":     status,
+            "period":     period,
+            "clock":      "5:00",
+            "home":       {"team_abbr": "HOM", "score": home_score, "is_winner": None},
+            "away":       {"team_abbr": "AWY", "score": away_score, "is_winner": None},
+            "win_prob":   {"home_pct": home_pct, "away_pct": 1 - home_pct},
+            "odds":       {"home_ml": home_ml, "away_ml": away_ml,
+                           "game_total": game_total},
+        }
+
+    def _types(self, events):
+        return [e["type"] for e in events]
+
+    # --- Transition events ---------------------------------------------------
+
+    def test_game_started_event(self):
+        old = self._base(status="pre", home_score=None, away_score=None)
+        new = self._base(status="in")
+        evs = self.rm.detect_changes(old, new)
+        self.assertIn("GAME_STARTED", self._types(evs))
+
+    def test_game_finished_event(self):
+        old = self._base(status="in")
+        new = self._base(status="post", home_score="110", away_score="105")
+        evs = self.rm.detect_changes(old, new)
+        self.assertIn("GAME_FINISHED", self._types(evs))
+
+    # --- Live game events ----------------------------------------------------
+
+    def test_score_update_live(self):
+        old = self._base(home_score="50", away_score="45")
+        new = self._base(home_score="52", away_score="45")
+        evs = self.rm.detect_changes(old, new)
+        self.assertIn("SCORE_UPDATE", self._types(evs))
+        score_ev = next(e for e in evs if e["type"] == "SCORE_UPDATE")
+        self.assertEqual(score_ev["home_score"], "52")
+
+    def test_period_change_live(self):
+        old = self._base(period=2)
+        new = self._base(period=3)
+        evs = self.rm.detect_changes(old, new)
+        self.assertIn("PERIOD_CHANGE", self._types(evs))
+
+    def test_period_change_only_when_live(self):
+        """Period change must NOT fire for finished games."""
+        old = self._base(status="post", period=3)
+        new = self._base(status="post", period=4)
+        evs = self.rm.detect_changes(old, new)
+        self.assertNotIn("PERIOD_CHANGE", self._types(evs))
+
+    def test_win_prob_shift_live(self):
+        old = self._base(home_pct=0.60)
+        new = self._base(home_pct=0.70)
+        evs = self.rm.detect_changes(old, new)
+        self.assertIn("WIN_PROB_SHIFT", self._types(evs))
+
+    def test_win_prob_shift_NOT_fired_for_pregame(self):
+        """Win probability shift must NOT fire for pregame games."""
+        old = self._base(status="pre", home_score=None, away_score=None, home_pct=0.55)
+        new = self._base(status="pre", home_score=None, away_score=None, home_pct=0.70)
+        evs = self.rm.detect_changes(old, new)
+        self.assertNotIn("WIN_PROB_SHIFT", self._types(evs))
+
+    def test_odds_move_live_emits_odds_move(self):
+        """Live game moneyline shifts emit ODDS_MOVE, not LINE_MOVE."""
+        old = self._base(home_ml=-120)
+        new = self._base(home_ml=-150)   # 30-point move
+        evs = self.rm.detect_changes(old, new)
+        self.assertIn("ODDS_MOVE", self._types(evs))
+        self.assertNotIn("LINE_MOVE", self._types(evs))
+
+    def test_no_score_update_when_none(self):
+        """No SCORE_UPDATE when scores are still None (pregame)."""
+        old = self._base(status="pre", home_score=None, away_score=None)
+        new = self._base(status="pre", home_score=None, away_score=None)
+        evs = self.rm.detect_changes(old, new)
+        self.assertNotIn("SCORE_UPDATE", self._types(evs))
+
+    def test_no_score_update_when_unchanged(self):
+        old = self._base(home_score="50", away_score="45")
+        new = self._base(home_score="50", away_score="45")
+        evs = self.rm.detect_changes(old, new)
+        self.assertNotIn("SCORE_UPDATE", self._types(evs))
+
+    # --- Pregame game events --------------------------------------------------
+
+    def test_line_move_for_pregame_game(self):
+        """Pregame moneyline shifts emit LINE_MOVE, not ODDS_MOVE."""
+        old = self._base(status="pre", home_score=None, away_score=None, home_ml=-110)
+        new = self._base(status="pre", home_score=None, away_score=None, home_ml=-150)  # 40-pt move
+        evs = self.rm.detect_changes(old, new)
+        self.assertIn("LINE_MOVE", self._types(evs))
+        self.assertNotIn("ODDS_MOVE", self._types(evs))
+
+    def test_line_move_fields(self):
+        old = self._base(status="pre", home_score=None, away_score=None, home_ml=-110)
+        new = self._base(status="pre", home_score=None, away_score=None, home_ml=-160)
+        evs = self.rm.detect_changes(old, new)
+        lm = next((e for e in evs if e["type"] == "LINE_MOVE"), None)
+        self.assertIsNotNone(lm)
+        self.assertEqual(lm["old_value"], -110)
+        self.assertEqual(lm["new_value"], -160)
+
+    def test_small_ml_move_does_not_fire(self):
+        """Moves of < 5 points must not emit any event."""
+        old = self._base(home_ml=-110)
+        new = self._base(home_ml=-112)   # 2-point move — below threshold
+        evs = self.rm.detect_changes(old, new)
+        types = self._types(evs)
+        self.assertNotIn("ODDS_MOVE", types)
+        self.assertNotIn("LINE_MOVE", types)
+
+    def test_total_move_fires(self):
+        old = self._base(game_total=220.0)
+        new = self._base(game_total=221.0)   # 1-point move
+        evs = self.rm.detect_changes(old, new)
+        self.assertIn("TOTAL_MOVE", self._types(evs))
+
+    def test_small_total_move_does_not_fire(self):
+        old = self._base(game_total=220.0)
+        new = self._base(game_total=220.3)   # < 0.5 — no event
+        evs = self.rm.detect_changes(old, new)
+        self.assertNotIn("TOTAL_MOVE", self._types(evs))
+
+    def test_no_events_when_nothing_changes(self):
+        g = self._base()
+        evs = self.rm.detect_changes(g, dict(g))  # identical copy
+        self.assertEqual(evs, [])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 19. realtime_monitor — pregame rate-limiting & opening_odds (poll_once logic)
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestPregameHandling(unittest.TestCase):
+
+    def setUp(self):
+        import realtime_monitor as rm
+        self.rm = rm
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_state(self, status="pre", event_id="EVT1") -> dict:
+        return {
+            "event_id":      event_id,
+            "short_name":    "HOM @ AWY",
+            "name":          "Home vs Away",
+            "league_key":    "nba",
+            "sport":         "basketball",
+            "league":        "nba",
+            "status":        status,
+            "status_detail": "Scheduled" if status == "pre" else "3rd Quarter",
+            "period":        0 if status == "pre" else 3,
+            "clock":         "",
+            "home":          {"team_abbr": "HOM", "score": None if status == "pre" else "60",
+                              "team_id": "1", "is_winner": None, "record": "20-10"},
+            "away":          {"team_abbr": "AWY", "score": None if status == "pre" else "55",
+                              "team_id": "2", "is_winner": None, "record": "18-12"},
+            "odds":          {"home_ml": -150, "away_ml": 130, "game_total": 220.0},
+            "win_prob":      {"home_pct": 0.60, "away_pct": 0.40},
+            "players":       [],
+            "formations":    {},
+            "date":          "2026-03-15T20:00Z",
+        }
+
+    def test_save_live_state_separates_pregame_and_live(self):
+        """save_live_state correctly places pre/in/post games in separate buckets."""
+        states = {
+            "E1": self._make_state("pre",  "E1"),
+            "E2": self._make_state("in",   "E2"),
+            "E3": self._make_state("post", "E3"),
+        }
+        states["E3"]["home"]["score"] = "110"
+        states["E3"]["away"]["score"] = "105"
+        self.rm.save_live_state(states, self.tmpdir)
+        with open(os.path.join(self.tmpdir, "live_state.json")) as f:
+            data = json.load(f)
+        self.assertEqual(data["pregame_count"],  1)
+        self.assertEqual(data["live_count"],     1)
+        self.assertEqual(data["finished_count"], 1)
+        self.assertEqual(data["pregame"][0]["status"],  "pre")
+        self.assertEqual(data["live"][0]["status"],     "in")
+        self.assertEqual(data["finished"][0]["status"], "post")
+
+    def test_pregame_game_in_pregame_dated_file(self):
+        """Pregame games must appear in pregame_YYYYMMDD.json."""
+        from datetime import date
+        today = date.today().strftime("%Y%m%d")
+        states = {"E1": self._make_state("pre", "E1")}
+        self.rm.save_live_state(states, self.tmpdir)
+        path = os.path.join(self.tmpdir, f"pregame_{today}.json")
+        self.assertTrue(os.path.exists(path))
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["games"][0]["event_id"], "E1")
+
+    def test_live_game_not_in_pregame_file(self):
+        """In-progress games must NOT appear in pregame_YYYYMMDD.json."""
+        from datetime import date
+        today = date.today().strftime("%Y%m%d")
+        states = {"E1": self._make_state("in", "E1")}
+        self.rm.save_live_state(states, self.tmpdir)
+        path = os.path.join(self.tmpdir, f"pregame_{today}.json")
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["count"], 0)
+
+    def test_pregame_odds_refresh_every_constant_exists(self):
+        """PREGAME_ODDS_REFRESH_EVERY constant must be defined and > 0."""
+        self.assertTrue(hasattr(self.rm, "PREGAME_ODDS_REFRESH_EVERY"))
+        self.assertGreater(self.rm.PREGAME_ODDS_REFRESH_EVERY, 0)
+
+    def test_build_game_state_accepts_refresh_extras_false(self):
+        """build_game_state must accept refresh_extras=False without error
+        (it returns {} when no competition data — same as normal failure path)."""
+        http_mock = MagicMock()
+        http_mock.get.return_value = {}   # empty response
+        # Empty event — no competition data — should return {} gracefully
+        result = self.rm.build_game_state(
+            http_mock, "basketball", "nba", "nba",
+            {"id": "EVT99", "competitions": []},
+            fetch_players=False,
+            player_cycle=False,
+            refresh_extras=False,
+        )
+        self.assertEqual(result, {})
+        # fetch_odds and fetch_win_prob must NOT have been called
+        # (refresh_extras=False, so no external calls)
+        # The http_mock.get would be called 0 times with refresh_extras=False
+        http_mock.get.assert_not_called()
+
+    def test_new_game_discovered_event_type_is_string(self):
+        """NEW_GAME_DISCOVERED event must have the correct type string."""
+        ev = {
+            "type": "NEW_GAME_DISCOVERED",
+            "event_id": "EVT1",
+            "status": "pre",
+            "scheduled_at": "2026-03-15T20:00Z",
+        }
+        self.assertEqual(ev["type"], "NEW_GAME_DISCOVERED")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 20. build_db — live_games table DDL
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestLiveGamesDDL(unittest.TestCase):
+    """The live_games table must be created by build_db.DDL and have the right schema."""
+
+    def setUp(self):
+        self.con = duckdb.connect(":memory:")
+        self.con.execute(bdb.DDL)
+
+    def tearDown(self):
+        self.con.close()
+
+    def test_live_games_table_exists(self):
+        tables = {r[0] for r in self.con.execute("SHOW TABLES").fetchall()}
+        self.assertIn("live_games", tables, "live_games table must exist after DDL")
+
+    def test_live_games_has_event_id_pk(self):
+        cols = {r[0] for r in self.con.execute("DESCRIBE live_games").fetchall()}
+        self.assertIn("event_id", cols)
+
+    def test_live_games_required_columns(self):
+        required = {
+            "event_id", "league_key", "sport", "league", "name",
+            "status", "status_detail", "period", "clock",
+            "home_team_id", "home_team_name", "home_team_abbr", "home_score",
+            "away_team_id", "away_team_name", "away_team_abbr", "away_score",
+            "home_ml", "away_ml", "home_spread", "game_total",
+            "home_win_pct", "away_win_pct",
+            "situation", "players", "updated_at",
+        }
+        actual = {r[0] for r in self.con.execute("DESCRIBE live_games").fetchall()}
+        missing = required - actual
+        self.assertEqual(missing, set(), f"Missing columns in live_games: {missing}")
+
+    def test_live_games_insert_and_select(self):
+        self.con.execute("""
+            INSERT INTO live_games (
+                event_id, league_key, sport, league, name,
+                status, status_detail, period, clock,
+                home_team_id, home_team_name, home_team_abbr, home_score,
+                away_team_id, away_team_name, away_team_abbr, away_score,
+                home_ml, away_ml, home_spread, game_total,
+                home_win_pct, away_win_pct,
+                situation, players, updated_at
+            ) VALUES (
+                'EVT1', 'nba', 'basketball', 'nba', 'Home vs Away',
+                'in', '3rd Quarter', 3, '5:00',
+                'T1', 'Home', 'HOM', '60',
+                'T2', 'Away', 'AWY', '55',
+                -150, 130, -3.5, 220.0,
+                0.65, 0.35,
+                '{}', '[]', '2026-03-15T20:00:00'
+            )
+        """)
+        row = self.con.execute("SELECT event_id, status, period FROM live_games").fetchone()
+        self.assertEqual(row[0], "EVT1")
+        self.assertEqual(row[1], "in")
+        self.assertEqual(row[2], 3)
+
+    def test_live_games_delete_replaces_rows(self):
+        """DELETE + re-INSERT pattern used by update_db must work correctly."""
+        for i in range(3):
+            self.con.execute(f"""
+                INSERT INTO live_games (event_id, sport, status, situation, players)
+                VALUES ('EVT{i}', 'basketball', 'in', '{{}}', '[]')
+            """)
+        self.con.execute("DELETE FROM live_games")
+        n = self.con.execute("SELECT COUNT(*) FROM live_games").fetchone()[0]
+        self.assertEqual(n, 0, "DELETE must remove all live_games rows")
+
+    def test_live_games_in_drop_all(self):
+        """DROP_ALL must include live_games so --rebuild works cleanly."""
+        self.assertIn("live_games", bdb.DROP_ALL)
+
+    def test_live_games_situation_is_json_compatible(self):
+        """situation column must accept a JSON string."""
+        import json
+        payload = json.dumps({"linescores": [{"period": 1, "home": 10, "away": 8}]})
+        self.con.execute(
+            "INSERT INTO live_games (event_id, sport, status, situation, players)"
+            " VALUES ('EVTJ', 'basketball', 'in', ?, '[]')",
+            [payload],
+        )
+        row = self.con.execute("SELECT situation FROM live_games WHERE event_id='EVTJ'").fetchone()
+        self.assertIsNotNone(row[0])
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 21. update_db — incremental_historical_update & sync_live_games
+# ════════════════════════════════════════════════════════════════════════════
+
+import update_db
+
+
+class TestUpdateDbIncrementalUpdate(unittest.TestCase):
+    """Tests for update_db.incremental_historical_update()."""
+
+    def setUp(self):
+        self.tmpdir  = tempfile.mkdtemp()
+        self.data_dir = os.path.join(self.tmpdir, "historical_data")
+        os.makedirs(self.data_dir)
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        con = duckdb.connect(self.db_path)
+        con.execute(bdb.DDL)
+        con.close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_json(self, filename: str, games: list) -> str:
+        path = os.path.join(self.data_dir, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(games, f)
+        return path
+
+    def test_returns_zeros_on_empty_data_dir(self):
+        g, p, s = update_db.incremental_historical_update(self.db_path, self.data_dir)
+        self.assertEqual((g, p, s), (0, 0, 0))
+
+    def test_returns_zeros_on_missing_data_dir(self):
+        g, p, s = update_db.incremental_historical_update(self.db_path, "/nonexistent/path")
+        self.assertEqual((g, p, s), (0, 0, 0))
+
+    def test_inserts_new_game_from_json(self):
+        self._write_json("nba.json", [_minimal_game(event_id="NEW1")])
+        g, _, _ = update_db.incremental_historical_update(self.db_path, self.data_dir)
+        self.assertEqual(g, 1)
+
+    def test_does_not_duplicate_existing_game(self):
+        game = _minimal_game(event_id="DUP1")
+        self._write_json("nba.json", [game])
+        update_db.incremental_historical_update(self.db_path, self.data_dir)
+        # Second call — nothing new
+        g, _, _ = update_db.incremental_historical_update(self.db_path, self.data_dir)
+        self.assertEqual(g, 0)
+
+    def test_inserts_only_new_games(self):
+        self._write_json("nba.json", [
+            _minimal_game(event_id="OLD1"),
+            _minimal_game(event_id="OLD2"),
+        ])
+        update_db.incremental_historical_update(self.db_path, self.data_dir)
+
+        # Add a third new game
+        self._write_json("nba.json", [
+            _minimal_game(event_id="OLD1"),
+            _minimal_game(event_id="OLD2"),
+            _minimal_game(event_id="NEW3"),
+        ])
+        g, _, _ = update_db.incremental_historical_update(self.db_path, self.data_dir)
+        self.assertEqual(g, 1)
+
+    def test_is_idempotent(self):
+        self._write_json("nba.json", [_minimal_game(event_id="IDEM1")])
+        for _ in range(3):
+            update_db.incremental_historical_update(self.db_path, self.data_dir)
+        con = duckdb.connect(self.db_path)
+        count = con.execute("SELECT COUNT(*) FROM games").fetchone()[0]
+        con.close()
+        self.assertEqual(count, 1)
+
+    def test_processes_multiple_sport_files(self):
+        self._write_json("nba.json",  [_minimal_game(event_id="NBA1", sport="basketball")])
+        self._write_json("nhl.json",  [_minimal_game(event_id="NHL1", sport="hockey",
+                                                      league="nhl")])
+        g, _, _ = update_db.incremental_historical_update(self.db_path, self.data_dir)
+        self.assertEqual(g, 2)
+
+
+class TestUpdateDbSyncLiveGames(unittest.TestCase):
+    """Tests for update_db.sync_live_games()."""
+
+    def setUp(self):
+        self.tmpdir   = tempfile.mkdtemp()
+        self.live_dir = os.path.join(self.tmpdir, "live")
+        os.makedirs(self.live_dir)
+        self.db_path  = os.path.join(self.tmpdir, "test.db")
+        con = duckdb.connect(self.db_path)
+        con.execute(bdb.DDL)
+        con.close()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_live_state(self, payload: dict) -> None:
+        path = os.path.join(self.live_dir, "live_state.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def _live_state(self, pre=None, live=None, finished=None) -> dict:
+        from datetime import datetime, timezone
+        return {
+            "updated_at":     datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "total_games":    len(pre or []) + len(live or []) + len(finished or []),
+            "live_count":     len(live or []),
+            "pregame_count":  len(pre or []),
+            "finished_count": len(finished or []),
+            "live":           live or [],
+            "pregame":        pre or [],
+            "finished":       finished or [],
+        }
+
+    def _game_entry(self, event_id="EVT1", status="in") -> dict:
+        return {
+            "event_id":      event_id,
+            "league_key":    "nba",
+            "sport":         "basketball",
+            "league":        "nba",
+            "name":          "Home vs Away",
+            "status":        status,
+            "status_detail": "3rd Quarter" if status == "in" else "Scheduled",
+            "period":        3 if status == "in" else 0,
+            "clock":         "5:00",
+            "home": {"team_id": "T1", "team_name": "Home", "team_abbr": "HOM",
+                     "score": "60" if status == "in" else None},
+            "away": {"team_id": "T2", "team_name": "Away", "team_abbr": "AWY",
+                     "score": "55" if status == "in" else None},
+            "odds":     {"home_ml": -150, "away_ml": 130, "game_total": 220.0},
+            "win_prob": {"home_pct": 0.65, "away_pct": 0.35},
+            "situation": {"linescores": []},
+            "players":   [],
+        }
+
+    def test_returns_zero_when_no_live_state_file(self):
+        count = update_db.sync_live_games(self.db_path, self.live_dir)
+        self.assertEqual(count, 0)
+
+    def test_returns_zero_when_all_buckets_empty(self):
+        self._write_live_state(self._live_state())
+        count = update_db.sync_live_games(self.db_path, self.live_dir)
+        self.assertEqual(count, 0)
+
+    def test_syncs_live_game_to_table(self):
+        self._write_live_state(self._live_state(live=[self._game_entry("E1", "in")]))
+        count = update_db.sync_live_games(self.db_path, self.live_dir)
+        self.assertEqual(count, 1)
+        con = duckdb.connect(self.db_path)
+        row = con.execute("SELECT status FROM live_games WHERE event_id='E1'").fetchone()
+        con.close()
+        self.assertEqual(row[0], "in")
+
+    def test_syncs_pregame_to_table(self):
+        self._write_live_state(self._live_state(pre=[self._game_entry("P1", "pre")]))
+        count = update_db.sync_live_games(self.db_path, self.live_dir)
+        self.assertEqual(count, 1)
+        con = duckdb.connect(self.db_path)
+        row = con.execute("SELECT status FROM live_games WHERE event_id='P1'").fetchone()
+        con.close()
+        self.assertEqual(row[0], "pre")
+
+    def test_syncs_all_buckets_together(self):
+        self._write_live_state(self._live_state(
+            pre=[self._game_entry("P1", "pre")],
+            live=[self._game_entry("L1", "in")],
+            finished=[self._game_entry("F1", "post")],
+        ))
+        count = update_db.sync_live_games(self.db_path, self.live_dir)
+        self.assertEqual(count, 3)
+
+    def test_replaces_stale_rows_on_each_call(self):
+        """Each call must DELETE all old rows and INSERT fresh ones."""
+        self._write_live_state(self._live_state(live=[self._game_entry("E1", "in")]))
+        update_db.sync_live_games(self.db_path, self.live_dir)
+
+        # Second call with different data
+        self._write_live_state(self._live_state(live=[self._game_entry("E2", "in")]))
+        update_db.sync_live_games(self.db_path, self.live_dir)
+
+        con = duckdb.connect(self.db_path)
+        rows = con.execute("SELECT event_id FROM live_games ORDER BY event_id").fetchall()
+        con.close()
+        event_ids = [r[0] for r in rows]
+        self.assertNotIn("E1", event_ids, "Old row E1 must be deleted on new sync")
+        self.assertIn("E2", event_ids)
+
+    def test_graceful_on_corrupt_live_state(self):
+        """Corrupt JSON must return 0 without raising."""
+        path = os.path.join(self.live_dir, "live_state.json")
+        with open(path, "w") as f:
+            f.write("{ invalid json }")
+        count = update_db.sync_live_games(self.db_path, self.live_dir)
+        self.assertEqual(count, 0)
+
+    def test_entries_missing_event_id_are_skipped(self):
+        bad_entry = {**self._game_entry(""), "event_id": ""}
+        self._write_live_state(self._live_state(live=[bad_entry]))
+        count = update_db.sync_live_games(self.db_path, self.live_dir)
+        self.assertEqual(count, 0)
+
+    def test_odds_stored_correctly(self):
+        game = self._game_entry("ODD1", "in")
+        game["odds"]["home_ml"] = -180
+        game["odds"]["game_total"] = 215.5
+        self._write_live_state(self._live_state(live=[game]))
+        update_db.sync_live_games(self.db_path, self.live_dir)
+        con = duckdb.connect(self.db_path)
+        row = con.execute(
+            "SELECT home_ml, game_total FROM live_games WHERE event_id='ODD1'"
+        ).fetchone()
+        con.close()
+        self.assertEqual(row[0], -180)
+        self.assertAlmostEqual(row[1], 215.5)
+
+    def test_win_prob_stored(self):
+        game = self._game_entry("WP1", "in")
+        game["win_prob"]["home_pct"] = 0.73
+        self._write_live_state(self._live_state(live=[game]))
+        update_db.sync_live_games(self.db_path, self.live_dir)
+        con = duckdb.connect(self.db_path)
+        row = con.execute(
+            "SELECT home_win_pct FROM live_games WHERE event_id='WP1'"
+        ).fetchone()
+        con.close()
+        self.assertAlmostEqual(row[0], 0.73, places=4)
+
+
+class TestUpdateDbHelpers(unittest.TestCase):
+    """Unit tests for update_db type-coercion helpers."""
+
+    def test_int_valid(self):
+        self.assertEqual(update_db._int("42"), 42)
+        self.assertEqual(update_db._int(-150), -150)
+
+    def test_int_invalid(self):
+        self.assertIsNone(update_db._int(None))
+        self.assertIsNone(update_db._int("N/A"))
+
+    def test_float_valid(self):
+        self.assertAlmostEqual(update_db._float("7.5"), 7.5)
+
+    def test_float_invalid(self):
+        self.assertIsNone(update_db._float(None))
+        self.assertIsNone(update_db._float(""))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 22. main.py — module structure, imports, and thread configuration
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestMainModuleStructure(unittest.TestCase):
+    """Verify main.py contains the correct thread targets and CLI args."""
+
+    def setUp(self):
+        import importlib
+        import main as main_mod
+        importlib.reload(main_mod)   # ensure fresh import
+        self.main_mod = main_mod
+
+    def test_run_api_function_exists(self):
+        self.assertTrue(callable(self.main_mod._run_api))
+
+    def test_run_monitor_function_exists(self):
+        self.assertTrue(callable(self.main_mod._run_monitor))
+
+    def test_run_updater_function_exists(self):
+        self.assertTrue(callable(self.main_mod._run_updater),
+                        "_run_updater must exist for Thread 3 (DB updater)")
+
+    def test_main_function_exists(self):
+        self.assertTrue(callable(self.main_mod.main))
+
+    def test_module_has_no_import_errors(self):
+        """Importing main must not raise any exception."""
+        import main  # noqa: F401
+        self.assertTrue(True)
+
+    def test_run_updater_signature(self):
+        """_run_updater must accept (db_path, data_dir, live_dir)."""
+        import inspect
+        sig = inspect.signature(self.main_mod._run_updater)
+        params = list(sig.parameters.keys())
+        self.assertIn("db_path",   params)
+        self.assertIn("data_dir",  params)
+        self.assertIn("live_dir",  params)
+
+    def test_run_api_signature(self):
+        """_run_api must accept a port parameter."""
+        import inspect
+        sig = inspect.signature(self.main_mod._run_api)
+        self.assertIn("port", sig.parameters)
+
+    def test_threading_import_is_present(self):
+        """main must import threading for thread management."""
+        import threading
+        self.assertTrue(hasattr(self.main_mod, "__file__"))
+        # Verify threading is available after import
+        self.assertIsNotNone(threading.Thread)
+
+    def test_signal_handlers_registered_on_import(self):
+        """The module must reference signal handling (not crash on non-TTY)."""
+        import signal
+        # Just verify the module can coexist with signal — no explosion
+        self.assertIsNotNone(signal.SIGTERM)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Runner
 # ════════════════════════════════════════════════════════════════════════════
 

@@ -40,7 +40,9 @@ jobs:
             enrich_players.py \
             enrich_flashscore.py \
             realtime_monitor.py \
-            stats_api.py
+            stats_api.py \
+            update_db.py \
+            main.py
           echo "✅ All files passed syntax check"
 
       - name: Run unit tests

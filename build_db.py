@@ -134,9 +134,43 @@ CREATE INDEX IF NOT EXISTS idx_game_players_event  ON game_players(event_id);
 CREATE INDEX IF NOT EXISTS idx_game_players_player ON game_players(player_id, sport);
 CREATE INDEX IF NOT EXISTS idx_player_stats_gp     ON player_stats(game_player_id);
 CREATE INDEX IF NOT EXISTS idx_player_stats_key    ON player_stats(stat_key);
+
+-- Highly-volatile live game state (replaced every poll cycle by update_db.py)
+CREATE TABLE IF NOT EXISTS live_games (
+    event_id        VARCHAR PRIMARY KEY,
+    league_key      VARCHAR,
+    sport           VARCHAR,
+    league          VARCHAR,
+    name            VARCHAR,
+    status          VARCHAR,        -- 'pre' | 'in' | 'post'
+    status_detail   VARCHAR,
+    period          INTEGER,
+    clock           VARCHAR,
+    home_team_id    VARCHAR,
+    home_team_name  VARCHAR,
+    home_team_abbr  VARCHAR,
+    home_score      VARCHAR,
+    away_team_id    VARCHAR,
+    away_team_name  VARCHAR,
+    away_team_abbr  VARCHAR,
+    away_score      VARCHAR,
+    home_ml         INTEGER,
+    away_ml         INTEGER,
+    home_spread     DOUBLE,
+    game_total      DOUBLE,
+    home_win_pct    DOUBLE,
+    away_win_pct    DOUBLE,
+    situation       JSON,           -- linescores / play-by-play blob
+    players         JSON,           -- full player-stats array blob
+    updated_at      TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_live_games_status ON live_games(status);
+CREATE INDEX IF NOT EXISTS idx_live_games_sport  ON live_games(sport);
 """
 
 DROP_ALL = """
+DROP TABLE IF EXISTS live_games;
 DROP TABLE IF EXISTS player_stats;
 DROP TABLE IF EXISTS game_players;
 DROP TABLE IF EXISTS game_teams;

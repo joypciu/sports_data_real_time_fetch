@@ -1,6 +1,6 @@
 # Realtime Match Fetch
 
-A sports data pipeline that pulls live and historical game data from ESPN's public API, enriches it with secondary sources, and loads it into a queryable DuckDB database.
+A sports data pipeline that pulls live and historical game data from ESPN's public API, enriches it with secondary sources, and loads it into a queryable DuckDB database — with a unified process manager that runs the API, live monitor, and DB auto-updater concurrently.
 
 ## What It Does
 
@@ -8,7 +8,9 @@ A sports data pipeline that pulls live and historical game data from ESPN's publ
 - **Persists** game records to per-sport JSON files in `historical_data/`
 - **Enriches** records with Flashscore data — period/quarter scores, team logos, match-level team stats (possession, shots, rebounds, etc.), and multi-bookmaker odds
 - **Loads** everything into a DuckDB database for fast SQL queries
-- **Monitors** live matches in real-time, emitting a change-event log and a live dashboard
+- **Monitors** pregame and live matches in real-time, emitting typed change events (`LINE_MOVE`, `ODDS_MOVE`, `NEW_GAME_DISCOVERED`, `GAME_STARTED`, `SCORE_UPDATE`, `WIN_PROB_SHIFT`, …) and writing a live dashboard
+- **Auto-syncs** the database: incremental historical inserts every 5 minutes + a volatile `live_games` table refreshed every 35 seconds from the live monitor's output
+- **Runs everything together** via `main.py` — a single supervised entry point for the API, monitor, and DB updater
 
 ## Supported Leagues
 
@@ -81,12 +83,26 @@ python build_db.py --rebuild # drop & recreate all tables
 
 ### `realtime_monitor.py`
 
-Polls ESPN every N seconds. Prints a live terminal dashboard, writes a `live_state.json` snapshot, and appends a `events_YYYYMMDD.jsonl` change log.
+Polls ESPN every N seconds. Handles both **pregame** and **live** matches with different logic for each:
+
+- **Pregame games**: fetched on every cycle; odds and win-probability API calls are rate-limited (every `PREGAME_ODDS_REFRESH_EVERY` cycles, ~150 s) to avoid hammering the API before tip-off. Emits `NEW_GAME_DISCOVERED` (first sight) and `LINE_MOVE` (betting-line shifts) events.
+- **Live games**: full odds + win-probability refresh every cycle; player box scores refreshed every `PLAYER_REFRESH_EVERY` cycles (~90 s). Emits `GAME_STARTED`, `SCORE_UPDATE`, `PERIOD_CHANGE`, `WIN_PROB_SHIFT`, `ODDS_MOVE` events.
+- **Finished games**: auto-archived to `historical_data/` on the same cycle the status flips to `post`.
+
+Writes three output files per poll cycle:
+
+| File                         | Contents                                                |
+| ---------------------------- | ------------------------------------------------------- |
+| `live/live_state.json`       | Combined snapshot: `pregame`, `live`, `finished` arrays |
+| `live/live_YYYYMMDD.json`    | In-progress games only                                  |
+| `live/pregame_YYYYMMDD.json` | Upcoming games only                                     |
+| `live/events_YYYYMMDD.jsonl` | Append-only typed change-event log                      |
 
 ```bash
 python realtime_monitor.py                    # all leagues, every 30s
 python realtime_monitor.py --interval 60
 python realtime_monitor.py --leagues nba nhl
+python realtime_monitor.py --no-players       # skip player box score pulls
 ```
 
 ### `stats_api.py`
@@ -109,6 +125,47 @@ Endpoints:
 
 Authentication is optional: set `STATS_API_TOKEN` in `.env` to require a bearer token. Leave blank for VPS-internal use.
 
+### `update_db.py`
+
+Background DB maintenance module — runs as Thread 3 inside `main.py`, or standalone.
+
+**Two jobs run on separate schedules:**
+
+| Job                           | Default interval | What it does                                                                                            |
+| ----------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------- |
+| Incremental historical update | Every 5 minutes  | Scans `historical_data/*.json`, finds event IDs not in `games`, inserts via `build_db.load_file()`      |
+| Live-games sync               | Every 35 seconds | Reads `live/live_state.json`, `DELETE`s old `live_games` rows, `INSERT`s current pre/live/post snapshot |
+
+The live sync only fires when `live_state.json` mtime has changed, so it adds zero DB pressure when the monitor is idle.
+
+```bash
+python update_db.py                         # run the loop standalone
+python update_db.py --hist-interval 600     # slower historical rescans
+python update_db.py --live-interval 20      # faster live sync
+```
+
+### `main.py`
+
+Unified supervised entry point — runs all three components concurrently in daemon threads with automatic crash-restart:
+
+| Thread             | Daemon | What it runs                                           |
+| ------------------ | ------ | ------------------------------------------------------ |
+| `stats-api`        | ✓      | `uvicorn stats_api:app` on configured port             |
+| `realtime-monitor` | ✓      | `realtime_monitor.run()` ESPN poll loop                |
+| `db-updater`       | ✓      | `update_db.run_updater_loop()` incremental + live sync |
+
+The main thread health-checks all three every 5 seconds and restarts any that crash. `SIGINT`/`SIGTERM` handled cleanly.
+
+```bash
+python main.py                        # all leagues, 30s poll, port 8001
+python main.py --interval 60          # slower polling
+python main.py --leagues nba nhl      # specific leagues only
+python main.py --no-players           # skip player box score pulls
+python main.py --port 8002            # different API port
+python main.py --api-only             # skip monitor and DB updater
+python main.py --monitor-only         # skip API (DB updater still runs)
+```
+
 ### `schedule_daily.ps1`
 
 PowerShell script to register the daily ingest as a Windows Task Scheduler job.
@@ -119,11 +176,30 @@ PowerShell script to register the daily ingest as a Windows Task Scheduler job.
 db/sports.db  (DuckDB)
 ├── teams         — master team list (team_id, sport, name, abbr)
 ├── players       — master player list (player_id, sport, display_name, position)
-├── games         — one row per event (scores, odds, win_prob, Flashscore fields)
+├── games         — one row per finished/historical event (scores, odds, win_prob, Flashscore fields)
 ├── game_teams    — home/away side per game (moneyline, spread, score, winner)
 ├── game_players  — per-player per-game appearance (starter/active flags)
-└── player_stats  — EAV: one row per (game_player_id, stat_key, stat_value)
+├── player_stats  — EAV: one row per (game_player_id, stat_key, stat_value)
+└── live_games    — volatile live state: one row per active/upcoming/just-finished game (replaced every poll cycle by update_db)
 ```
+
+### `live_games` table
+
+Populated every ~35 seconds by `update_db.sync_live_games()`. Always reflects the latest `live_state.json` snapshot. Useful for real-time dashboards that query SQL instead of parsing JSON.
+
+| Column                          | Type       | Description                      |
+| ------------------------------- | ---------- | -------------------------------- |
+| `event_id`                      | VARCHAR PK | ESPN event ID                    |
+| `status`                        | VARCHAR    | `pre` / `in` / `post`            |
+| `period`                        | INTEGER    | Current period / half            |
+| `clock`                         | VARCHAR    | Display clock e.g. `4:22`        |
+| `home_score` / `away_score`     | VARCHAR    | Current score strings            |
+| `home_ml` / `away_ml`           | INTEGER    | Current moneyline odds           |
+| `home_spread` / `game_total`    | DOUBLE     | Current spread / total           |
+| `home_win_pct` / `away_win_pct` | DOUBLE     | Live win probability             |
+| `situation`                     | JSON       | Linescores + live play info blob |
+| `players`                       | JSON       | Full player-stats array blob     |
+| `updated_at`                    | TIMESTAMP  | Poll cycle timestamp             |
 
 The `games` table also holds Flashscore-enriched fields when available:
 
@@ -172,11 +248,26 @@ All test scripts live in `tests/`.
 
 ### Unit tests (`tests/test_suite.py`)
 
-206 self-contained unit tests covering parsing, deduplication, enrichment logic, and edge cases across all sports. No live API calls — all ESPN responses are mocked.
+**265 self-contained unit tests** across 22 numbered sections covering every module. No live API calls — all ESPN responses are mocked.
+
+| Section | Module             | Tests                                                                                                                                               |
+| ------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1–6     | `enrich_players`   | parse_players, parse_soccer_roster, enrich_game, SPORT_FILE_PREFIX, file helpers, enrich_file                                                       |
+| 7–9     | `daily_ingest`     | load_existing_ids, append_games, parse_game_to_dict                                                                                                 |
+| 10      | `fetch_matches`    | helper functions                                                                                                                                    |
+| 11–13   | `realtime_monitor` | helper functions, save_live_state (pregame + live + dated files), archive_finished_game                                                             |
+| 14      | Integration        | round-trip enrich_file → data integrity                                                                                                             |
+| 15–16   | `build_db`         | scalar helpers (\_ts, \_int, \_float, \_score), load_file in-memory DuckDB                                                                          |
+| 17      | DB Integration     | live sports.db row counts, schema, sport-specific edge cases                                                                                        |
+| 18      | `realtime_monitor` | detect_changes: GAME_STARTED/FINISHED, SCORE_UPDATE, PERIOD_CHANGE, WIN_PROB_SHIFT (live only), ODDS_MOVE (live) vs LINE_MOVE (pregame), TOTAL_MOVE |
+| 19      | `realtime_monitor` | Pregame rate-limiting: PREGAME_ODDS_REFRESH_EVERY, dated file correctness, refresh_extras param                                                     |
+| 20      | `build_db`         | live_games DDL: table exists, required columns, insert/delete, DROP_ALL includes live_games                                                         |
+| 21      | `update_db`        | incremental_historical_update (idempotent, multi-file), sync_live_games (all buckets, stale-row replacement, corrupt JSON, edge cases)              |
+| 22      | `main`             | Module structure, thread targets (\_run_api, \_run_monitor, \_run_updater), signatures, signal handling                                             |
 
 ```bash
-python tests/test_suite.py   # runs via unittest, verbose output
-pytest tests/test_suite.py   # alternative runner
+pytest tests/test_suite.py        # 265 tests
+pytest tests/test_suite.py -v     # verbose with test names
 ```
 
 ### DB integrity (`tests/verify_db.py`)
@@ -225,19 +316,27 @@ cp .env.example .env
 # 3. Backfill historical data (21 days all leagues)
 python daily_ingest.py --days 21
 
-# 4. Build the database
+# 4. Build the database (creates all tables including live_games)
 python build_db.py --rebuild
 
 # 5. (Optional) Enrich with Flashscore data
 SPORTDB_API_KEY=your_key python enrich_flashscore.py --no-players
 
-# 6. Start the stats API (internal service, port 8001)
+# 6. Run everything together (API + monitor + DB auto-updater)
+python main.py
+
+# --- Or run components individually ---
+
+# Start only the stats API
 python stats_api.py
 
-# 7. Start the live monitor
+# Start only the live monitor
 python realtime_monitor.py
 
-# 8. Schedule daily ingest (Windows)
+# Start only the DB updater (keeps live_games and historical tables in sync)
+python update_db.py
+
+# 7. Schedule daily ingest (Windows)
 powershell -File schedule_daily.ps1
 ```
 
@@ -252,8 +351,8 @@ Triggered on push to `main`, manual dispatch, or PR targeting `main`.
 **`validate` job** (runs on every PR and push):
 
 1. Sets up Python 3.12 and installs `requirements.txt`
-2. `py_compile` syntax check on all seven core scripts
-3. `pytest tests/test_suite.py` — 206 unit tests, all mocked (no live API, no real DB)
+2. `py_compile` syntax check on all nine core scripts (`build_db`, `daily_ingest`, `fetch_matches`, `enrich_players`, `enrich_flashscore`, `realtime_monitor`, `stats_api`, `update_db`, `main`)
+3. `pytest tests/test_suite.py` — 265 unit tests, all mocked (no live API, no real DB)
 
 **`deploy` job** (push to `main` only, skipped on PRs):
 
@@ -293,7 +392,7 @@ Triggered when a pull request is closed (merged or declined). Automatically dele
 - Clones the repo if not already present; otherwise `git pull`
 - Creates/updates a Python virtual environment and installs `requirements.txt`
 - Writes/updates two systemd units:
-  - `<SERVICE_NAME>.service` — runs `uvicorn stats_api:app` continuously on the configured port
+  - `<SERVICE_NAME>.service` — runs `uvicorn stats_api:app` continuously on the configured port (replace with `python main.py` to run all three threads under one process)
   - `<SERVICE_NAME>-ingest.timer` + `.service` — fires `daily_ingest.py` every day at 06:00 UTC
 - Reloads the systemd daemon and restarts the stats API service
 - Verifies the service is active before returning

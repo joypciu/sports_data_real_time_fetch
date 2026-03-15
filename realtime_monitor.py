@@ -79,6 +79,9 @@ RETRY_BACKOFF   = 1.5
 # How often (in poll cycles) to refresh player box scores for live games
 PLAYER_REFRESH_EVERY = 3   # every 3rd poll cycle (~90s at 30s interval)
 
+# How often to re-fetch odds/win-prob for PREGAME games (they change slowly)
+PREGAME_ODDS_REFRESH_EVERY = 5  # every 5th poll cycle (~150s at 30s interval)
+
 # Data directory for archiving finished games
 DATA_DIR = "historical_data"
 
@@ -244,6 +247,7 @@ def build_game_state(
     event: dict,
     fetch_players: bool = True,
     player_cycle: bool = False,
+    refresh_extras: bool = True,
 ) -> dict:
     """Build a full game state dict from a raw ESPN event."""
     event_id = event.get("id", "")
@@ -272,8 +276,8 @@ def build_game_state(
     home = team_info(home_raw)
     away = team_info(away_raw)
 
-    # Odds
-    odds_items = fetch_odds(http, sport, league, event_id)
+    # Odds — skipped for pregame games on cached cycles (see refresh_extras)
+    odds_items = fetch_odds(http, sport, league, event_id) if refresh_extras else []
     chosen = _pick_provider(odds_items)
     odds: dict = {}
     if chosen:
@@ -302,8 +306,8 @@ def build_game_state(
             ),
         }
 
-    # Win probability
-    prob = fetch_win_prob(http, sport, league, event_id)
+    # Win probability — also rate-limited for pregame
+    prob = fetch_win_prob(http, sport, league, event_id) if refresh_extras else {}
     win_prob = {
         "home_pct": _parse_float(prob.get("homeWinPercentage")),
         "away_pct": _parse_float(prob.get("awayWinPercentage")),
@@ -490,26 +494,29 @@ def detect_changes(old: dict, new: dict) -> list[dict]:
             winner=winner,
         ))
 
-    # Win probability shift ≥ 5%
-    old_hp = (old.get("win_prob") or {}).get("home_pct")
-    new_hp = (new.get("win_prob") or {}).get("home_pct")
-    if old_hp is not None and new_hp is not None:
-        shift = abs(new_hp - old_hp)
-        if shift >= 0.05:
-            events.append(ev("WIN_PROB_SHIFT",
-                home_pct=round(new_hp, 3),
-                away_pct=round(1 - new_hp, 3),
-                prev_home_pct=round(old_hp, 3),
-                shift=round(shift, 3),
-            ))
+    # Win probability shift ≥ 5% — only meaningful for live (in-progress) games
+    if new.get("status") == "in":
+        old_hp = (old.get("win_prob") or {}).get("home_pct")
+        new_hp = (new.get("win_prob") or {}).get("home_pct")
+        if old_hp is not None and new_hp is not None:
+            shift = abs(new_hp - old_hp)
+            if shift >= 0.05:
+                events.append(ev("WIN_PROB_SHIFT",
+                    home_pct=round(new_hp, 3),
+                    away_pct=round(1 - new_hp, 3),
+                    prev_home_pct=round(old_hp, 3),
+                    shift=round(shift, 3),
+                ))
 
-    # Odds line move (moneyline shift ≥ 5 points)
+    # Odds/line move — ODDS_MOVE for live games, LINE_MOVE for pregame
+    is_live_game = new.get("status") == "in"
+    move_type = "ODDS_MOVE" if is_live_game else "LINE_MOVE"
     old_odds = old.get("odds") or {}
     new_odds = new.get("odds") or {}
     for side in ("home_ml", "away_ml"):
         o, n = old_odds.get(side), new_odds.get(side)
         if o is not None and n is not None and abs(n - o) >= 5:
-            events.append(ev("ODDS_MOVE",
+            events.append(ev(move_type,
                 field=side, old_value=o, new_value=n,
             ))
     # Total move ≥ 0.5
@@ -619,13 +626,15 @@ def print_dashboard(states: dict[str, dict], event_log: list[dict]) -> None:
             game    = ev.get("game", "")
             ts      = ev.get("timestamp", "")[-8:]
             col = {
-                "SCORE_UPDATE":   "green",
-                "GAME_STARTED":   "cyan",
-                "GAME_FINISHED":  "yellow",
-                "PERIOD_CHANGE":  "blue",
-                "WIN_PROB_SHIFT": "grey",
-                "ODDS_MOVE":      "grey",
-                "TOTAL_MOVE":     "grey",
+                "SCORE_UPDATE":       "green",
+                "GAME_STARTED":       "cyan",
+                "GAME_FINISHED":      "yellow",
+                "PERIOD_CHANGE":      "blue",
+                "WIN_PROB_SHIFT":     "grey",
+                "ODDS_MOVE":          "grey",
+                "TOTAL_MOVE":         "grey",
+                "LINE_MOVE":          "grey",
+                "NEW_GAME_DISCOVERED": "cyan",
             }.get(ev_type, "white")
             detail = ""
             if ev_type == "SCORE_UPDATE":
@@ -638,8 +647,11 @@ def print_dashboard(states: dict[str, dict], event_log: list[dict]) -> None:
                 detail = f"P{ev.get('old_period')} → P{ev.get('new_period')}  {ev.get('away_score')}-{ev.get('home_score')}"
             elif ev_type == "WIN_PROB_SHIFT":
                 detail = f"home {int(ev.get('prev_home_pct',0)*100)}% → {int(ev.get('home_pct',0)*100)}%"
-            elif ev_type in ("ODDS_MOVE", "TOTAL_MOVE"):
+            elif ev_type in ("ODDS_MOVE", "TOTAL_MOVE", "LINE_MOVE"):
                 detail = f"{ev.get('field','total')} {ev.get('old_value','?')} → {ev.get('new_value') or ev.get('new_total','?')}"
+            elif ev_type == "NEW_GAME_DISCOVERED":
+                sched = ev.get('scheduled_at', '')[:16].replace('T', ' ')
+                detail = f"{ev.get('status','?').upper()}  {sched} UTC"
             print(f"    {c(ts, 'grey')}  {c(ev_type, col):<22}  {c(game, 'white')}  {detail}")
     print()
 
@@ -760,11 +772,15 @@ def _print_pregame_row(g: dict) -> None:
     spr  = odds.get("home_spread")
     tot  = odds.get("game_total")
 
-    game_str = (
-        c(f"{a.get('team_abbr','?'):>4}", "grey") + "          " +
-        c(f"{h.get('team_abbr','?'):<4}", "grey") +
-        f"   {c(game_dt, 'grey')}"
-    )
+    # Show win records if available (e.g. "20-10" from ESPN)
+    a_rec = a.get("record", "")
+    h_rec = h.get("record", "")
+    a_abbr = c(f"{a.get('team_abbr', '?'):>4}", "grey")
+    h_abbr = c(f"{h.get('team_abbr', '?'):<4}", "grey")
+    a_part = a_abbr + (c(f" ({a_rec})", "grey") if a_rec else "")
+    h_part = h_abbr + (c(f" ({h_rec})", "grey") if h_rec else "")
+    game_str = f"{a_part}  {c('vs', 'grey')}  {h_part}   {c(game_dt, 'grey')}"
+
     odds_parts = []
     if ml_h != "N/A":
         odds_parts.append(f"ML {ml_a}/{ml_h}")
@@ -1004,7 +1020,8 @@ def poll_once(
             )
             game_becoming_live = old_state.get("status") != "in" and new_raw_state == "in"
             game_finishing = old_state.get("status") == "in" and new_raw_state == "post"
-            is_live = new_raw_state == "in"
+            is_live    = new_raw_state == "in"
+            is_pregame = new_raw_state == "pre"
 
             player_cycle = fetch_players and (
                 game_becoming_live
@@ -1013,11 +1030,22 @@ def poll_once(
                 or (new_raw_state in ("in", "post") and not old_state.get("players"))
             )
 
+            # Rate-limit odds/win-prob API calls for pregame games:
+            # always fetch on first sight, when no odds exist yet, or every
+            # PREGAME_ODDS_REFRESH_EVERY cycles; always refresh for live/post.
+            refresh_extras = (
+                not is_pregame                                    # live/post: always
+                or not old_state                                  # first sighting
+                or not old_state.get("odds")                     # no cached odds yet
+                or poll_count % PREGAME_ODDS_REFRESH_EVERY == 0  # periodic refresh
+            )
+
             try:
                 gs = build_game_state(
                     http, sport, league, league_key, event,
                     fetch_players=fetch_players,
                     player_cycle=player_cycle,
+                    refresh_extras=refresh_extras,
                 )
             except Exception:
                 gs = old_state  # keep old on error
@@ -1025,11 +1053,23 @@ def poll_once(
             if not gs:
                 continue
 
+            # Carry cached odds/winprob forward when skipping the API call
+            if not refresh_extras and old_state:
+                gs["odds"]     = old_state.get("odds", {})
+                gs["win_prob"] = old_state.get("win_prob", {})
+
             # Preserve previously fetched players if not refreshing this cycle
             if not player_cycle and old_state.get("players"):
-                gs["players"]           = old_state["players"]
-                gs["formations"]        = old_state.get("formations", {})
+                gs["players"]            = old_state["players"]
+                gs["formations"]         = old_state.get("formations", {})
                 gs["players_fetched_at"] = old_state.get("players_fetched_at")
+
+            # Track the opening betting line: snapshot pregame odds when
+            # the game first goes live so callers can compare opening vs live.
+            if game_becoming_live and old_state.get("odds"):
+                gs["opening_odds"] = old_state["odds"]
+            elif old_state.get("opening_odds"):
+                gs["opening_odds"] = old_state["opening_odds"]
 
             new_states[eid] = gs
 
@@ -1044,6 +1084,19 @@ def poll_once(
                         archive_finished_game(gs, data_dir=data_dir)
                     except Exception as exc:
                         print(f"  [archive-warn] {gs.get('short_name')}: {exc}", file=sys.stderr)
+            else:
+                # First time we've seen this game — emit a discovery event
+                all_events.append({
+                    "type":         "NEW_GAME_DISCOVERED",
+                    "event_id":     gs["event_id"],
+                    "game":         gs.get("short_name", gs.get("name", "")),
+                    "sport":        gs.get("sport", ""),
+                    "league":       gs.get("league", ""),
+                    "league_key":   gs.get("league_key", ""),
+                    "status":       gs.get("status", ""),
+                    "scheduled_at": gs.get("date", ""),
+                    "timestamp":    _now_iso(),
+                })
 
     return new_states, all_events
 
