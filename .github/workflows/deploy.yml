@@ -80,6 +80,7 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           timeout: 60s
           command_timeout: 5m
+          envs: GH_PAT,DEPLOY_SERVICE_NAME,DEPLOY_DIR,DEPLOY_BRANCH,DEPLOY_PORT,DEPLOY_REPO_URL,DEPLOY_REPO_SLUG
           script: |
             set -e
             SERVICE_NAME="${DEPLOY_SERVICE_NAME:-sports-stats-api}"
@@ -88,6 +89,7 @@ jobs:
             PORT="${DEPLOY_PORT:-8001}"
             REPO_URL="${DEPLOY_REPO_URL}"
             REPO_SLUG="${DEPLOY_REPO_SLUG}"
+            AUTH_URL="https://x-access-token:${GH_PAT}@github.com/${REPO_SLUG}.git"
 
             echo "Deploying service=${SERVICE_NAME} dir=${SERVICE_DIR} port=${PORT}"
 
@@ -97,8 +99,9 @@ jobs:
             cd "${SERVICE_DIR}"
 
             if [ ! -d ".git" ]; then
-              CLONE_URL="https://x-access-token:${GH_PAT}@github.com/${REPO_SLUG}.git"
-              git clone "${CLONE_URL}" .
+              git clone "${AUTH_URL}" .
+            else
+              git remote set-url origin "${AUTH_URL}"
             fi
 
             export SERVICE_NAME="${SERVICE_NAME}"
@@ -130,6 +133,7 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           timeout: 60s
           command_timeout: 5m
+          envs: GH_PAT,DEPLOY_SERVICE_NAME,DEPLOY_DIR,DEPLOY_BRANCH,DEPLOY_PORT,DEPLOY_REPO_URL,DEPLOY_REPO_SLUG
           script: |
             set -e
             SERVICE_NAME="${DEPLOY_SERVICE_NAME:-sports-stats-api}"
@@ -138,12 +142,14 @@ jobs:
             PORT="${DEPLOY_PORT:-8001}"
             REPO_URL="${DEPLOY_REPO_URL}"
             REPO_SLUG="${DEPLOY_REPO_SLUG}"
+            AUTH_URL="https://x-access-token:${GH_PAT}@github.com/${REPO_SLUG}.git"
 
             cd "${SERVICE_DIR}"
 
             if [ ! -d ".git" ]; then
-              CLONE_URL="https://x-access-token:${GH_PAT}@github.com/${REPO_SLUG}.git"
-              git clone "${CLONE_URL}" .
+              git clone "${AUTH_URL}" .
+            else
+              git remote set-url origin "${AUTH_URL}"
             fi
 
             export SERVICE_NAME="${SERVICE_NAME}"
