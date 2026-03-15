@@ -23,10 +23,10 @@ echo ""
 SERVICE_NAME="${SERVICE_NAME:-sports-stats-api}"
 SERVICE_DIR="${SERVICE_DIR:-/home/ubuntu/services/${SERVICE_NAME}}"
 VENV_DIR="$SERVICE_DIR/venv"
-REPO_URL="${REPO_URL:-https://github.com/YOUR_USERNAME/realtime_data_fetch.git}"
+REPO_URL="${REPO_URL:-https://github.com/joypciu/sports_data_real_time_fetch.git}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 API_PORT="${API_PORT:-8001}"
-EXPECTED_REPO_SLUG="${EXPECTED_REPO_SLUG:-YOUR_USERNAME/realtime_data_fetch}"
+EXPECTED_REPO_SLUG="${EXPECTED_REPO_SLUG:-joypciu/sports_data_real_time_fetch}"
 LOCK_FILE="/tmp/${SERVICE_NAME}.deploy.lock"
 
 # Daily ingest timer name (may differ from the API service name)
