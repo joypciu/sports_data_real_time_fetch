@@ -119,7 +119,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=${SERVICE_DIR}
 EnvironmentFile=${SERVICE_DIR}/.env
-ExecStart=${VENV_DIR}/bin/uvicorn stats_api:app --host 0.0.0.0 --port ${API_PORT} --workers 2
+ExecStart=${VENV_DIR}/bin/python main.py --port ${API_PORT} --output-dir live
 Restart=always
 RestartSec=5
 
