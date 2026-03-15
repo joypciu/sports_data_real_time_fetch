@@ -168,27 +168,39 @@ def stats_player(
     sql = """
         SELECT
             g.event_id,
-            g.date,
+            g.game_date              AS date,
             g.sport,
             g.league,
-            g.home_team,
-            g.away_team,
+            COALESCE(th.team_name, '') AS home_team,
+            COALESCE(ta.team_name, '') AS away_team,
             g.home_score,
             g.away_score,
             g.status,
             p.display_name,
             p.team_name,
             p.position,
-            p.jersey_number,
-            p.is_starter,
-            s.stat_name,
-            s.stat_value
-        FROM players p
-        JOIN games   g ON g.event_id = p.event_id
-        JOIN stats   s ON s.event_id = p.event_id AND s.player_id = p.player_id
+            gp.starter               AS is_starter,
+            ps.stat_key              AS stat_name,
+            ps.stat_value
+        FROM players    p
+        JOIN game_players gp ON gp.player_id = p.player_id AND gp.sport = p.sport
+        JOIN games        g  ON g.event_id   = gp.event_id
+        JOIN player_stats ps ON ps.game_player_id = gp.id
+        LEFT JOIN (
+            SELECT gt.event_id, t.team_name
+            FROM   game_teams gt
+            JOIN   teams      t ON t.team_id = gt.team_id AND t.sport = gt.sport
+            WHERE  gt.home_away = 'home'
+        ) th ON th.event_id = g.event_id
+        LEFT JOIN (
+            SELECT gt.event_id, t.team_name
+            FROM   game_teams gt
+            JOIN   teams      t ON t.team_id = gt.team_id AND t.sport = gt.sport
+            WHERE  gt.home_away = 'away'
+        ) ta ON ta.event_id = g.event_id
         WHERE LOWER(p.display_name) LIKE LOWER(?)
         {sport_filter}
-        ORDER BY g.date DESC, g.event_id, s.stat_name
+        ORDER BY g.game_date DESC, g.event_id, ps.stat_key
         LIMIT ?
     """
     sport_filter = "AND LOWER(g.sport) = LOWER(?)" if sport else ""
@@ -230,8 +242,7 @@ def stats_player(
                 "display_name":  pname,
                 "team":          row["team_name"],
                 "position":      row["position"],
-                "jersey_number": row["jersey_number"],
-                "is_starter":    row["is_starter"],
+                "is_starter":    bool(row["is_starter"]) if row["is_starter"] is not None else None,
                 "stats":         {},
             }
         gm["players"][pname]["stats"][row["stat_name"]] = row["stat_value"]
@@ -258,39 +269,64 @@ def stats_team(
     """
     sport_filter = "AND LOWER(g.sport) = LOWER(?)" if sport else ""
 
+    # Shared subqueries for resolving home/away team names from game_teams + teams
+    _home_sub = """
+        SELECT gt.event_id, t.team_name
+        FROM   game_teams gt
+        JOIN   teams      t ON t.team_id = gt.team_id AND t.sport = gt.sport
+        WHERE  gt.home_away = 'home'
+    """
+    _away_sub = """
+        SELECT gt.event_id, t.team_name
+        FROM   game_teams gt
+        JOIN   teams      t ON t.team_id = gt.team_id AND t.sport = gt.sport
+        WHERE  gt.home_away = 'away'
+    """
+
     # --- Record ---
     record_sql = f"""
+        WITH tg AS (
+            SELECT
+                g.home_score, g.away_score, g.status,
+                COALESCE(th.team_name, '') AS home_team,
+                COALESCE(ta.team_name, '') AS away_team
+            FROM games g
+            LEFT JOIN ({_home_sub}) th ON th.event_id = g.event_id
+            LEFT JOIN ({_away_sub}) ta ON ta.event_id = g.event_id
+            WHERE (LOWER(COALESCE(th.team_name,'')) LIKE LOWER(?) OR LOWER(COALESCE(ta.team_name,'')) LIKE LOWER(?))
+              AND g.status = 'post'
+              {sport_filter}
+        )
         SELECT
-            COUNT(*) FILTER (WHERE (LOWER(g.home_team) LIKE LOWER(?) AND g.home_score > g.away_score)
-                                OR (LOWER(g.away_team) LIKE LOWER(?) AND g.away_score > g.home_score))
-                AS wins,
-            COUNT(*) FILTER (WHERE (LOWER(g.home_team) LIKE LOWER(?) AND g.home_score < g.away_score)
-                                OR (LOWER(g.away_team) LIKE LOWER(?) AND g.away_score < g.home_score))
-                AS losses,
-            COUNT(*) FILTER (WHERE g.home_score IS NOT NULL AND g.away_score IS NOT NULL
-                              AND g.home_score = g.away_score
-                              AND (LOWER(g.home_team) LIKE LOWER(?) OR LOWER(g.away_team) LIKE LOWER(?)))
-                AS draws,
+            COUNT(*) FILTER (WHERE (LOWER(home_team) LIKE LOWER(?) AND home_score > away_score)
+                                OR (LOWER(away_team) LIKE LOWER(?) AND away_score > home_score)) AS wins,
+            COUNT(*) FILTER (WHERE (LOWER(home_team) LIKE LOWER(?) AND home_score < away_score)
+                                OR (LOWER(away_team) LIKE LOWER(?) AND away_score < home_score)) AS losses,
+            COUNT(*) FILTER (WHERE home_score IS NOT NULL AND away_score IS NOT NULL
+                              AND home_score = away_score
+                              AND (LOWER(home_team) LIKE LOWER(?) OR LOWER(away_team) LIKE LOWER(?))) AS draws,
             COUNT(*) AS total_games
-        FROM games g
-        WHERE (LOWER(g.home_team) LIKE LOWER(?) OR LOWER(g.away_team) LIKE LOWER(?))
-          AND g.status = 'post'
-          {sport_filter}
+        FROM tg
     """
     pattern = f"%{name}%"
-    rec_params: list = [pattern] * 8
+    rec_params: list = [pattern, pattern]  # CTE WHERE
     if sport:
         rec_params.append(sport)
+    rec_params += [pattern] * 6  # FILTER clauses (2 per wins/losses/draws)
 
     # --- Recent games ---
     recent_sql = f"""
         SELECT
-            g.event_id, g.date, g.sport, g.league,
-            g.home_team, g.away_team, g.home_score, g.away_score, g.status
+            g.event_id, g.game_date AS date, g.sport, g.league,
+            COALESCE(th.team_name, '') AS home_team,
+            COALESCE(ta.team_name, '') AS away_team,
+            g.home_score, g.away_score, g.status
         FROM games g
-        WHERE (LOWER(g.home_team) LIKE LOWER(?) OR LOWER(g.away_team) LIKE LOWER(?))
+        LEFT JOIN ({_home_sub}) th ON th.event_id = g.event_id
+        LEFT JOIN ({_away_sub}) ta ON ta.event_id = g.event_id
+        WHERE (LOWER(COALESCE(th.team_name,'')) LIKE LOWER(?) OR LOWER(COALESCE(ta.team_name,'')) LIKE LOWER(?))
           {sport_filter}
-        ORDER BY g.date DESC
+        ORDER BY g.game_date DESC
         LIMIT ?
     """
     recent_params: list = [pattern, pattern]
@@ -300,15 +336,16 @@ def stats_team(
 
     # --- Top scorers (goals / points per player) ---
     scorers_sql = f"""
-        SELECT p.display_name, SUM(CAST(s.stat_value AS DOUBLE)) AS total
-        FROM players p
-        JOIN games   g ON g.event_id = p.event_id
-        JOIN stats   s ON s.event_id = p.event_id AND s.player_id = p.player_id
+        SELECT p.display_name, SUM(TRY_CAST(ps.stat_value AS DOUBLE)) AS total
+        FROM players    p
+        JOIN game_players gp ON gp.player_id = p.player_id AND gp.sport = p.sport
+        JOIN games        g  ON g.event_id   = gp.event_id
+        JOIN player_stats ps ON ps.game_player_id = gp.id
         WHERE LOWER(p.team_name) LIKE LOWER(?)
-          AND LOWER(s.stat_name) IN ('goals', 'points', 'runs scored', 'runs')
+          AND LOWER(ps.stat_key) IN ('goals', 'points', 'runs scored', 'runs')
           {sport_filter}
         GROUP BY p.display_name
-        ORDER BY total DESC
+        ORDER BY total DESC NULLS LAST
         LIMIT 3
     """
     scorers_params: list = [pattern]
@@ -329,8 +366,8 @@ def stats_team(
             "date":       str(r["date"]) if r["date"] else None,
             "sport":      r["sport"],
             "league":     r["league"],
-            "home_team":  r["home_team"],
-            "away_team":  r["away_team"],
+            "home_team":  r["home_team"] or None,
+            "away_team":  r["away_team"] or None,
             "home_score": r["home_score"],
             "away_score": r["away_score"],
             "status":     r["status"],
