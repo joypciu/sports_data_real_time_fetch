@@ -107,7 +107,7 @@ python realtime_monitor.py --no-players       # skip player box score pulls
 
 ### `stats_api.py`
 
-Internal read-only FastAPI service (port 8001) that exposes the DuckDB database and live state to other services (used by the Cache API's optional `include_stats` enrichment).
+Internal read-only FastAPI service (port 8001) that exposes the DuckDB database and live state to other services (used by the Cache API's optional `include_stats` enrichment and `/event/check` market evaluation).
 
 ```bash
 python stats_api.py                      # start on port 8001
@@ -122,8 +122,11 @@ Endpoints:
 | `GET /stats/player?name=Raphinha&sport=soccer` | Per-player recent game stats (ILIKE name search)                     |
 | `GET /stats/team?name=Barcelona&sport=soccer`  | Win/loss record, last 5 results, top scorers                         |
 | `GET /stats/live?team=Barcelona`               | Live / pregame entries from `live/live_state.json`                   |
+| `GET /stats/market-check?...`                  | Resolve one event and evaluate `moneyline`, `spread`, or `total`     |
 
 Authentication is optional: set `STATS_API_TOKEN` in `.env` to require a bearer token. Leave blank for VPS-internal use.
+
+`/stats/market-check` accepts either `event_id`, or `date` + `team` + `opponent`, plus `market`, `pick`, optional `line`, and optional `sport`. It searches live state first, then historical DuckDB rows, and returns a normalized payload including `found`, `source`, `settled`, `result`, `outcome`, `event`, `score`, and `pricing`. Invalid dates are rejected with `400` (`YYYY-MM-DD` only).
 
 ### `update_db.py`
 
@@ -248,7 +251,7 @@ All test scripts live in `tests/`.
 
 ### Unit tests (`tests/test_suite.py`)
 
-**265 self-contained unit tests** across 22 numbered sections covering every module. No live API calls — all ESPN responses are mocked.
+**270 self-contained unit tests** across 23 numbered sections covering every module. No live API calls — all ESPN responses are mocked.
 
 | Section | Module             | Tests                                                                                                                                               |
 | ------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -263,10 +266,11 @@ All test scripts live in `tests/`.
 | 19      | `realtime_monitor` | Pregame rate-limiting: PREGAME_ODDS_REFRESH_EVERY, dated file correctness, refresh_extras param                                                     |
 | 20      | `build_db`         | live_games DDL: table exists, required columns, insert/delete, DROP_ALL includes live_games                                                         |
 | 21      | `update_db`        | incremental_historical_update (idempotent, multi-file), sync_live_games (all buckets, stale-row replacement, corrupt JSON, edge cases)              |
-| 22      | `main`             | Module structure, thread targets (\_run_api, \_run_monitor, \_run_updater), signatures, signal handling                                             |
+| 22      | `stats_api`        | `/stats/market-check` evaluation for historical/live total, spread, moneyline, and invalid-date validation                                          |
+| 23      | `main`             | Module structure, thread targets (\_run_api, \_run_monitor, \_run_updater), signatures, signal handling                                             |
 
 ```bash
-pytest tests/test_suite.py        # 265 tests
+pytest tests/test_suite.py        # 270 tests
 pytest tests/test_suite.py -v     # verbose with test names
 ```
 
@@ -352,7 +356,7 @@ Triggered on push to `main`, manual dispatch, or PR targeting `main`.
 
 1. Sets up Python 3.12 and installs `requirements.txt`
 2. `py_compile` syntax check on all nine core scripts (`build_db`, `daily_ingest`, `fetch_matches`, `enrich_players`, `enrich_flashscore`, `realtime_monitor`, `stats_api`, `update_db`, `main`)
-3. `pytest tests/test_suite.py` — 265 unit tests, all mocked (no live API, no real DB)
+3. `pytest tests/test_suite.py` — 270 unit tests, all mocked (no live API, no real DB)
 
 **`deploy` job** (push to `main` only, skipped on PRs):
 
