@@ -2862,6 +2862,73 @@ class TestStatsApiMarketCheck(unittest.TestCase):
         self.assertFalse(payload["settled"])
         self.assertEqual(payload["source"], "live")
 
+    def test_historical_moneyline_home_win_returns_true(self):
+        historical_row = {
+            "event_id": "SOC3",
+            "date": "2026-03-12T20:00:00",
+            "sport": "soccer",
+            "league": "uefa.champions",
+            "name": "Paris Saint-Germain vs Chelsea",
+            "short_name": "PSG vs CHE",
+            "status": "post",
+            "home_team": "Paris Saint-Germain",
+            "home_abbr": "PSG",
+            "away_team": "Chelsea",
+            "away_abbr": "CHE",
+            "home_score": 3,
+            "away_score": 1,
+            "provider": "ESPN BET",
+            "game_total": 3.5,
+            "over_odds": -110,
+            "under_odds": -110,
+            "draw_odds": 240,
+            "home_ml": -120,
+            "away_ml": 100,
+            "home_spread": -0.5,
+            "away_spread": 0.5,
+            "home_spread_odds": -105,
+            "away_spread_odds": -115,
+        }
+
+        with (
+            patch.object(self.stats_api, "_read_live_state", return_value={"pregame": [], "live": [], "finished": []}),
+            patch.object(self.stats_api, "_query", return_value=[historical_row]),
+        ):
+            response = self.client.get(
+                "/stats/market-check",
+                params={
+                    "date": "2026-03-12",
+                    "team": "PSG",
+                    "opponent": "Chelsea",
+                    "sport": "soccer",
+                    "market": "moneyline",
+                    "pick": "home",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["result"])
+        self.assertTrue(payload["settled"])
+        self.assertEqual(payload["outcome"], "win")
+
+    def test_invalid_date_returns_400(self):
+        response = self.client.get(
+            "/stats/market-check",
+            params={
+                "date": "2026-13-40",
+                "team": "PSG",
+                "opponent": "Chelsea",
+                "sport": "soccer",
+                "market": "total",
+                "pick": "over",
+                "line": 2.5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "date must be in YYYY-MM-DD format")
+
     def test_total_without_line_returns_400(self):
         historical_row = {
             "event_id": "SOC2",

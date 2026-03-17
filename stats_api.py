@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -160,7 +160,10 @@ def _date_only(value: Any) -> str | None:
         return None
     text = str(value).strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
-        return text
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError:
+            return None
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
     except ValueError:
