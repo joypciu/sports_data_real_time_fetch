@@ -239,8 +239,8 @@ def _historical_event_candidates(
             g.status,
             COALESCE(ht.team_name, '') AS home_team,
             COALESCE(ht.team_abbr, '') AS home_abbr,
-            COALESCE(at.team_name, '') AS away_team,
-            COALESCE(at.team_abbr, '') AS away_abbr,
+            COALESCE(away_t.team_name, '') AS away_team,
+            COALESCE(away_t.team_abbr, '') AS away_abbr,
             g.home_score,
             g.away_score,
             g.provider,
@@ -256,7 +256,7 @@ def _historical_event_candidates(
             away_line.spread_odds AS away_spread_odds
         FROM games g
         LEFT JOIN ({home_team_subquery}) ht ON ht.event_id = g.event_id
-        LEFT JOIN ({away_team_subquery}) at ON at.event_id = g.event_id
+        LEFT JOIN ({away_team_subquery}) away_t ON away_t.event_id = g.event_id
         LEFT JOIN game_teams home_line
             ON home_line.event_id = g.event_id AND home_line.home_away = 'home'
         LEFT JOIN game_teams away_line
