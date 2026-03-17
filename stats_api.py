@@ -137,6 +137,353 @@ def _matches_filter(entry: dict, team: str | None, player: str | None) -> bool:
     return True
 
 
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_text(value: str | None) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip()).lower()
+
+
+def _date_only(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return None
+
+
+def _team_matches(query: str | None, team_name: str | None, team_abbr: str | None) -> bool:
+    if not query:
+        return False
+    query_norm = _normalize_text(query)
+    if not query_norm:
+        return False
+    name_norm = _normalize_text(team_name)
+    abbr_norm = _normalize_text(team_abbr)
+    return (
+        query_norm == name_norm
+        or query_norm == abbr_norm
+        or query_norm in name_norm
+        or name_norm in query_norm
+        or query_norm in abbr_norm
+    )
+
+
+def _matchup_matches(event: dict[str, Any], team: str | None, opponent: str | None) -> bool:
+    if not team or not opponent:
+        return True
+
+    forward = (
+        _team_matches(team, event.get("home_team"), event.get("home_abbr"))
+        and _team_matches(opponent, event.get("away_team"), event.get("away_abbr"))
+    )
+    reverse = (
+        _team_matches(team, event.get("away_team"), event.get("away_abbr"))
+        and _team_matches(opponent, event.get("home_team"), event.get("home_abbr"))
+    )
+    return forward or reverse
+
+
+def _resolve_pick_side(pick: str, event: dict[str, Any]) -> str | None:
+    pick_norm = _normalize_text(pick)
+    if pick_norm in {"home", "away", "draw", "tie"}:
+        return "draw" if pick_norm == "tie" else pick_norm
+    if _team_matches(pick, event.get("home_team"), event.get("home_abbr")):
+        return "home"
+    if _team_matches(pick, event.get("away_team"), event.get("away_abbr")):
+        return "away"
+    return None
+
+
+def _historical_event_candidates(
+    event_id: str | None,
+    game_date: str | None,
+    sport: str | None,
+) -> list[dict[str, Any]]:
+    home_team_subquery = """
+        SELECT gt.event_id, t.team_name, t.team_abbr
+        FROM game_teams gt
+        JOIN teams t ON t.team_id = gt.team_id AND t.sport = gt.sport
+        WHERE gt.home_away = 'home'
+    """
+    away_team_subquery = """
+        SELECT gt.event_id, t.team_name, t.team_abbr
+        FROM game_teams gt
+        JOIN teams t ON t.team_id = gt.team_id AND t.sport = gt.sport
+        WHERE gt.home_away = 'away'
+    """
+
+    sql = f"""
+        SELECT
+            g.event_id,
+            g.game_date AS date,
+            g.sport,
+            g.league,
+            g.name,
+            g.short_name,
+            g.status,
+            COALESCE(ht.team_name, '') AS home_team,
+            COALESCE(ht.team_abbr, '') AS home_abbr,
+            COALESCE(at.team_name, '') AS away_team,
+            COALESCE(at.team_abbr, '') AS away_abbr,
+            g.home_score,
+            g.away_score,
+            g.provider,
+            g.game_total,
+            g.over_odds,
+            g.under_odds,
+            g.draw_odds,
+            home_line.moneyline AS home_ml,
+            away_line.moneyline AS away_ml,
+            home_line.spread AS home_spread,
+            away_line.spread AS away_spread,
+            home_line.spread_odds AS home_spread_odds,
+            away_line.spread_odds AS away_spread_odds
+        FROM games g
+        LEFT JOIN ({home_team_subquery}) ht ON ht.event_id = g.event_id
+        LEFT JOIN ({away_team_subquery}) at ON at.event_id = g.event_id
+        LEFT JOIN game_teams home_line
+            ON home_line.event_id = g.event_id AND home_line.home_away = 'home'
+        LEFT JOIN game_teams away_line
+            ON away_line.event_id = g.event_id AND away_line.home_away = 'away'
+        WHERE {{where_clause}}
+        ORDER BY g.game_date DESC
+        LIMIT 50
+    """
+
+    if event_id:
+        return _query(sql.format(where_clause="g.event_id = ?"), [event_id])
+
+    if not game_date:
+        return []
+
+    params: list[Any] = [game_date]
+    where_clause = "CAST(g.game_date AS DATE) = CAST(? AS DATE)"
+    if sport:
+        where_clause += " AND LOWER(g.sport) = LOWER(?)"
+        params.append(sport)
+    return _query(sql.format(where_clause=where_clause), params)
+
+
+def _live_event_candidates(
+    event_id: str | None,
+    game_date: str | None,
+    sport: str | None,
+) -> list[dict[str, Any]]:
+    state = _read_live_state()
+    candidates: list[dict[str, Any]] = []
+    for bucket_name in ("live", "pregame", "finished"):
+        for entry in state.get(bucket_name, []):
+            if event_id and str(entry.get("event_id") or "") != event_id:
+                continue
+            if not event_id:
+                if game_date and _date_only(entry.get("date")) != game_date:
+                    continue
+                if sport and _normalize_text(entry.get("sport")) != _normalize_text(sport):
+                    continue
+
+            odds = entry.get("odds") or {}
+            home = entry.get("home") or {}
+            away = entry.get("away") or {}
+            candidates.append({
+                "event_id": str(entry.get("event_id") or ""),
+                "date": entry.get("date"),
+                "sport": entry.get("sport"),
+                "league": entry.get("league"),
+                "name": entry.get("name"),
+                "short_name": entry.get("short_name"),
+                "status": entry.get("status"),
+                "home_team": home.get("team_name"),
+                "home_abbr": home.get("team_abbr"),
+                "away_team": away.get("team_name"),
+                "away_abbr": away.get("team_abbr"),
+                "home_score": _as_int(home.get("score")),
+                "away_score": _as_int(away.get("score")),
+                "provider": odds.get("provider"),
+                "game_total": _as_float(odds.get("game_total")),
+                "over_odds": _as_int(odds.get("over_odds")),
+                "under_odds": _as_int(odds.get("under_odds")),
+                "draw_odds": _as_int(odds.get("draw_odds")),
+                "home_ml": _as_int(odds.get("home_ml")),
+                "away_ml": _as_int(odds.get("away_ml")),
+                "home_spread": _as_float(odds.get("home_spread")),
+                "away_spread": _as_float(odds.get("away_spread")),
+                "home_spread_odds": _as_int(odds.get("home_spread_odds")),
+                "away_spread_odds": _as_int(odds.get("away_spread_odds")),
+                "source": "live",
+            })
+    return candidates
+
+
+def _resolve_event(
+    event_id: str | None,
+    game_date: str | None,
+    sport: str | None,
+    team: str | None,
+    opponent: str | None,
+) -> dict[str, Any] | None:
+    live_candidates = _live_event_candidates(event_id, game_date, sport)
+    for event in live_candidates:
+        if _matchup_matches(event, team, opponent):
+            return event
+
+    historical_candidates = _historical_event_candidates(event_id, game_date, sport)
+    for event in historical_candidates:
+        if _matchup_matches(event, team, opponent):
+            event["source"] = "historical"
+            return event
+
+    return None
+
+
+def _evaluate_market(
+    event: dict[str, Any],
+    market: str,
+    pick: str,
+    line: float | None,
+) -> dict[str, Any]:
+    market_norm = _normalize_text(market)
+    pick_norm = _normalize_text(pick)
+    home_score = _as_int(event.get("home_score"))
+    away_score = _as_int(event.get("away_score"))
+    settled = _normalize_text(str(event.get("status") or "")) == "post"
+    total_score = None if home_score is None or away_score is None else home_score + away_score
+
+    result: bool | None = None
+    outcome = "pending"
+    resolved_pick = pick
+    resolved_line = line
+
+    if market_norm == "moneyline":
+        side = _resolve_pick_side(pick, event)
+        if side is None:
+            raise HTTPException(
+                status_code=400,
+                detail="For moneyline, pick must be home, away, draw, or a matching team name",
+            )
+        resolved_pick = side
+        if home_score is not None and away_score is not None:
+            if side == "draw":
+                result = home_score == away_score
+            elif side == "home":
+                result = home_score > away_score
+            else:
+                result = away_score > home_score
+            outcome = "win" if result else "loss"
+
+    elif market_norm == "spread":
+        side = _resolve_pick_side(pick, event)
+        if side not in {"home", "away"}:
+            raise HTTPException(
+                status_code=400,
+                detail="For spread, pick must be home, away, or a matching team name",
+            )
+        resolved_pick = side
+        if resolved_line is None:
+            resolved_line = _as_float(event.get("home_spread" if side == "home" else "away_spread"))
+        if resolved_line is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Spread line is required when the event does not have a stored spread",
+            )
+        if home_score is not None and away_score is not None:
+            adjusted = (home_score if side == "home" else away_score) + resolved_line
+            opponent_score = away_score if side == "home" else home_score
+            if adjusted > opponent_score:
+                result = True
+                outcome = "win"
+            elif adjusted < opponent_score:
+                result = False
+                outcome = "loss"
+            else:
+                result = None
+                outcome = "push"
+
+    elif market_norm == "total":
+        if pick_norm not in {"over", "under"}:
+            raise HTTPException(
+                status_code=400,
+                detail="For total, pick must be over or under",
+            )
+        resolved_pick = pick_norm
+        if resolved_line is None:
+            resolved_line = _as_float(event.get("game_total"))
+        if resolved_line is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Total line is required when the event does not have a stored total",
+            )
+        if total_score is not None:
+            if total_score > resolved_line:
+                result = pick_norm == "over"
+                outcome = "win" if result else "loss"
+            elif total_score < resolved_line:
+                result = pick_norm == "under"
+                outcome = "win" if result else "loss"
+            else:
+                result = None
+                outcome = "push"
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="market must be one of moneyline, spread, or total",
+        )
+
+    return {
+        "found": True,
+        "source": event.get("source"),
+        "settled": settled,
+        "market": market_norm,
+        "pick": resolved_pick,
+        "line": resolved_line,
+        "result": result,
+        "outcome": outcome,
+        "event": {
+            "event_id": str(event.get("event_id") or ""),
+            "date": str(event.get("date")) if event.get("date") is not None else None,
+            "sport": event.get("sport"),
+            "league": event.get("league"),
+            "name": event.get("name"),
+            "short_name": event.get("short_name"),
+            "status": event.get("status"),
+            "home_team": event.get("home_team"),
+            "away_team": event.get("away_team"),
+        },
+        "score": {
+            "home": home_score,
+            "away": away_score,
+            "total": total_score,
+        },
+        "pricing": {
+            "provider": event.get("provider"),
+            "game_total": _as_float(event.get("game_total")),
+            "over_odds": _as_int(event.get("over_odds")),
+            "under_odds": _as_int(event.get("under_odds")),
+            "draw_odds": _as_int(event.get("draw_odds")),
+            "home_ml": _as_int(event.get("home_ml")),
+            "away_ml": _as_int(event.get("away_ml")),
+            "home_spread": _as_float(event.get("home_spread")),
+            "away_spread": _as_float(event.get("away_spread")),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -420,6 +767,50 @@ def stats_live(
         "pregame_count": len(matches["pregame"]),
         **matches,
     })
+
+
+@app.get("/stats/market-check")
+def stats_market_check(
+    event_id: Optional[str] = Query(None, description="Exact event_id when known"),
+    date: Optional[str] = Query(None, description="Game date in YYYY-MM-DD format"),
+    sport: Optional[str] = Query(None, description="Optional sport filter"),
+    team: Optional[str] = Query(None, description="One team in the matchup"),
+    opponent: Optional[str] = Query(None, description="The opposing team in the matchup"),
+    market: str = Query(..., description="moneyline, spread, or total"),
+    pick: str = Query(..., description="Pick to evaluate: team/home/away/draw for moneyline or spread, over/under for total"),
+    line: Optional[float] = Query(None, description="Optional custom line; if omitted, stored line is used"),
+    _: None = Depends(_verify_token),
+) -> JSONResponse:
+    if not event_id and not (date and team and opponent):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either event_id or date + team + opponent",
+        )
+
+    if date and _date_only(date) is None:
+        raise HTTPException(status_code=400, detail="date must be in YYYY-MM-DD format")
+
+    event = _resolve_event(event_id, _date_only(date), sport, team, opponent)
+    if event is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "found": False,
+                "message": "No matching event found",
+                "query": {
+                    "event_id": event_id,
+                    "date": _date_only(date),
+                    "sport": sport,
+                    "team": team,
+                    "opponent": opponent,
+                    "market": market,
+                    "pick": pick,
+                    "line": line,
+                },
+            },
+        )
+
+    return JSONResponse(_evaluate_market(event, market, pick, line))
 
 
 # ---------------------------------------------------------------------------
