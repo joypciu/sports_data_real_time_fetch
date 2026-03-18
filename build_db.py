@@ -112,7 +112,8 @@ CREATE TABLE IF NOT EXISTS game_players (
     dnp_reason      VARCHAR,
     subbed_in       BOOLEAN,
     subbed_out      BOOLEAN,
-    formation_place VARCHAR
+    formation_place VARCHAR,
+    stats_json      VARCHAR            -- JSON dict of {stat_key: stat_value}
 );
 
 CREATE TABLE IF NOT EXISTS player_stats (
@@ -242,7 +243,6 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
     rows_teams:        list[tuple] = []
     rows_game_players: list[tuple] = []
     rows_players:      list[tuple] = []
-    rows_stats:        list[tuple] = []
 
     for g in games:
         event_id = str(g.get("event_id", ""))
@@ -320,6 +320,7 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
             ))
 
             gp_id = f"{event_id}_{player_id}"
+            stats_dict = {k: str(v) for k, v in (p.get("stats") or {}).items()}
             rows_game_players.append((
                 gp_id,
                 event_id,
@@ -334,15 +335,8 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
                 bool(p.get("subbed_in", False)),
                 bool(p.get("subbed_out", False)),
                 p.get("formation_place"),
+                json.dumps(stats_dict) if stats_dict else None,
             ))
-
-            for stat_key, stat_val in (p.get("stats") or {}).items():
-                rows_stats.append((
-                    f"{gp_id}_{stat_key}",
-                    gp_id,
-                    stat_key,
-                    str(stat_val),
-                ))
 
     if not rows_games:
         return 0, 0, 0
@@ -387,12 +381,11 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
     _bulk_ignore("game_players", [
         "id","event_id","player_id","sport","team_id","home_away",
         "starter","active","did_not_play","dnp_reason",
-        "subbed_in","subbed_out","formation_place",
+        "subbed_in","subbed_out","formation_place","stats_json",
     ], rows_game_players)
 
-    _bulk_ignore("player_stats", ["id","game_player_id","stat_key","stat_value"], rows_stats)
-
-    return len(rows_games), len(rows_players), len(rows_stats)
+    stats_written = sum(1 for r in rows_game_players if r[-1] is not None)
+    return len(rows_games), len(rows_players), stats_written
 
 
 # ---------------------------------------------------------------------------

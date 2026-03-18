@@ -530,12 +530,10 @@ def stats_player(
             p.team_name,
             p.position,
             gp.starter               AS is_starter,
-            ps.stat_key              AS stat_name,
-            ps.stat_value
+            gp.stats_json
         FROM players    p
         JOIN game_players gp ON gp.player_id = p.player_id AND gp.sport = p.sport
         JOIN games        g  ON g.event_id   = gp.event_id
-        JOIN player_stats ps ON ps.game_player_id = gp.id
         LEFT JOIN (
             SELECT gt.event_id, t.team_name
             FROM   game_teams gt
@@ -550,7 +548,7 @@ def stats_player(
         ) ta ON ta.event_id = g.event_id
         WHERE LOWER(p.display_name) LIKE LOWER(?)
         {sport_filter}
-        ORDER BY g.game_date DESC, g.event_id, ps.stat_key
+        ORDER BY g.game_date DESC, g.event_id
         LIMIT ?
     """
     sport_filter = "AND LOWER(g.sport) = LOWER(?)" if sport else ""
@@ -560,42 +558,40 @@ def stats_player(
     params: list = [pattern]
     if sport:
         params.append(sport)
-    params.append(limit * 50)  # over-fetch rows; group by game below
+    params.append(limit)  # one row per game-player now
 
     try:
         rows = _query(sql, params)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Group into games → player → stats
+    # Group into games → players; one DB row per game-player, stats in JSON blob
     games_map: dict[str, dict] = {}
     for row in rows:
-        eid  = str(row["event_id"])
+        eid   = str(row["event_id"])
         pname = row["display_name"]
-        key  = f"{eid}:{pname}"
         if eid not in games_map:
             games_map[eid] = {
-                "event_id":  eid,
-                "date":      str(row["date"]) if row["date"] else None,
-                "sport":     row["sport"],
-                "league":    row["league"],
-                "home_team": row["home_team"],
-                "away_team": row["away_team"],
+                "event_id":   eid,
+                "date":       str(row["date"]) if row["date"] else None,
+                "sport":      row["sport"],
+                "league":     row["league"],
+                "home_team":  row["home_team"],
+                "away_team":  row["away_team"],
                 "home_score": row["home_score"],
                 "away_score": row["away_score"],
-                "status":    row["status"],
-                "players":   {},
+                "status":     row["status"],
+                "players":    {},
             }
         gm = games_map[eid]
         if pname not in gm["players"]:
             gm["players"][pname] = {
-                "display_name":  pname,
-                "team":          row["team_name"],
-                "position":      row["position"],
-                "is_starter":    bool(row["is_starter"]) if row["is_starter"] is not None else None,
-                "stats":         {},
+                "display_name": pname,
+                "team":         row["team_name"],
+                "position":     row["position"],
+                "is_starter":   bool(row["is_starter"]) if row["is_starter"] is not None else None,
+                "stats":        json.loads(row["stats_json"] or "{}"),
             }
-        gm["players"][pname]["stats"][row["stat_name"]] = row["stat_value"]
 
     # Convert to list, collapse players dict to list, cap at limit games
     result = []
@@ -686,13 +682,23 @@ def stats_team(
 
     # --- Top scorers (goals / points per player) ---
     scorers_sql = f"""
-        SELECT p.display_name, SUM(TRY_CAST(ps.stat_value AS DOUBLE)) AS total
+        SELECT p.display_name,
+               SUM(TRY_CAST(
+                   COALESCE(
+                       json_extract_string(gp.stats_json, '$.goals'),
+                       json_extract_string(gp.stats_json, '$.G'),
+                       json_extract_string(gp.stats_json, '$.points'),
+                       json_extract_string(gp.stats_json, '$.PTS'),
+                       json_extract_string(gp.stats_json, '$.runs'),
+                       json_extract_string(gp.stats_json, '$.R'),
+                       json_extract_string(gp.stats_json, '$.runs scored')
+                   ) AS DOUBLE
+               )) AS total
         FROM players    p
         JOIN game_players gp ON gp.player_id = p.player_id AND gp.sport = p.sport
         JOIN games        g  ON g.event_id   = gp.event_id
-        JOIN player_stats ps ON ps.game_player_id = gp.id
         WHERE LOWER(p.team_name) LIKE LOWER(?)
-          AND LOWER(ps.stat_key) IN ('goals', 'points', 'runs scored', 'runs')
+          AND gp.stats_json IS NOT NULL
           {sport_filter}
         GROUP BY p.display_name
         ORDER BY total DESC NULLS LAST
