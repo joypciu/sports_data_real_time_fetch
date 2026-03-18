@@ -1366,7 +1366,7 @@ class TestLoadFileInMemory(unittest.TestCase):
         g, pl, st = bdb.load_file(self.con, p)
         self.assertEqual(g, 1)
         self.assertEqual(pl, 1)
-        self.assertEqual(st, 3)  # PTS, REB, AST
+        self.assertEqual(st, 1)  # 1 game_player row with stats_json set
 
     def test_empty_file_returns_zeros(self):
         p = self._write([])
@@ -1449,20 +1449,27 @@ class TestLoadFileInMemory(unittest.TestCase):
         game = _minimal_game(players=[player])
         p = self._write([game])
         bdb.load_file(self.con, p)
-        keys = set(r[0] for r in self.con.execute(
-            "SELECT stat_key FROM player_stats"
-        ).fetchall())
-        self.assertIn("PTS", keys)
-        self.assertIn("REB", keys)
+        import json as _json
+        row = self.con.execute(
+            "SELECT stats_json FROM game_players WHERE event_id='EVT001'"
+        ).fetchone()
+        self.assertIsNotNone(row, "game_players row should exist")
+        stats = _json.loads(row[0] or "{}")
+        self.assertIn("PTS", stats)
+        self.assertIn("REB", stats)
 
     def test_player_stat_values_stored_as_strings(self):
         player = _minimal_player(stats={"PTS": "42"})
         game = _minimal_game(players=[player])
         p = self._write([game])
         bdb.load_file(self.con, p)
-        val = self.con.execute(
-            "SELECT stat_value FROM player_stats WHERE stat_key='PTS'"
-        ).fetchone()[0]
+        import json as _json
+        row = self.con.execute(
+            "SELECT stats_json FROM game_players WHERE event_id='EVT001'"
+        ).fetchone()
+        self.assertIsNotNone(row, "game_players row should exist")
+        stats = _json.loads(row[0] or "{}")
+        val = stats.get("PTS")
         self.assertIsInstance(val, str)
         self.assertEqual(val, "42")
 
