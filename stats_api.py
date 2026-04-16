@@ -1,6 +1,7 @@
+<<<<<<< HEAD
 """
 stats_api.py
-============
+===========
 Internal read-only FastAPI service that exposes historical and live sports
 statistics from the DuckDB database (db/sports.db) and the live state file
 written by realtime_monitor.py.
@@ -29,7 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,6 +47,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 _THIS_DIR = Path(__file__).parent.resolve()
 DB_PATH   = str(_THIS_DIR / "db" / "sports.db")
 LIVE_DIR  = str(_THIS_DIR / "live")
+ARCHIVE_DIR = str(_THIS_DIR / "archive")
 
 _TOKEN    = os.getenv("STATS_API_TOKEN", "").strip()
 _PORT     = int(os.getenv("STATS_API_PORT", "8001"))
@@ -73,6 +75,30 @@ def _verify_token(
         return  # auth disabled — internal VPS use
     if credentials is None or credentials.credentials != _TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+# ---------------------------------------------------------------------------
+# Archive helpers
+# ---------------------------------------------------------------------------
+
+def _load_json_archive(table_name: str) -> list[dict[str, Any]]:
+    """Load archived data from JSON file for a given table."""
+    archive_path = os.path.join(ARCHIVE_DIR, f"old_{table_name}.json")
+    if not os.path.exists(archive_path):
+        return []
+
+    try:
+        with open(archive_path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def _get_cutoff_date() -> str:
+    """Calculate cutoff date (today - 2 months)."""
+    today = datetime.now(timezone.utc)
+    cutoff = today - timedelta(days=60)  # 2 months approx
+    return cutoff.strftime('%Y-%m-%d')
 
 
 # ---------------------------------------------------------------------------
@@ -565,41 +591,97 @@ def stats_player(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Group into games → players; one DB row per game-player, stats in JSON blob
-    games_map: dict[str, dict] = {}
-    for row in rows:
-        eid   = str(row["event_id"])
-        pname = row["display_name"]
-        if eid not in games_map:
-            games_map[eid] = {
-                "event_id":   eid,
-                "date":       str(row["date"]) if row["date"] else None,
-                "sport":      row["sport"],
-                "league":     row["league"],
-                "home_team":  row["home_team"],
-                "away_team":  row["away_team"],
-                "home_score": row["home_score"],
-                "away_score": row["away_score"],
-                "status":     row["status"],
-                "players":    {},
-            }
-        gm = games_map[eid]
-        if pname not in gm["players"]:
-            gm["players"][pname] = {
-                "display_name": pname,
-                "team":         row["team_name"],
-                "position":     row["position"],
-                "is_starter":   bool(row["is_starter"]) if row["is_starter"] is not None else None,
-                "stats":        json.loads(row["stats_json"] or "{}"),
-            }
-
-    # Convert to list, collapse players dict to list, cap at limit games
     result = []
-    for gm in list(games_map.values())[:limit]:
-        gm["players"] = list(gm["players"].values())
-        result.append(gm)
+    source = "database"
 
-    return JSONResponse({"found": bool(result), "count": len(result), "games": result})
+    if rows:
+        # Group into games → players; one DB row per game-player now, stats in JSON blob
+        games_map: dict[str, dict] = {}
+        for row in rows:
+            eid   = str(row["event_id"])
+            pname = row["display_name"]
+            if eid not in games_map:
+                games_map[eid] = {
+                    "event_id":   eid,
+                    "date":       str(row["date"]) if row["date"] else None,
+                    "sport":      row["sport"],
+                    "league":     row["league"],
+                    "home_team":  row["home_team"],
+                    "away_team":  row["away_team"],
+                    "home_score": row["home_score"],
+                    "away_score": row["away_score"],
+                    "status":     row["status"],
+                    "players":    {},
+                }
+            gm = games_map[eid]
+            if pname not in gm["players"]:
+                gm["players"][pname] = {
+                    "display_name": pname,
+                    "team":         row["team_name"],
+                    "position":     row["position"],
+                    "is_starter":   bool(row["is_starter"]) if row["is_starter"] is not None else None,
+                    "stats":        json.loads(row["stats_json"] or "{}"),
+                }
+
+        # Convert to list, collapse players dict to list, cap at limit games
+        result = []
+        for gm in list(games_map.values())[:limit]:
+            gm["players"] = list(gm["players"].values())
+            result.append(gm)
+    else:
+        # Fallback to archive
+        # First, find player_id from name and sport
+        player_sql = """
+            SELECT player_id FROM players
+            WHERE LOWER(display_name) LIKE LOWER(?)
+        """
+        player_params = [f"%{name}%"]
+        if sport:
+            player_sql += " AND LOWER(sport) = LOWER(?)"
+            player_params.append(sport)
+
+        player_rows = _query(player_sql, player_params)
+        if player_rows:
+            player_id = player_rows[0]["player_id"]
+            # Load archive
+            archive_data = _load_json_archive("player_stats")
+            # Filter by player_id
+            player_archive = [stat for stat in archive_data if stat.get("player_id") == player_id]
+            if player_archive:
+                source = "archive"
+                # Group by game_id, similar to DB logic
+                games_map: dict[str, dict] = {}
+                for stat in player_archive[:limit]:  # limit to prevent too much data
+                    game_id = stat.get("game_id")
+                    if game_id and str(game_id) not in games_map:
+                        # Get game info from archive or DB
+                        game_sql = "SELECT * FROM games WHERE id = ?"
+                        game_rows = _query(game_sql, [game_id])
+                        if game_rows:
+                            game = game_rows[0]
+                            games_map[str(game_id)] = {
+                                "event_id": str(game["event_id"]),
+                                "date": str(game["game_date"]) if game["game_date"] else None,
+                                "sport": game["sport"],
+                                "league": game["league"],
+                                "home_team": None,  # Would need to join, simplify
+                                "away_team": None,
+                                "home_score": game["home_score"],
+                                "away_score": game["away_score"],
+                                "status": game["status"],
+                                "players": {
+                                    name: {  # Assuming name matches
+                                        "display_name": name,
+                                        "team": None,  # Would need to get from players table
+                                        "position": None,
+                                        "is_starter": None,
+                                        "stats": stat  # Simplified, just the stat dict
+                                    }
+                                }
+                            }
+                result = list(games_map.values())
+
+    return JSONResponse({"found": bool(result), "count": len(result), "source": source, "games": result})
 
 
 @app.get("/stats/team")
@@ -715,29 +797,75 @@ def stats_team(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    record  = rec_rows[0] if rec_rows else {}
-    recent  = [
-        {
-            "event_id":   str(r["event_id"]),
-            "date":       str(r["date"]) if r["date"] else None,
-            "sport":      r["sport"],
-            "league":     r["league"],
-            "home_team":  r["home_team"] or None,
-            "away_team":  r["away_team"] or None,
-            "home_score": r["home_score"],
-            "away_score": r["away_score"],
-            "status":     r["status"],
-        }
-        for r in recent_rows
-    ]
-    scorers = [
-        {"player": r["display_name"], "total": r["total"]}
-        for r in scorer_rows
-    ]
+    found = bool(recent_rows) or bool(rec_rows and rec_rows[0].get("total_games", 0) > 0)
+    source = "database"
 
-    found = bool(recent) or (record.get("total_games", 0) or 0) > 0
+    if found:
+        record  = rec_rows[0] if rec_rows else {}
+        recent  = [
+            {
+                "event_id":   str(r["event_id"]),
+                "date":       str(r["date"]) if r["date"] else None,
+                "sport":      r["sport"],
+                "league":     r["league"],
+                "home_team":  r["home_team"] or None,
+                "away_team":  r["away_team"] or None,
+                "home_score": r["home_score"],
+                "away_score": r["away_score"],
+                "status":     r["status"],
+            }
+            for r in recent_rows
+        ]
+        scorers = [
+            {"player": r["display_name"], "total": r["total"]}
+            for r in scorer_rows
+        ]
+    else:
+        # Fallback to archive
+        # Find team_id from name
+        team_sql = """
+            SELECT team_id FROM teams
+            WHERE LOWER(team_name) LIKE LOWER(?)
+        """
+        team_params = [f"%{name}%"]
+        if sport:
+            team_sql += " AND LOWER(sport) = LOWER(?)"
+            team_params.append(sport)
+
+        team_rows = _query(team_sql, team_params)
+        if team_rows:
+            team_id = team_rows[0]["team_id"]
+            # Load archived game_teams
+            archive_data = _load_json_archive("game_teams")
+            team_archive = [gt for gt in archive_data if gt.get("team_id") == team_id]
+            if team_archive:
+                source = "archive"
+                # Simplified: just return recent archived games
+                recent = []
+                for gt in team_archive[:limit]:
+                    game_id = gt.get("game_id")
+                    if game_id:
+                        game_sql = "SELECT * FROM games WHERE id = ?"
+                        game_rows = _query(game_sql, [game_id])
+                        if game_rows:
+                            game = game_rows[0]
+                            recent.append({
+                                "event_id": str(game["event_id"]),
+                                "date": str(game["game_date"]) if game["game_date"] else None,
+                                "sport": game["sport"],
+                                "league": game["league"],
+                                "home_team": None,
+                                "away_team": None,
+                                "home_score": game["home_score"],
+                                "away_score": game["away_score"],
+                                "status": game["status"],
+                            })
+                record = {}  # Can't compute record from archive easily
+                scorers = []  # Can't compute scorers from archive easily
+
     return JSONResponse({
-        "found":       found,
+        "found":       bool(recent),
+        "source":      source,
         "team_filter": name,
         "record":      record,
         "recent":      recent,
@@ -828,3 +956,197 @@ def stats_market_check(
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=_PORT)
+=======
+import os
+import json
+import duckdb
+from fastapi import FastAPI, HTTPException, Query
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+
+app = FastAPI(title="Sports Stats API")
+
+# Configuration
+DB_PATH = "db/sports.db"
+ARCHIVE_DIR = "archive"
+CUTOFF_MONTHS = 2  # Archive data older than 2 months
+
+
+def get_db_connection():
+    """Get a read-only connection to the DuckDB database."""
+    return duckdb.connect(DB_PATH, read_only=True)
+
+
+def load_json_archive(table_name: str) -> List[Dict[str, Any]]:
+    """Load archived data from JSON file for a given table."""
+    archive_path = os.path.join(ARCHIVE_DIR, f"old_{table_name}.json")
+    if not os.path.exists(archive_path):
+        return []
+
+    try:
+        with open(archive_path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Error loading archive {archive_path}: {e}")
+        return []
+
+
+def get_player_stats_from_db(
+    player_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None
+) -> List[Dict]:
+    """Fetch player stats from the database."""
+    conn = get_db_connection()
+    try:
+        query = """
+            SELECT ps.*, g.game_date
+            FROM player_stats ps
+            JOIN games g ON ps.game_id = g.id
+            WHERE ps.player_id = ?
+        """
+        params = [player_id]
+
+        if start_date:
+            query += " AND g.game_date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND g.game_date <= ?"
+            params.append(end_date)
+
+        query += " ORDER BY g.game_date"
+
+        result = conn.execute(query, params).fetchall()
+        # Get column names
+        columns = [desc[0] for desc in conn.description]
+        # Convert to list of dicts
+        return [dict(zip(columns, row)) for row in result]
+    finally:
+        conn.close()
+
+
+def get_team_stats_from_db(
+    team_id: int, start_date: Optional[str] = None, end_date: Optional[str] = None
+) -> List[Dict]:
+    """Fetch team stats from the database."""
+    conn = get_db_connection()
+    try:
+        query = """
+            SELECT gt.*, g.game_date
+            FROM game_teams gt
+            JOIN games g ON gt.game_id = g.id
+            WHERE gt.team_id = ?
+        """
+        params = [team_id]
+
+        if start_date:
+            query += " AND g.game_date >= ?"
+            params.append(start_date)
+        if end_date:
+            query += " AND g.game_date <= ?"
+            params.append(end_date)
+
+        query += " ORDER BY g.game_date"
+
+        result = conn.execute(query, params).fetchall()
+        columns = [desc[0] for desc in conn.description]
+        return [dict(zip(columns, row)) for row in result]
+    finally:
+        conn.close()
+
+
+@app.get("/stats/player")
+async def get_player_stats(
+    player_id: int = Query(..., description="ID of the player"),
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+):
+    """
+    Get statistics for a specific player.
+    First tries to fetch from the database (recent data).
+    If no data found in DB, falls back to JSON archive (old data).
+    """
+    # Try database first
+    db_stats = get_player_stats_from_db(player_id, start_date, end_date)
+    if db_stats:
+        return {"source": "database", "data": db_stats, "count": len(db_stats)}
+
+    # Fallback to JSON archive
+    archive_stats = load_json_archive("player_stats")
+    if not archive_stats:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stats found for player_id {player_id} in database or archive",
+        )
+
+    # Filter archive data by date if specified
+    filtered_stats = archive_stats
+    if start_date or end_date:
+        filtered_stats = []
+        for stat in archive_stats:
+            game_date = stat.get("game_date")
+            if game_date:
+                if start_date and game_date < start_date:
+                    continue
+                if end_date and game_date > end_date:
+                    continue
+                filtered_stats.append(stat)
+
+    if not filtered_stats:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stats found for player_id {player_id} in archive matching date criteria",
+        )
+
+    return {"source": "archive", "data": filtered_stats, "count": len(filtered_stats)}
+
+
+@app.get("/stats/team")
+async def get_team_stats(
+    team_id: int = Query(..., description="ID of the team"),
+    start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="End date (YYYY-MM-DD)"),
+):
+    """
+    Get statistics for a specific team.
+    First tries to fetch from the database (recent data).
+    If no data found in DB, falls back to JSON archive (old data).
+    """
+    # Try database first
+    db_stats = get_team_stats_from_db(team_id, start_date, end_date)
+    if db_stats:
+        return {"source": "database", "data": db_stats, "count": len(db_stats)}
+
+    # Fallback to JSON archive
+    archive_stats = load_json_archive("game_teams")
+    if not archive_stats:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stats found for team_id {team_id} in database or archive",
+        )
+
+    # Filter archive data by date if specified
+    filtered_stats = archive_stats
+    if start_date or end_date:
+        filtered_stats = []
+        for stat in archive_stats:
+            game_date = stat.get("game_date")
+            if game_date:
+                if start_date and game_date < start_date:
+                    continue
+                if end_date and game_date > end_date:
+                    continue
+                filtered_stats.append(stat)
+
+    if not filtered_stats:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stats found for team_id {team_id} in archive matching date criteria",
+        )
+
+    return {"source": "archive", "data": filtered_stats, "count": len(filtered_stats)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+>>>>>>> 63ab153 (Add database archiving system and update stats API with fallback to JSON archives)
