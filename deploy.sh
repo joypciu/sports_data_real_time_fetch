@@ -107,6 +107,33 @@ if [ ! -f ".env" ]; then
     fi
 fi
 
+# ── Ensure required runtime directories exist ────────────────────────────────
+print_info "Ensuring runtime directories exist..."
+mkdir -p "$SERVICE_DIR/db" \
+         "$SERVICE_DIR/historical_data" \
+         "$SERVICE_DIR/live" \
+         "$SERVICE_DIR/archive"
+print_success "Runtime directories ready"
+
+# ── Bootstrap historical data (first deploy or missing DB) ───────────────────
+DB_FILE="$SERVICE_DIR/db/sports.db"
+DATA_DIR="$SERVICE_DIR/historical_data"
+
+if [ ! -f "$DB_FILE" ] || [ -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then
+    print_info "No database or historical data found — running 30-day backfill (this may take a few minutes)..."
+    source "$VENV_DIR/bin/activate"
+
+    python daily_ingest.py --days 30 \
+        && print_success "Historical ingest complete" \
+        || print_info "Ingest finished with some errors — continuing"
+
+    python build_db.py \
+        && print_success "Database built from historical data" \
+        || print_info "build_db finished with warnings — continuing"
+else
+    print_info "Existing database found — skipping backfill (daily timer handles ongoing ingestion)"
+fi
+
 # ── Systemd unit: stats_api ─────────────────────────────────────────────────
 print_info "Writing systemd unit: ${SERVICE_NAME}.service"
 sudo tee "/etc/systemd/system/${SERVICE_NAME}.service" > /dev/null <<EOF
@@ -129,10 +156,13 @@ EOF
 print_success "stats_api unit written"
 
 # ── Systemd unit + timer: daily_ingest ─────────────────────────────────────
+# The ingest service runs daily_ingest.py then build_db.py sequentially.
+# update_db.py (Thread 3 in main.py) handles incremental DuckDB updates every
+# 5 minutes during the day; the nightly build_db ensures a clean full rebuild.
 print_info "Writing systemd unit + timer: ${INGEST_TIMER_NAME}"
 sudo tee "/etc/systemd/system/${INGEST_TIMER_NAME}.service" > /dev/null <<EOF
 [Unit]
-Description=Daily ESPN data ingest (realtime_data_fetch)
+Description=Daily ESPN data ingest + DB rebuild (realtime_data_fetch)
 After=network.target
 
 [Service]
@@ -141,13 +171,15 @@ User=ubuntu
 WorkingDirectory=${SERVICE_DIR}
 EnvironmentFile=${SERVICE_DIR}/.env
 ExecStart=${VENV_DIR}/bin/python daily_ingest.py
+ExecStartPost=${VENV_DIR}/bin/python build_db.py
 StandardOutput=journal
 StandardError=journal
+TimeoutStartSec=1800
 EOF
 
 sudo tee "/etc/systemd/system/${INGEST_TIMER_NAME}.timer" > /dev/null <<EOF
 [Unit]
-Description=Run ESPN daily ingest every day at 06:00 UTC
+Description=Run ESPN daily ingest + DB rebuild every day at 06:00 UTC
 
 [Timer]
 OnCalendar=*-*-* 06:00:00 UTC
