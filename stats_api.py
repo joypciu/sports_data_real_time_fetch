@@ -105,8 +105,13 @@ def _get_cutoff_date() -> str:
 # ---------------------------------------------------------------------------
 
 def _conn() -> duckdb.DuckDBPyConnection:  # type: ignore[name-defined]
-    """Return a fresh read-only DuckDB connection for one request."""
-    return duckdb.connect(DB_PATH, read_only=True)
+    """Return a fresh DuckDB connection for one request.
+
+    Uses the default (read-write) mode so it is compatible with the
+    update_db background thread, which also needs write access.  DuckDB
+    serialises concurrent same-mode connections internally.
+    """
+    return duckdb.connect(DB_PATH)
 
 
 def _query(sql: str, params: list | None = None) -> list[dict[str, Any]]:

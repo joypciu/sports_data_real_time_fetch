@@ -75,6 +75,24 @@ def _float(v) -> float | None:      # noqa: ANN001
 # 1. Incremental historical update
 # ---------------------------------------------------------------------------
 
+def _connect_with_retry(db_path: str, retries: int = 6, delay: float = 2.0) -> duckdb.DuckDBPyConnection:  # type: ignore[name-defined]
+    """Open a DuckDB connection, retrying if another connection holds the file.
+
+    stats_api.py and update_db both use the default (read-write) mode so DuckDB
+    can serialise them, but a brief retry window handles the race on startup or
+    during a heavy query.
+    """
+    for attempt in range(retries):
+        try:
+            return duckdb.connect(db_path)
+        except Exception as exc:
+            if attempt == retries - 1:
+                raise
+            log.warning("DB connect attempt %d/%d failed (%s) — retrying in %.1fs", attempt + 1, retries, exc, delay)
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
+
+
 def incremental_historical_update(db_path: str, data_dir: str) -> tuple[int, int, int]:
     """Scan all JSON files in *data_dir* and insert any games not yet in the DB.
 
@@ -94,18 +112,20 @@ def incremental_historical_update(db_path: str, data_dir: str) -> tuple[int, int
 
     total_g = total_p = total_s = 0
     try:
-        con = duckdb.connect(db_path)
-        for path in files:
-            g, p, s = build_db.load_file(con, path)
-            if g:
-                log.info(
-                    "Incremental: +%d games, +%d player-rows, +%d stat-rows from %s",
-                    g, p, s, os.path.basename(path),
-                )
-            total_g += g
-            total_p += p
-            total_s += s
-        con.close()
+        con = _connect_with_retry(db_path)
+        try:
+            for path in files:
+                g, p, s = build_db.load_file(con, path)
+                if g:
+                    log.info(
+                        "Incremental: +%d games, +%d player-rows, +%d stat-rows from %s",
+                        g, p, s, os.path.basename(path),
+                    )
+                total_g += g
+                total_p += p
+                total_s += s
+        finally:
+            con.close()
     except Exception:
         log.exception("Error during incremental historical update")
 
@@ -187,31 +207,33 @@ def sync_live_games(db_path: str, live_dir: str) -> int:
         return 0
 
     try:
-        con = duckdb.connect(db_path)
-        con.execute("DELETE FROM live_games")
-        con.executemany(
-            """
-            INSERT INTO live_games (
-                event_id, league_key, sport, league, name,
-                status, status_detail, period, clock,
-                home_team_id, home_team_name, home_team_abbr, home_score,
-                away_team_id, away_team_name, away_team_abbr, away_score,
-                home_ml, away_ml, home_spread, game_total,
-                home_win_pct, away_win_pct,
-                situation, players, updated_at
-            ) VALUES (
-                ?,?,?,?,?,
-                ?,?,?,?,
-                ?,?,?,?,
-                ?,?,?,?,
-                ?,?,?,?,
-                ?,?,
-                ?,?,?
+        con = _connect_with_retry(db_path)
+        try:
+            con.execute("DELETE FROM live_games")
+            con.executemany(
+                """
+                INSERT INTO live_games (
+                    event_id, league_key, sport, league, name,
+                    status, status_detail, period, clock,
+                    home_team_id, home_team_name, home_team_abbr, home_score,
+                    away_team_id, away_team_name, away_team_abbr, away_score,
+                    home_ml, away_ml, home_spread, game_total,
+                    home_win_pct, away_win_pct,
+                    situation, players, updated_at
+                ) VALUES (
+                    ?,?,?,?,?,
+                    ?,?,?,?,
+                    ?,?,?,?,
+                    ?,?,?,?,
+                    ?,?,?,?,
+                    ?,?,
+                    ?,?,?
+                )
+                """,
+                rows,
             )
-            """,
-            rows,
-        )
-        con.close()
+        finally:
+            con.close()
         log.debug("Live sync: wrote %d rows to live_games", len(rows))
     except Exception:
         log.exception("Error syncing live_games table")
@@ -224,6 +246,23 @@ def sync_live_games(db_path: str, live_dir: str) -> int:
 # 3. Background loop (Thread 3 entry point)
 # ---------------------------------------------------------------------------
 
+VACUUM_INTERVAL = 6 * 3600  # VACUUM once every 6 hours to reclaim live_games dead space
+
+
+def vacuum_db(db_path: str) -> None:
+    """Run VACUUM to reclaim space from live_games DELETE/INSERT churn."""
+    try:
+        con = _connect_with_retry(db_path)
+        try:
+            log.info("Running VACUUM to reclaim dead space...")
+            con.execute("VACUUM")
+            log.info("VACUUM complete.")
+        finally:
+            con.close()
+    except Exception:
+        log.exception("Error running VACUUM")
+
+
 def run_updater_loop(
     db_path:       str = DEFAULT_DB,
     data_dir:      str = DEFAULT_DATA_DIR,
@@ -231,20 +270,22 @@ def run_updater_loop(
     hist_interval: int = 300,   # seconds between historical re-scans
     live_interval: int = 35,    # seconds between live-sync attempts
 ) -> None:
-    """Infinite loop: historical incremental update + live-games sync.
+    """Infinite loop: historical incremental update + live-games sync + periodic VACUUM.
 
     Designed to run as a daemon thread.  Exits only when the process exits.
     """
     log.info(
-        "DB updater started (hist_interval=%ds, live_interval=%ds)",
-        hist_interval, live_interval,
+        "DB updater started (hist_interval=%ds, live_interval=%ds, vacuum_interval=%ds)",
+        hist_interval, live_interval, VACUUM_INTERVAL,
     )
 
     # Bootstrap: ensure live_games table exists (safe on already-built DBs)
     try:
-        con = duckdb.connect(db_path)
-        con.execute(build_db.DDL)   # all CREATE TABLE IF NOT EXISTS — idempotent
-        con.close()
+        con = _connect_with_retry(db_path)
+        try:
+            con.execute(build_db.DDL)   # all CREATE TABLE IF NOT EXISTS — idempotent
+        finally:
+            con.close()
         log.info("Schema bootstrap complete.")
     except Exception:
         log.exception("Could not bootstrap schema — updater may fail")
@@ -253,6 +294,7 @@ def run_updater_loop(
     last_live_mtime: float = 0.0
     last_hist_run:   float = 0.0   # 0 → run immediately on first tick
     last_live_run:   float = 0.0
+    last_vacuum_run: float = 0.0
 
     while True:
         now = time.monotonic()
@@ -281,6 +323,11 @@ def run_updater_loop(
                     log.debug("Live sync wrote %d rows.", count)
 
             last_live_run = now
+
+        # ── Periodic VACUUM — reclaim dead space from live_games churn ───────
+        if now - last_vacuum_run >= VACUUM_INTERVAL:
+            vacuum_db(db_path)
+            last_vacuum_run = now
 
         time.sleep(5)
 
