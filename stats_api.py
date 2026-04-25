@@ -1391,6 +1391,51 @@ def stats_game_odds_history(
 
 
 # ---------------------------------------------------------------------------
+# Injuries endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/stats/injuries")
+def stats_injuries(
+    sport:  Optional[str] = Query(None, description="Sport filter: basketball, soccer, hockey, baseball, football"),
+    team:   Optional[str] = Query(None, description="Team name or abbreviation (partial match)"),
+    player: Optional[str] = Query(None, description="Player name (partial match)"),
+    _:      None          = Depends(_verify_token),
+) -> JSONResponse:
+    """
+    Return current injury and availability status for players.
+    Data is fetched from ESPN every ~10 minutes and stored in live/injuries.json.
+    """
+    path = os.path.join(LIVE_DIR, "injuries.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return JSONResponse({"found": False, "injuries": [], "error": "Injury data not yet available — refreshes every 10 minutes"})
+
+    injuries: list[dict[str, Any]] = data.get("injuries", [])
+
+    if sport:
+        injuries = [i for i in injuries if _normalize_text(i.get("sport", "")) == _normalize_text(sport)]
+    if team:
+        t = _normalize_text(team)
+        injuries = [
+            i for i in injuries
+            if t in _normalize_text(i.get("team_name", ""))
+            or t in _normalize_text(i.get("team_abbr", ""))
+        ]
+    if player:
+        p = _normalize_text(player)
+        injuries = [i for i in injuries if p in _normalize_text(i.get("player_name", ""))]
+
+    return JSONResponse({
+        "found":      bool(injuries),
+        "count":      len(injuries),
+        "fetched_at": data.get("fetched_at"),
+        "injuries":   injuries,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 

@@ -82,6 +82,19 @@ PLAYER_REFRESH_EVERY = 3   # every 3rd poll cycle (~90s at 30s interval)
 # How often to re-fetch odds/win-prob for PREGAME games (they change slowly)
 PREGAME_ODDS_REFRESH_EVERY = 5  # every 5th poll cycle (~150s at 30s interval)
 
+# How often to refresh injury reports (injuries change slowly)
+INJURY_REFRESH_EVERY = 20  # every 20th poll cycle (~10 min at 30s interval)
+
+# Sports/leagues to fetch injuries for (team-based sports only)
+INJURY_LEAGUES: list[tuple[str, str, str]] = [
+    ("basketball", "nba",             "nba"),
+    ("hockey",     "nhl",             "nhl"),
+    ("baseball",   "mlb",             "mlb"),
+    ("soccer",     "eng.1",           "epl"),
+    ("soccer",     "esp.1",           "laliga"),
+    ("football",   "nfl",             "nfl"),
+]
+
 # Data directory for archiving finished games
 DATA_DIR = "historical_data"
 
@@ -1101,6 +1114,77 @@ def poll_once(
     return new_states, all_events
 
 
+# ---------------------------------------------------------------------------
+# Injury feed
+# ---------------------------------------------------------------------------
+
+def fetch_and_save_injuries(http: "ESPNRequester", out_dir: str) -> None:
+    """
+    Fetch injury reports for all tracked team-based leagues and write
+    live/injuries.json.  Errors per-team are silently skipped so one bad
+    team does not block the rest.
+    """
+    injuries: list[dict[str, Any]] = []
+    fetched_at = _now_iso()
+
+    for sport, league, league_key in INJURY_LEAGUES:
+        # Step 1: get all teams in the league
+        teams_url = f"{SITE_API_BASE}/apis/site/v2/sports/{sport}/{league}/teams"
+        try:
+            teams_data = http.get(teams_url, params={"limit": 100})
+        except Exception:
+            continue
+
+        team_items = teams_data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
+        if not team_items:
+            # Fallback: sometimes top-level "teams" key
+            team_items = teams_data.get("teams", [])
+
+        for t_entry in team_items:
+            team = t_entry.get("team", t_entry)
+            team_id   = str(team.get("id", ""))
+            team_name = team.get("displayName") or team.get("name", "")
+            team_abbr = team.get("abbreviation", "")
+            if not team_id:
+                continue
+
+            inj_url = (
+                f"{SITE_API_BASE}/apis/site/v2/sports/{sport}/{league}"
+                f"/teams/{team_id}/injuries"
+            )
+            try:
+                inj_data = http.get(inj_url)
+            except Exception:
+                continue
+
+            for inj in inj_data.get("injuries", []):
+                athlete = inj.get("athlete", {})
+                details = inj.get("details", {})
+                injuries.append({
+                    "sport":       sport,
+                    "league":      league,
+                    "league_key":  league_key,
+                    "team_id":     team_id,
+                    "team_name":   team_name,
+                    "team_abbr":   team_abbr,
+                    "player_id":   str(athlete.get("id", "")),
+                    "player_name": athlete.get("displayName") or athlete.get("fullName", ""),
+                    "status":      inj.get("status", ""),
+                    "type":        details.get("type", ""),
+                    "detail":      details.get("detail", ""),
+                    "side":        details.get("side", ""),
+                    "return_date": details.get("returnDate", ""),
+                    "fetched_at":  fetched_at,
+                })
+
+    path = os.path.join(out_dir, "injuries.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": fetched_at, "count": len(injuries), "injuries": injuries}, fh)
+    except OSError as exc:
+        print(f"  [injuries] Failed to save: {exc}", file=sys.stderr)
+
+
 def run(args: argparse.Namespace) -> None:
     active_leagues = args.leagues if args.leagues else list(LEAGUES.keys())
     interval = args.interval
@@ -1138,6 +1222,14 @@ def run(args: argparse.Namespace) -> None:
                 # Persist
                 save_live_state(states, out_dir)
                 append_events(new_events, out_dir)
+
+                # Injury feed — refresh every INJURY_REFRESH_EVERY cycles
+                if poll_count % INJURY_REFRESH_EVERY == 0:
+                    try:
+                        fetch_and_save_injuries(http, out_dir)
+                        print(c(f"  [injuries] Refreshed", "grey"), file=sys.stderr)
+                    except Exception as exc:
+                        print(c(f"  [injuries] Error: {exc}", "red"), file=sys.stderr)
 
                 # Dashboard
                 print_dashboard(states, event_log)
