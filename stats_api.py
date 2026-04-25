@@ -955,6 +955,184 @@ def stats_market_check(
 
 
 # ---------------------------------------------------------------------------
+# Event log helpers
+# ---------------------------------------------------------------------------
+
+def _iter_event_files(date_from: str | None, date_to: str | None):
+    """Yield (date_str, path) for every events_YYYYMMDD.jsonl in LIVE_DIR."""
+    try:
+        names = sorted(
+            f for f in os.listdir(LIVE_DIR)
+            if f.startswith("events_") and f.endswith(".jsonl")
+        )
+    except OSError:
+        return
+    for name in names:
+        date_str = name[len("events_"):-len(".jsonl")]  # "20260415"
+        if date_from and date_str < date_from.replace("-", ""):
+            continue
+        if date_to and date_str > date_to.replace("-", ""):
+            continue
+        yield date_str, os.path.join(LIVE_DIR, name)
+
+
+def _event_matches(ev: dict[str, Any], sport: str | None, league: str | None,
+                   event_type: str | None, team: str | None,
+                   event_id: str | None) -> bool:
+    if sport and _normalize_text(ev.get("sport")) != _normalize_text(sport):
+        return False
+    if league:
+        ev_league = _normalize_text(ev.get("league", ""))
+        if _normalize_text(league) not in ev_league and ev_league not in _normalize_text(league):
+            return False
+    if event_type and _normalize_text(ev.get("type", ev.get("event_type", ""))) != _normalize_text(event_type):
+        return False
+    if event_id and str(ev.get("event_id", "")) != str(event_id):
+        return False
+    if team:
+        game_label = _normalize_text(ev.get("game", ev.get("short_name", "")))
+        home_abbr  = _normalize_text(ev.get("home_abbr", ev.get("home", "")))
+        away_abbr  = _normalize_text(ev.get("away_abbr", ev.get("away", "")))
+        t = _normalize_text(team)
+        if t not in game_label and t not in home_abbr and t not in away_abbr:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Event log endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/stats/events")
+def stats_events(
+    sport:      Optional[str] = Query(None, description="Sport filter: basketball, baseball, soccer, hockey"),
+    league:     Optional[str] = Query(None, description="League filter: nba, mlb, nhl, eng.1, esp.1 …"),
+    event_type: Optional[str] = Query(None, alias="type", description="Event type: LINE_MOVE, SCORE_UPDATE, TOTAL_MOVE, PERIOD_CHANGE, ODDS_MOVE, WIN_PROB_SHIFT, GAME_STARTED, GAME_FINISHED, NEW_GAME_DISCOVERED"),
+    team:       Optional[str] = Query(None, description="Team abbreviation or partial name (matched against game label)"),
+    event_id:   Optional[str] = Query(None, description="Exact ESPN event_id to filter a specific game"),
+    date_from:  Optional[str] = Query(None, description="Start date inclusive (YYYY-MM-DD)"),
+    date_to:    Optional[str] = Query(None, description="End date inclusive (YYYY-MM-DD)"),
+    limit:      int           = Query(50, ge=1, le=500, description="Max events to return"),
+    offset:     int           = Query(0, ge=0, description="Skip this many matching events (for pagination)"),
+    _:          None          = Depends(_verify_token),
+) -> JSONResponse:
+    """
+    Query the historical event log (LINE_MOVE, SCORE_UPDATE, etc.) with filters.
+
+    Events are stored in live/events_YYYYMMDD.jsonl files, one per day.
+    All 37,757 events from 2026-03-15 onwards are available.
+    """
+    if date_from and _date_only(date_from) is None:
+        raise HTTPException(status_code=400, detail="date_from must be YYYY-MM-DD")
+    if date_to and _date_only(date_to) is None:
+        raise HTTPException(status_code=400, detail="date_to must be YYYY-MM-DD")
+
+    matched: list[dict[str, Any]] = []
+    total_scanned = 0
+
+    for _date_str, path in _iter_event_files(date_from, date_to):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        ev = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    total_scanned += 1
+                    if _event_matches(ev, sport, league, event_type, team, event_id):
+                        matched.append(ev)
+        except OSError:
+            continue
+
+    total_matched = len(matched)
+    page = matched[offset: offset + limit]
+
+    return JSONResponse({
+        "found":         total_matched > 0,
+        "total_matched": total_matched,
+        "returned":      len(page),
+        "offset":        offset,
+        "limit":         limit,
+        "filters": {
+            "sport": sport, "league": league, "type": event_type,
+            "team": team, "event_id": event_id,
+            "date_from": date_from, "date_to": date_to,
+        },
+        "events": page,
+    })
+
+
+@app.get("/stats/events/summary")
+def stats_events_summary(
+    _: None = Depends(_verify_token),
+) -> JSONResponse:
+    """
+    Return aggregate counts across all event log files.
+    Shows total events broken down by type, sport, and league.
+    Useful for understanding what activity has been recorded.
+    """
+    from collections import Counter
+    by_type:   Counter = Counter()
+    by_sport:  Counter = Counter()
+    by_league: Counter = Counter()
+    by_date:   Counter = Counter()
+    games: dict[str, dict[str, Any]] = {}   # event_id -> {game, sport, league, count}
+
+    for date_str, path in _iter_event_files(None, None):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        ev = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    etype  = ev.get("type", ev.get("event_type", "UNKNOWN"))
+                    sport  = ev.get("sport", "unknown")
+                    league = ev.get("league", "unknown")
+                    eid    = str(ev.get("event_id", ""))
+                    by_type[etype]               += 1
+                    by_sport[sport]              += 1
+                    by_league[f"{sport}/{league}"] += 1
+                    by_date[date_str]            += 1
+                    if eid:
+                        if eid not in games:
+                            games[eid] = {
+                                "event_id": eid,
+                                "game":     ev.get("game", ev.get("short_name", "")),
+                                "sport":    sport,
+                                "league":   league,
+                                "count":    0,
+                            }
+                        games[eid]["count"] += 1
+        except OSError:
+            continue
+
+    total = sum(by_type.values())
+    top_games = sorted(games.values(), key=lambda g: -g["count"])[:20]
+    date_keys = sorted(by_date.keys())
+
+    return JSONResponse({
+        "total_events":   total,
+        "unique_games":   len(games),
+        "date_range": {
+            "from": date_keys[0] if date_keys else None,
+            "to":   date_keys[-1] if date_keys else None,
+            "days": len(date_keys),
+        },
+        "by_type":   dict(sorted(by_type.items(),   key=lambda x: -x[1])),
+        "by_sport":  dict(sorted(by_sport.items(),  key=lambda x: -x[1])),
+        "by_league": dict(sorted(by_league.items(), key=lambda x: -x[1])),
+        "top_games_by_activity": top_games,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
