@@ -1121,45 +1121,54 @@ def poll_once(
 def fetch_and_save_injuries(http: "ESPNRequester", out_dir: str) -> None:
     """
     Fetch injury reports for all tracked team-based leagues and write
-    live/injuries.json.  Errors per-team are silently skipped so one bad
-    team does not block the rest.
+    live/injuries.json.
+
+    Uses the ESPN roster endpoint (one call per team) which embeds injury
+    status directly on each athlete object. Only athletes with a non-empty
+    injuries array are included.  Errors per-team are silently skipped.
     """
     injuries: list[dict[str, Any]] = []
     fetched_at = _now_iso()
 
     for sport, league, league_key in INJURY_LEAGUES:
-        # Step 1: get all teams in the league
+        # Get all teams in the league
         teams_url = f"{SITE_API_BASE}/apis/site/v2/sports/{sport}/{league}/teams"
         try:
             teams_data = http.get(teams_url, params={"limit": 100})
         except Exception:
             continue
 
-        team_items = teams_data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
-        if not team_items:
-            # Fallback: sometimes top-level "teams" key
-            team_items = teams_data.get("teams", [])
+        team_items = (
+            teams_data.get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
+            or teams_data.get("teams", [])
+        )
 
         for t_entry in team_items:
-            team = t_entry.get("team", t_entry)
+            team      = t_entry.get("team", t_entry)
             team_id   = str(team.get("id", ""))
             team_name = team.get("displayName") or team.get("name", "")
             team_abbr = team.get("abbreviation", "")
             if not team_id:
                 continue
 
-            inj_url = (
-                f"{SITE_API_BASE}/apis/site/v2/sports/{sport}/{league}"
-                f"/teams/{team_id}/injuries"
-            )
+            # Roster endpoint — one call gets all players + injury status
+            roster_url = f"{SITE_API_BASE}/apis/site/v2/sports/{sport}/{league}/teams/{team_id}/roster"
             try:
-                inj_data = http.get(inj_url)
+                roster_data = http.get(roster_url)
             except Exception:
                 continue
 
-            for inj in inj_data.get("injuries", []):
-                athlete = inj.get("athlete", {})
-                details = inj.get("details", {})
+            for athlete in roster_data.get("athletes", []):
+                inj_list = athlete.get("injuries", [])
+                if not inj_list:
+                    continue
+
+                latest_inj = inj_list[0]
+                inj_status = latest_inj.get("status", "")
+                if not inj_status or inj_status.lower() == "active":
+                    continue
+
+                player_status = athlete.get("status", {})
                 injuries.append({
                     "sport":       sport,
                     "league":      league,
@@ -1169,11 +1178,11 @@ def fetch_and_save_injuries(http: "ESPNRequester", out_dir: str) -> None:
                     "team_abbr":   team_abbr,
                     "player_id":   str(athlete.get("id", "")),
                     "player_name": athlete.get("displayName") or athlete.get("fullName", ""),
-                    "status":      inj.get("status", ""),
-                    "type":        details.get("type", ""),
-                    "detail":      details.get("detail", ""),
-                    "side":        details.get("side", ""),
-                    "return_date": details.get("returnDate", ""),
+                    "position":    (athlete.get("position") or {}).get("abbreviation", ""),
+                    "jersey":      str(athlete.get("jersey", "")),
+                    "status":      inj_status,
+                    "player_availability": (player_status.get("abbreviation") or player_status.get("name", "")) if isinstance(player_status, dict) else str(player_status),
+                    "report_date": latest_inj.get("date", ""),
                     "fetched_at":  fetched_at,
                 })
 
