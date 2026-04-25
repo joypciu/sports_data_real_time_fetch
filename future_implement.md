@@ -12,6 +12,12 @@ Each feature is committed and tested live before moving to the next.
 
 ---
 
+---
+
+## All Features Shipped ✅ (2026-04-25)
+
+---
+
 ## Feature 1 — Game Timeline  ✅
 **Endpoint:** `GET /game/timeline?event_id=X`
 
