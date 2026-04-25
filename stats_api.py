@@ -1227,14 +1227,14 @@ def stats_matchups(
             g.short_name,
             COALESCE(ht.team_name, '') AS home_team,
             COALESCE(ht.team_abbr, '') AS home_abbr,
-            COALESCE(at.team_name, '') AS away_team,
-            COALESCE(at.team_abbr, '') AS away_abbr,
+            COALESCE(awt.team_name, '') AS away_team,
+            COALESCE(awt.team_abbr, '') AS away_abbr,
             g.home_score,
             g.away_score,
             g.status
         FROM games g
         LEFT JOIN ({_home_sub}) ht ON ht.event_id = g.event_id
-        LEFT JOIN ({_away_sub}) at ON at.event_id = g.event_id
+        LEFT JOIN ({_away_sub}) awt ON awt.event_id = g.event_id
         WHERE g.status = 'post'
           {sport_filter}
         ORDER BY g.game_date DESC
