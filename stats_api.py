@@ -1133,6 +1133,264 @@ def stats_events_summary(
 
 
 # ---------------------------------------------------------------------------
+# Game Timeline endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/stats/game/timeline")
+def stats_game_timeline(
+    event_id: str  = Query(..., description="ESPN event ID"),
+    _:        None = Depends(_verify_token),
+) -> JSONResponse:
+    """
+    Return every recorded event for a single game in chronological order.
+    Includes score updates, line moves, period changes, win probability
+    shifts, and the final result — all sorted oldest to newest.
+    """
+    matched: list[dict[str, Any]] = []
+
+    for _date_str, path in _iter_event_files(None, None):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        ev = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(ev.get("event_id", "")) == event_id:
+                        matched.append(ev)
+        except OSError:
+            continue
+
+    matched.sort(key=lambda e: e.get("timestamp", ""))
+
+    game_meta: dict[str, Any] = {}
+    if matched:
+        first = matched[0]
+        game_meta = {
+            "event_id": event_id,
+            "game":     first.get("game", first.get("short_name", "")),
+            "sport":    first.get("sport"),
+            "league":   first.get("league"),
+        }
+
+    return JSONResponse({
+        "found":       bool(matched),
+        "event_id":    event_id,
+        "game":        game_meta.get("game"),
+        "sport":       game_meta.get("sport"),
+        "league":      game_meta.get("league"),
+        "event_count": len(matched),
+        "events":      matched,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Head-to-Head History endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/stats/matchups")
+def stats_matchups(
+    team:     str           = Query(..., description="One team name or abbreviation"),
+    opponent: str           = Query(..., description="Opposing team name or abbreviation"),
+    sport:    Optional[str] = Query(None, description="Sport filter"),
+    limit:    int           = Query(10, ge=1, le=50, description="Max games to return"),
+    _:        None          = Depends(_verify_token),
+) -> JSONResponse:
+    """
+    Return historical head-to-head games between two teams, most recent first.
+    Also checks the live state for any upcoming/live matchup between them.
+    """
+    sport_filter = "AND LOWER(g.sport) = LOWER(?)" if sport else ""
+
+    _home_sub = """
+        SELECT gt.event_id, t.team_name, t.team_abbr
+        FROM   game_teams gt
+        JOIN   teams      t ON t.team_id = gt.team_id AND t.sport = gt.sport
+        WHERE  gt.home_away = 'home'
+    """
+    _away_sub = """
+        SELECT gt.event_id, t.team_name, t.team_abbr
+        FROM   game_teams gt
+        JOIN   teams      t ON t.team_id = gt.team_id AND t.sport = gt.sport
+        WHERE  gt.home_away = 'away'
+    """
+
+    sql = f"""
+        SELECT
+            g.event_id,
+            g.game_date     AS date,
+            g.sport,
+            g.league,
+            g.short_name,
+            COALESCE(ht.team_name, '') AS home_team,
+            COALESCE(ht.team_abbr, '') AS home_abbr,
+            COALESCE(at.team_name, '') AS away_team,
+            COALESCE(at.team_abbr, '') AS away_abbr,
+            g.home_score,
+            g.away_score,
+            g.status
+        FROM games g
+        LEFT JOIN ({_home_sub}) ht ON ht.event_id = g.event_id
+        LEFT JOIN ({_away_sub}) at ON at.event_id = g.event_id
+        WHERE g.status = 'post'
+          {sport_filter}
+        ORDER BY g.game_date DESC
+        LIMIT ?
+    """
+
+    params: list[Any] = []
+    if sport:
+        params.append(sport)
+    params.append(500)  # fetch wide, filter client-side for both-team match
+
+    try:
+        rows = _query(sql, params)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    results = []
+    for r in rows:
+        if not (
+            _team_matches(team, r["home_team"], r["home_abbr"]) or
+            _team_matches(team, r["away_team"], r["away_abbr"])
+        ):
+            continue
+        if not (
+            _team_matches(opponent, r["home_team"], r["home_abbr"]) or
+            _team_matches(opponent, r["away_team"], r["away_abbr"])
+        ):
+            continue
+
+        home_score = _as_int(r["home_score"])
+        away_score = _as_int(r["away_score"])
+        if home_score is not None and away_score is not None:
+            if home_score > away_score:
+                winner = r["home_team"]
+            elif away_score > home_score:
+                winner = r["away_team"]
+            else:
+                winner = "draw"
+        else:
+            winner = None
+
+        results.append({
+            "event_id":   str(r["event_id"]),
+            "date":       str(r["date"]) if r["date"] else None,
+            "sport":      r["sport"],
+            "league":     r["league"],
+            "short_name": r["short_name"],
+            "home_team":  r["home_team"] or None,
+            "away_team":  r["away_team"] or None,
+            "home_score": home_score,
+            "away_score": away_score,
+            "winner":     winner,
+            "status":     r["status"],
+        })
+        if len(results) >= limit:
+            break
+
+    # Tally head-to-head record
+    team_norm = _normalize_text(team)
+    team_wins = sum(
+        1 for g in results
+        if g["winner"] and _normalize_text(g["winner"]) != "draw"
+        and team_norm in _normalize_text(g["winner"])
+    )
+    opp_wins = len([g for g in results if g["winner"] and not (
+        _normalize_text(g["winner"]) == "draw" or team_norm in _normalize_text(g["winner"])
+    )])
+    draws = sum(1 for g in results if g["winner"] == "draw")
+
+    return JSONResponse({
+        "found":    bool(results),
+        "team":     team,
+        "opponent": opponent,
+        "sport":    sport,
+        "h2h_record": {
+            "team_wins":     team_wins,
+            "opponent_wins": opp_wins,
+            "draws":         draws,
+            "total_games":   len(results),
+        },
+        "games": results,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Odds History endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/stats/game/odds-history")
+def stats_game_odds_history(
+    event_id: str  = Query(..., description="ESPN event ID"),
+    _:        None = Depends(_verify_token),
+) -> JSONResponse:
+    """
+    Return the full timeline of how odds moved for one game —
+    moneyline shifts, total line changes, spread updates —
+    from opening line to close, in chronological order.
+    """
+    odds_types = {"LINE_MOVE", "TOTAL_MOVE", "ODDS_MOVE"}
+    matched: list[dict[str, Any]] = []
+
+    for _date_str, path in _iter_event_files(None, None):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        ev = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(ev.get("event_id", "")) == event_id:
+                        etype = ev.get("type", ev.get("event_type", ""))
+                        if etype in odds_types:
+                            matched.append(ev)
+        except OSError:
+            continue
+
+    matched.sort(key=lambda e: e.get("timestamp", ""))
+
+    game_meta: dict[str, Any] = {}
+    if matched:
+        first = matched[0]
+        game_meta = {
+            "game":   first.get("game", first.get("short_name", "")),
+            "sport":  first.get("sport"),
+            "league": first.get("league"),
+        }
+
+    # Build a summary of opening vs closing values by field
+    opening: dict[str, Any] = {}
+    closing: dict[str, Any] = {}
+    for ev in matched:
+        field = ev.get("field")
+        if not field:
+            continue
+        val = ev.get("new_value")
+        if field not in opening and ev.get("old_value") is not None:
+            opening[field] = ev["old_value"]
+        closing[field] = val
+
+    return JSONResponse({
+        "found":       bool(matched),
+        "event_id":    event_id,
+        "game":        game_meta.get("game"),
+        "sport":       game_meta.get("sport"),
+        "league":      game_meta.get("league"),
+        "move_count":  len(matched),
+        "opening":     opening,
+        "closing":     closing,
+        "history":     matched,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
