@@ -105,13 +105,13 @@ def _get_cutoff_date() -> str:
 # ---------------------------------------------------------------------------
 
 def _conn() -> duckdb.DuckDBPyConnection:  # type: ignore[name-defined]
-    """Return a fresh DuckDB connection for one request.
+    """Return a fresh read-only DuckDB connection for one request.
 
-    Uses the default (read-write) mode so it is compatible with the
-    update_db background thread, which also needs write access.  DuckDB
-    serialises concurrent same-mode connections internally.
+    Read-only mode lets multiple stats_api workers coexist with the
+    update_db write process without competing for the exclusive write lock.
+    DuckDB allows unlimited read-only connections alongside one writer.
     """
-    return duckdb.connect(DB_PATH)
+    return duckdb.connect(DB_PATH, read_only=True)
 
 
 def _query(sql: str, params: list | None = None) -> list[dict[str, Any]]:
@@ -383,7 +383,15 @@ def _resolve_event(
         if _matchup_matches(event, team, opponent):
             return event
 
-    historical_candidates = _historical_event_candidates(event_id, game_date, sport)
+    try:
+        historical_candidates = _historical_event_candidates(event_id, game_date, sport)
+    except Exception as exc:
+        # DuckDB unavailable or temporarily locked — treat as not found so
+        # callers receive a clean 404 rather than an unhandled 500.
+        import logging
+        logging.getLogger(__name__).warning("DuckDB query failed in _resolve_event: %s", exc)
+        return None
+
     for event in historical_candidates:
         if _matchup_matches(event, team, opponent):
             event["source"] = "historical"
