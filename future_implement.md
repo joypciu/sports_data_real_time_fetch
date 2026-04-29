@@ -159,12 +159,66 @@ POST /bets
 
 ---
 
+## Feature 7 — Team Trends (ATS / O-U / Home-Away Splits)  ✅
+**Endpoints:** `GET /trends?team=X&sport=Y` (Cache API), `GET /stats/trends` (Stats API)
+
+Computes ATS (against the spread), over/under, and home/away performance splits
+for any team directly from the historical DuckDB database.
+
+**Why:** Before placing a bet on /bets, there was no way to research how a team
+historically performs against the spread or on totals. This endpoint closes that gap.
+
+**Params:**
+| Param | Required | Description |
+|---|---|---|
+| `team` | yes | Team name or abbreviation |
+| `sport` | no | Filter by sport |
+| `league` | no | Filter by league key |
+| `limit` | no | Recent games to analyse (5–200, default 50) |
+
+**Response includes:**
+- `overall`, `home`, `away`: ATS record (cover %, covers/losses/pushes), O/U record (over %, overs/unders), SU record (W-L-D)
+- `recent_form`: last 10 completed games with date, side, score, SU, ATS result, O/U result
+
+**Example:**
+```
+GET /trends?team=OKC&sport=basketball
+GET /trends?team=Arsenal&sport=soccer&limit=20
+```
+
+---
+
+## Feature 8 — Bet P&L Analytics  ✅
+**Endpoint:** `GET /bets/analytics`
+
+Extended analytics across all tracked bets: win rate, ROI, average American odds,
+net profit, and breakdowns by market (moneyline/spread/total) and by sport.
+
+**Why:** The existing `/bets/summary` only gave raw counts. Users wanted to know
+whether their betting strategy is profitable, which markets perform best, and their
+overall ROI — without doing the math themselves.
+
+**Response includes:**
+- `win_rate_pct`, `roi_pct`, `avg_odds`, `net_profit`, `total_staked`, `total_returned`
+- `by_status`: win/loss/push counts
+- `by_market`: per-market wins, losses, staked, returned, net, win_rate
+- `by_sport`: same breakdown by sport
+
+**Example:**
+```
+GET /bets/analytics
+→ { "win_rate_pct": 58.3, "roi_pct": 6.2, "net_profit": 74.40, ... }
+```
+
+---
+
 ## Backlog (Future Consideration)
 
 | Feature | Description |
 |---|---|
 | Player props tracking | Track player prop lines (LeBron pts o/u, etc.) via sportsbooks |
-| Betting trends | Public betting % per side — sharp vs public money |
+| Public betting % | Betting trends — sharp vs public money % per side |
+| Closing Line Value (CLV) | Compare bet-time odds to closing odds to measure line value |
 | WebSocket / SSE push | Stream score + odds updates in real time instead of polling |
 | CSV export | `GET /events/export?format=csv` — download event data as spreadsheet |
 | Win probability chart | Historical win probability over the course of a game |

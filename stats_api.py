@@ -1444,6 +1444,200 @@ def stats_injuries(
 
 
 # ---------------------------------------------------------------------------
+# Team Trends endpoint  (ATS / O-U / home-away splits)
+# ---------------------------------------------------------------------------
+
+@app.get("/stats/trends")
+def stats_trends(
+    team:   str           = Query(..., description="Team name or abbreviation"),
+    sport:  Optional[str] = Query(None, description="Sport filter: basketball, soccer, hockey, baseball"),
+    league: Optional[str] = Query(None, description="League filter: nba, mlb, nhl, eng.1 …"),
+    limit:  int           = Query(50, ge=5, le=200, description="Number of recent completed games to analyse (default 50)"),
+    _:      None          = Depends(_verify_token),
+) -> JSONResponse:
+    """
+    Return ATS (against the spread), over/under, and home/away performance
+    trends for a team, computed from the historical DuckDB database.
+
+    ATS  — team covered the spread (team_score + spread > opponent_score).
+    O/U  — combined final score vs the posted game total line.
+    Splits include home-only and away-only breakdowns.
+    """
+    sport_clause  = "AND LOWER(g.sport)  = LOWER(?)" if sport  else ""
+    league_clause = "AND LOWER(g.league) = LOWER(?)" if league else ""
+
+    sql = f"""
+        SELECT
+            g.event_id,
+            g.game_date,
+            g.sport,
+            g.league,
+            CAST(g.home_score  AS DOUBLE) AS home_score,
+            CAST(g.away_score  AS DOUBLE) AS away_score,
+            CAST(g.game_total  AS DOUBLE) AS game_total,
+            my_gt.home_away                AS my_side,
+            CAST(my_gt.spread  AS DOUBLE)  AS my_spread,
+            CAST(my_gt.moneyline AS DOUBLE) AS my_ml
+        FROM games g
+        JOIN game_teams my_gt  ON my_gt.event_id = g.event_id
+        JOIN teams      my_t   ON my_t.team_id   = my_gt.team_id
+                               AND my_t.sport     = my_gt.sport
+        WHERE g.status = 'post'
+          AND g.home_score IS NOT NULL
+          AND g.away_score IS NOT NULL
+          AND (
+              LOWER(my_t.team_name) LIKE LOWER(?)
+              OR LOWER(my_t.team_abbr) = LOWER(?)
+          )
+          {sport_clause}
+          {league_clause}
+        ORDER BY g.game_date DESC
+        LIMIT ?
+    """
+
+    team_like = f"%{team}%"
+    params: list[Any] = [team_like, team.lower()]
+    if sport:  params.append(sport)
+    if league: params.append(league)
+    params.append(limit)
+
+    try:
+        rows = _query(sql, params)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Database error: {exc}")
+
+    if not rows:
+        return JSONResponse({
+            "found": False,
+            "team":  team,
+            "sport": sport,
+            "games_analysed": 0,
+            "message": "No completed games found for this team in the database.",
+        })
+
+    # ---- compute record accumulators ----
+    def _blank():
+        return {"covers": 0, "losses": 0, "pushes": 0,
+                "overs": 0, "unders": 0, "ou_pushes": 0,
+                "wins": 0, "defeats": 0, "draws": 0, "games": 0}
+
+    overall = _blank()
+    home    = _blank()
+    away    = _blank()
+    recent_form: list[dict[str, Any]] = []
+
+    for r in rows:
+        hs = r["home_score"]
+        as_ = r["away_score"]
+        gt  = r["game_total"]
+        side = r["my_side"]          # "home" or "away"
+        spd  = r["my_spread"]        # spread from DB for this team's side
+
+        bucket = home if side == "home" else away
+        overall["games"] += 1
+        bucket["games"]  += 1
+
+        # --- win / loss / draw (straight up) ---
+        if hs is not None and as_ is not None:
+            if side == "home":
+                my_score, opp_score = hs, as_
+            else:
+                my_score, opp_score = as_, hs
+
+            if my_score > opp_score:
+                overall["wins"]    += 1
+                bucket["wins"]     += 1
+                su = "W"
+            elif my_score < opp_score:
+                overall["defeats"] += 1
+                bucket["defeats"]  += 1
+                su = "L"
+            else:
+                overall["draws"]   += 1
+                bucket["draws"]    += 1
+                su = "D"
+
+            # --- ATS ---
+            ats = "N/A"
+            if spd is not None:
+                covered_score = my_score + spd
+                if covered_score > opp_score:
+                    overall["covers"] += 1
+                    bucket["covers"]  += 1
+                    ats = "cover"
+                elif covered_score < opp_score:
+                    overall["losses"] += 1
+                    bucket["losses"]  += 1
+                    ats = "loss"
+                else:
+                    overall["pushes"] += 1
+                    bucket["pushes"]  += 1
+                    ats = "push"
+        else:
+            su, ats, my_score, opp_score = "?", "N/A", None, None
+
+        # --- O/U ---
+        ou = "N/A"
+        if gt is not None and hs is not None and as_ is not None:
+            total = hs + as_
+            if total > gt:
+                overall["overs"]  += 1
+                bucket["overs"]   += 1
+                ou = "over"
+            elif total < gt:
+                overall["unders"] += 1
+                bucket["unders"]  += 1
+                ou = "under"
+            else:
+                overall["ou_pushes"] += 1
+                bucket["ou_pushes"]  += 1
+                ou = "push"
+
+        if len(recent_form) < 10:
+            recent_form.append({
+                "event_id":  str(r["event_id"]),
+                "date":      str(r["game_date"]) if r["game_date"] else None,
+                "side":      side,
+                "score":     f"{int(my_score)}-{int(opp_score)}" if my_score is not None else None,
+                "su":        su,
+                "ats":       ats,
+                "ou":        ou,
+                "spread":    spd,
+            })
+
+    def _pct(n, d):
+        return round(n / d * 100, 1) if d else None
+
+    def _fmt(b):
+        ats_games = b["covers"] + b["losses"] + b["pushes"]
+        ou_games  = b["overs"]  + b["unders"]  + b["ou_pushes"]
+        return {
+            "games": b["games"],
+            "su_record": f"{b['wins']}-{b['defeats']}-{b['draws']}",
+            "ats": {
+                "covers": b["covers"], "losses": b["losses"], "pushes": b["pushes"],
+                "cover_pct": _pct(b["covers"], ats_games),
+            },
+            "ou": {
+                "overs": b["overs"], "unders": b["unders"], "pushes": b["ou_pushes"],
+                "over_pct": _pct(b["overs"], ou_games),
+            },
+        }
+
+    return JSONResponse({
+        "found":          True,
+        "team":           team,
+        "sport":          sport,
+        "league":         league,
+        "games_analysed": overall["games"],
+        "overall":        _fmt(overall),
+        "home":           _fmt(home),
+        "away":           _fmt(away),
+        "recent_form":    recent_form,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
