@@ -14,7 +14,7 @@ Each feature is committed and tested live before moving to the next.
 
 ---
 
-## All Features Shipped ✅ (2026-04-25)
+## All Features Shipped ✅ (2026-04-29)
 
 ---
 
@@ -137,6 +137,24 @@ GET /injuries
 GET /injuries?sport=basketball
 GET /injuries?team=Lakers
 GET /injuries?player=LeBron+James
+```
+
+---
+
+## Feature 6 — Bet Tracking & Settlement  ✅
+**Endpoints:** `POST /bets`, `GET /bets`, `GET /bets/summary`, `GET /bets/{id}`, `POST /bets/{id}/settle`, `DELETE /bets/{id}`
+
+Persistent bet records backed by SQLite with automatic settlement against historical and live ESPN data.
+
+**Key design:** No event ID or opponent required — team name + date is sufficient to place and settle a bet. Settlement runs immediately on create; pending bets auto-settle on retrieval once the game finishes.
+
+**Single-team market check:** `/stats/market-check` now accepts `date + one team` (opponent optional). The resolver searches both home and away sides, enabling settlement even when only one team in the matchup is known.
+
+**Example:**
+```
+POST /bets
+{ "team": "OKC", "date": "2026-04-28", "market": "moneyline", "pick": "home" }
+→ status: "loss", settled: true, source: "historical"
 ```
 
 ---

@@ -126,7 +126,7 @@ Endpoints:
 
 Authentication is optional: set `STATS_API_TOKEN` in `.env` to require a bearer token. Leave blank for VPS-internal use.
 
-`/stats/market-check` accepts either `event_id`, or `date` + `team` + `opponent`, plus `market`, `pick`, optional `line`, and optional `sport`. It searches live state first, then historical DuckDB rows, and returns a normalized payload including `found`, `source`, `settled`, `result`, `outcome`, `event`, `score`, and `pricing`. Invalid dates are rejected with `400` (`YYYY-MM-DD` only).
+`/stats/market-check` accepts either `event_id`, or `date` + at least one team name (`team` and/or `opponent` — opponent is optional). When only one team is provided, the endpoint searches for any game on that date involving that team on either side. Plus `market`, `pick`, optional `line`, and optional `sport`. It searches live state first, then historical DuckDB rows, and returns a normalized payload including `found`, `source`, `settled`, `result`, `outcome`, `event`, `score`, and `pricing`. Invalid dates are rejected with `400` (`YYYY-MM-DD` only).
 
 ### `update_db.py`
 
