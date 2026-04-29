@@ -29,6 +29,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -101,28 +103,59 @@ def _get_cutoff_date() -> str:
 
 
 # ---------------------------------------------------------------------------
-# DuckDB helpers (read-only, thread-per-request)
+# DuckDB helpers — persistent thread-local connections with retry
+# ---------------------------------------------------------------------------
+#
+# Each worker thread keeps ONE read-only connection alive for its lifetime.
+# This eliminates the per-request connect() call that races with update_db's
+# write lock.  If a connection does go stale (DB file replaced, DuckDB error)
+# it is closed and re-opened with exponential backoff, up to _DB_MAX_RETRIES.
+#
+# FastAPI runs sync `def` endpoint handlers in its default thread-pool
+# (starlette.concurrency.run_in_threadpool), so thread-local storage is safe.
 # ---------------------------------------------------------------------------
 
-def _conn() -> duckdb.DuckDBPyConnection:  # type: ignore[name-defined]
-    """Return a fresh read-only DuckDB connection for one request.
+_thread_local: threading.local = threading.local()
+_DB_MAX_RETRIES: int   = 5
+_DB_RETRY_BASE:  float = 0.1   # seconds; doubles each attempt (0.1 → 3.2 s total)
 
-    Read-only mode lets multiple stats_api workers coexist with the
-    update_db write process without competing for the exclusive write lock.
-    DuckDB allows unlimited read-only connections alongside one writer.
-    """
-    return duckdb.connect(DB_PATH, read_only=True)
+
+def _get_thread_conn() -> duckdb.DuckDBPyConnection:  # type: ignore[name-defined]
+    """Return this thread's persistent read-only DuckDB connection, creating it if needed."""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is None:
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        _thread_local.conn = conn
+    return conn
+
+
+def _drop_thread_conn() -> None:
+    """Close and discard this thread's connection so the next call reconnects."""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _thread_local.conn = None
 
 
 def _query(sql: str, params: list | None = None) -> list[dict[str, Any]]:
-    """Execute *sql* and return rows as a list of dicts."""
-    con = _conn()
-    try:
-        rel = con.execute(sql, params or [])
-        cols = [d[0] for d in rel.description]
-        return [dict(zip(cols, row)) for row in rel.fetchall()]
-    finally:
-        con.close()
+    """Execute *sql* on this thread's persistent connection, retrying on lock errors."""
+    last_exc: Exception | None = None
+    for attempt in range(_DB_MAX_RETRIES):
+        try:
+            conn = _get_thread_conn()
+            rel  = conn.execute(sql, params or [])
+            cols = [d[0] for d in rel.description]
+            return [dict(zip(cols, row)) for row in rel.fetchall()]
+        except Exception as exc:
+            _drop_thread_conn()  # force reconnect on next attempt
+            last_exc = exc
+            if attempt < _DB_MAX_RETRIES - 1:
+                time.sleep(_DB_RETRY_BASE * (2 ** attempt))  # 0.1 0.2 0.4 0.8 1.6 s
+    assert last_exc is not None
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------

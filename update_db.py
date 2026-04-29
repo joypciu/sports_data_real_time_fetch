@@ -93,28 +93,49 @@ def _connect_with_retry(db_path: str, retries: int = 6, delay: float = 2.0) -> d
     raise RuntimeError("unreachable")
 
 
+# (path -> mtime) of files already fully processed; avoids re-opening the
+# write connection on every 5-minute tick for files that haven't changed.
+_processed_files: dict[str, float] = {}
+
+
 def incremental_historical_update(db_path: str, data_dir: str) -> tuple[int, int, int]:
     """Scan all JSON files in *data_dir* and insert any games not yet in the DB.
 
     Returns (games_added, player_rows_added, stat_rows_added).
     The function is idempotent — re-running it is always safe.
+
+    The write connection is opened ONLY when there are new or modified files,
+    minimising the lock window that would block stats_api read-only connections.
     """
     if not os.path.isdir(data_dir):
         return 0, 0, 0
 
-    files = sorted(
+    all_files = sorted(
         os.path.join(data_dir, f)
         for f in os.listdir(data_dir)
         if f.endswith(".json")
     )
-    if not files:
-        return 0, 0, 0
+
+    # Pre-scan: identify files that are new or have been modified since last run.
+    # This is done WITHOUT opening the DB, so no lock is held during the scan.
+    new_files: list[str] = []
+    for path in all_files:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if _processed_files.get(path) != mtime:
+            new_files.append(path)
+
+    if not new_files:
+        return 0, 0, 0  # nothing changed — skip DB entirely
 
     total_g = total_p = total_s = 0
+    processed_this_run: dict[str, float] = {}
     try:
         con = _connect_with_retry(db_path)
         try:
-            for path in files:
+            for path in new_files:
                 g, p, s = build_db.load_file(con, path)
                 if g:
                     log.info(
@@ -124,11 +145,18 @@ def incremental_historical_update(db_path: str, data_dir: str) -> tuple[int, int
                 total_g += g
                 total_p += p
                 total_s += s
+                try:
+                    processed_this_run[path] = os.path.getmtime(path)
+                except OSError:
+                    pass
         finally:
             con.close()
     except Exception:
         log.exception("Error during incremental historical update")
+        return total_g, total_p, total_s
 
+    # Only mark files as processed after a successful DB session
+    _processed_files.update(processed_this_run)
     return total_g, total_p, total_s
 
 
