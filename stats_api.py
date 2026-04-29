@@ -218,18 +218,26 @@ def _team_matches(query: str | None, team_name: str | None, team_abbr: str | Non
 
 
 def _matchup_matches(event: dict[str, Any], team: str | None, opponent: str | None) -> bool:
-    if not team or not opponent:
+    if not team and not opponent:
         return True
 
-    forward = (
-        _team_matches(team, event.get("home_team"), event.get("home_abbr"))
-        and _team_matches(opponent, event.get("away_team"), event.get("away_abbr"))
+    if team and opponent:
+        forward = (
+            _team_matches(team, event.get("home_team"), event.get("home_abbr"))
+            and _team_matches(opponent, event.get("away_team"), event.get("away_abbr"))
+        )
+        reverse = (
+            _team_matches(team, event.get("away_team"), event.get("away_abbr"))
+            and _team_matches(opponent, event.get("home_team"), event.get("home_abbr"))
+        )
+        return forward or reverse
+
+    # Single team provided — match whichever side it's on
+    single = team or opponent
+    return (
+        _team_matches(single, event.get("home_team"), event.get("home_abbr"))
+        or _team_matches(single, event.get("away_team"), event.get("away_abbr"))
     )
-    reverse = (
-        _team_matches(team, event.get("away_team"), event.get("away_abbr"))
-        and _team_matches(opponent, event.get("home_team"), event.get("home_abbr"))
-    )
-    return forward or reverse
 
 
 def _resolve_pick_side(pick: str, event: dict[str, Any]) -> str | None:
@@ -922,10 +930,10 @@ def stats_market_check(
     line: Optional[float] = Query(None, description="Optional custom line; if omitted, stored line is used"),
     _: None = Depends(_verify_token),
 ) -> JSONResponse:
-    if not event_id and not (date and team and opponent):
+    if not event_id and not (date and (team or opponent)):
         raise HTTPException(
             status_code=400,
-            detail="Provide either event_id or date + team + opponent",
+            detail="Provide either event_id, or date + at least one team name",
         )
 
     if date and _date_only(date) is None:
