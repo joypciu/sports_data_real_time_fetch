@@ -122,12 +122,12 @@ Endpoints:
 | `GET /stats/player?name=Raphinha&sport=soccer` | Per-player recent game stats (ILIKE name search)                     |
 | `GET /stats/team?name=Barcelona&sport=soccer`  | Win/loss record, last 5 results, top scorers                         |
 | `GET /stats/live?team=Barcelona`               | Live / pregame entries from `live/live_state.json`                   |
-| `GET /stats/market-check?...`                  | Resolve one event and evaluate `moneyline`, `spread`, or `total`     |
+| `GET /stats/market-check?...`                  | Resolve one event and evaluate `moneyline`, `spread` / `game spread`, or `total` |
 | `GET /stats/trends?team=OKC&sport=basketball`  | ATS, O/U, home/away splits + recent form for a team (from DuckDB)    |
 
 Authentication is optional: set `STATS_API_TOKEN` in `.env` to require a bearer token. Leave blank for VPS-internal use.
 
-`/stats/market-check` accepts either `event_id`, or `date` + at least one team name (`team` and/or `opponent` — opponent is optional). When only one team is provided, the endpoint searches for any game on that date involving that team on either side. Plus `market`, `pick`, optional `line`, and optional `sport`. It searches live state first, then historical DuckDB rows, and returns a normalized payload including `found`, `source`, `settled`, `result`, `outcome`, `event`, `score`, and `pricing`. Invalid dates are rejected with `400` (`YYYY-MM-DD` only).
+`/stats/market-check` accepts either `event_id`, or `date` + at least one team name (`team` and/or `opponent` — opponent is optional). When only one team is provided, the endpoint searches for any game on that date involving that team on either side. Plus `market`, `pick`, optional `line`, and optional `sport`. `market=game spread` is treated as `spread`. It searches live state first, then historical DuckDB rows, and returns a normalized payload including `found`, `source`, `settled`, `result`, `outcome`, `event`, `score`, and `pricing`. Invalid dates are rejected with `400` (`YYYY-MM-DD` only).
 
 `/stats/trends` accepts `team` (required), `sport`, `league`, and `limit` (5–200, default 50). Queries DuckDB directly to compute ATS cover rate, O/U over rate, straight-up win record, and home/away splits for the last N completed games. Returns `recent_form` (last 10 games with per-game result) plus aggregate `overall`, `home`, and `away` blocks.
 

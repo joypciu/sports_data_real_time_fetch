@@ -440,6 +440,8 @@ def _evaluate_market(
     line: float | None,
 ) -> dict[str, Any]:
     market_norm = _normalize_text(market)
+    if market_norm == "game spread":
+        market_norm = "spread"
     pick_norm = _normalize_text(pick)
     home_score = _as_int(event.get("home_score"))
     away_score = _as_int(event.get("away_score"))
@@ -524,7 +526,7 @@ def _evaluate_market(
     else:
         raise HTTPException(
             status_code=400,
-            detail="market must be one of moneyline, spread, or total",
+            detail="market must be one of moneyline, spread, game spread, or total",
         )
 
     return {
