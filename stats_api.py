@@ -445,7 +445,9 @@ def _evaluate_market(
     pick_norm = _normalize_text(pick)
     home_score = _as_int(event.get("home_score"))
     away_score = _as_int(event.get("away_score"))
-    settled = _normalize_text(str(event.get("status") or "")) == "post"
+    status_norm = _normalize_text(str(event.get("status") or ""))
+    settled  = status_norm == "post"
+    pregame  = status_norm == "pre"   # scores are 0-0 and meaningless
     total_score = None if home_score is None or away_score is None else home_score + away_score
 
     result: bool | None = None
@@ -461,7 +463,7 @@ def _evaluate_market(
                 detail="For moneyline, pick must be home, away, draw, or a matching team name",
             )
         resolved_pick = side
-        if home_score is not None and away_score is not None:
+        if home_score is not None and away_score is not None and not pregame:
             if side == "draw":
                 result = home_score == away_score
             elif side == "home":
@@ -485,7 +487,7 @@ def _evaluate_market(
                 status_code=400,
                 detail="Spread line is required when the event does not have a stored spread",
             )
-        if home_score is not None and away_score is not None:
+        if home_score is not None and away_score is not None and not pregame:
             adjusted = (home_score if side == "home" else away_score) + resolved_line
             opponent_score = away_score if side == "home" else home_score
             if adjusted > opponent_score:
@@ -512,7 +514,7 @@ def _evaluate_market(
                 status_code=400,
                 detail="Total line is required when the event does not have a stored total",
             )
-        if total_score is not None:
+        if total_score is not None and not pregame:
             if total_score > resolved_line:
                 result = pick_norm == "over"
                 outcome = "win" if result else "loss"
@@ -550,9 +552,9 @@ def _evaluate_market(
             "away_team": event.get("away_team"),
         },
         "score": {
-            "home": home_score,
-            "away": away_score,
-            "total": total_score,
+            "home":  None if pregame else home_score,
+            "away":  None if pregame else away_score,
+            "total": None if pregame else total_score,
         },
         "pricing": {
             "provider": event.get("provider"),
