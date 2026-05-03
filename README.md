@@ -129,6 +129,8 @@ Authentication is optional: set `STATS_API_TOKEN` in `.env` to require a bearer 
 
 `/stats/market-check` accepts either `event_id`, or `date` + at least one team name (`team` and/or `opponent` — opponent is optional). When only one team is provided, the endpoint searches for any game on that date involving that team on either side. Plus `market`, `pick`, optional `line`, and optional `sport`. `market=game spread` is treated as `spread`. It searches live state first, then historical DuckDB rows, and returns a normalized payload including `found`, `source`, `settled`, `result`, `outcome`, `event`, `score`, and `pricing`. Invalid dates are rejected with `400` (`YYYY-MM-DD` only).
 
+**Pre-game guard:** ESPN sets home/away scores to `0-0` for games with `status: pre`. The evaluator detects this via `status_norm == "pre"` and returns `outcome: pending` with `score: null` for all three market types (`moneyline`, `spread`, `total`) rather than evaluating the meaningless 0-0 score. A settled result is only computed when `status_norm == "post"`.
+
 `/stats/trends` accepts `team` (required), `sport`, `league`, and `limit` (5–200, default 50). Queries DuckDB directly to compute ATS cover rate, O/U over rate, straight-up win record, and home/away splits for the last N completed games. Returns `recent_form` (last 10 games with per-game result) plus aggregate `overall`, `home`, and `away` blocks.
 
 ### `update_db.py`
@@ -269,7 +271,7 @@ All test scripts live in `tests/`.
 | 19      | `realtime_monitor` | Pregame rate-limiting: PREGAME_ODDS_REFRESH_EVERY, dated file correctness, refresh_extras param                                                     |
 | 20      | `build_db`         | live_games DDL: table exists, required columns, insert/delete, DROP_ALL includes live_games                                                         |
 | 21      | `update_db`        | incremental_historical_update (idempotent, multi-file), sync_live_games (all buckets, stale-row replacement, corrupt JSON, edge cases)              |
-| 22      | `stats_api`        | `/stats/market-check` evaluation for historical/live total, spread, moneyline, and invalid-date validation                                          |
+| 22      | `stats_api`        | `/stats/market-check` evaluation for historical/live total, spread, moneyline, invalid-date validation, and pre-game guard (outcome: pending when status=pre) |
 | 23      | `main`             | Module structure, thread targets (\_run_api, \_run_monitor, \_run_updater), signatures, signal handling                                             |
 
 ```bash
