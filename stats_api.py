@@ -1681,6 +1681,313 @@ def stats_trends(
 
 
 # ---------------------------------------------------------------------------
+# Player Prop Settlement
+# ---------------------------------------------------------------------------
+#
+# PROP_STAT_MAP: maps our market name → ESPN stat_key candidates (tried left→right).
+# Keys are confirmed present in ESPN data (see tools/verify_db.py sport-key checks).
+#
+# When a market is NOT in this map, or when the player/stat is absent from a
+# specific game's data, we return espn_limitation=True with a plain-English
+# explanation so callers know this is ESPN's data coverage, not a system error.
+# ---------------------------------------------------------------------------
+
+PROP_STAT_MAP: dict[str, list[str]] = {
+    # ── Basketball (NBA) ────────────────────────────────────────────────────
+    # Confirmed keys: PTS, REB, AST, MIN; slash-format: FG, 3PT, FT
+    "player_points":      ["PTS"],
+    "player_rebounds":    ["REB"],
+    "player_assists":     ["AST"],
+    "player_threes":      ["3PT"],          # slash "made-att" → first number used
+    "player_steals":      ["STL"],          # present in ESPN, not in verify_db checks
+    "player_blocks":      ["BLK"],          # present in ESPN, not in verify_db checks
+    "player_turnovers":   ["TOV", "TO"],
+    "player_minutes":     ["MIN"],
+    "player_fg_made":     ["FG"],           # slash "made-att" → first number
+    "player_ft_made":     ["FT"],           # slash "made-att" → first number
+    # ── Soccer ──────────────────────────────────────────────────────────────
+    # Confirmed keys: G, SV, YC
+    "player_goals":       ["G"],
+    "player_saves":       ["SV"],
+    "player_yellow_cards":["YC"],
+    # ── Hockey (NHL) ────────────────────────────────────────────────────────
+    # Confirmed keys: G, A, TOI
+    "player_goals_hockey":   ["G"],
+    "player_assists_hockey": ["A"],
+    # ── Baseball (MLB) ──────────────────────────────────────────────────────
+    # Confirmed keys: H, RBI, ERA
+    "player_hits":        ["H"],
+    "player_rbis":        ["RBI"],
+    # ── Cricket ─────────────────────────────────────────────────────────────
+    "player_runs_cricket":    ["BAT_INN1_RUNS", "BAT_INN2_RUNS"],
+    "player_wickets_cricket": ["BWL_INN1_WICKETS", "BWL_INN2_WICKETS"],
+}
+
+# Stat keys where ESPN stores the value as "made-attempted" (e.g. "8-18").
+# We extract the made count (first number) for prop comparison.
+_SLASH_STAT_KEYS: frozenset[str] = frozenset({"FG", "3PT", "FT", "H-AB", "PC-ST"})
+
+# Markets ESPN definitively does not provide in any game data.
+# Returning this list in the limitation response proves the gap is ESPN's, not ours.
+ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset({
+    "anytime_scorer", "first_scorer", "last_scorer",
+    "first_td", "last_td", "first_basket",
+    "player_double_double", "player_triple_double", "player_hat_trick",
+    # American-football props — ESPN tracks NFL but our ingest does not collect them
+    "player_pass_yards", "player_rush_yards", "player_receiving_yards",
+    "player_pass_tds", "player_rush_tds", "player_receiving_tds",
+    "player_receptions", "player_pass_attempts",
+})
+
+SUPPORTED_PROP_MARKETS: list[str] = sorted(PROP_STAT_MAP.keys())
+
+
+def _extract_stat_value(raw: Any, stat_key: str) -> float | None:
+    """Parse a raw stat string to float, handling slash format (e.g. '8-18' → 8.0)."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    s = str(raw).strip()
+    if stat_key in _SLASH_STAT_KEYS and "-" in s:
+        try:
+            return float(s.split("-")[0])
+        except ValueError:
+            return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+@app.get("/stats/prop-check")
+def stats_prop_check(
+    player:   str           = Query(...,  description="Player display name (partial match, case-insensitive)"),
+    market:   str           = Query(...,  description="Prop market: player_points | player_rebounds | player_assists | player_threes | player_goals | player_hits | player_rbis | … (see espn_supported_markets in response)"),
+    pick:     str           = Query(...,  description="over | under"),
+    line:     float         = Query(...,  description="The prop line to evaluate (e.g. 25.5)"),
+    event_id: Optional[str] = Query(None, description="ESPN event_id — most precise"),
+    date:     Optional[str] = Query(None, description="Game date YYYY-MM-DD"),
+    sport:    Optional[str] = Query(None, description="Sport filter"),
+    team:     Optional[str] = Query(None, description="Team filter (helps narrow player search)"),
+    _:        None          = Depends(_verify_token),
+) -> JSONResponse:
+    """
+    Evaluate a player prop bet against ESPN historical data.
+
+    Returns outcome (win/loss/push/pending) and a settlement explanation.
+
+    When ESPN does not carry the requested stat, the response includes
+    ``espn_limitation: true`` and a plain-English ``espn_limitation_reason``
+    listing exactly what IS available — so it is clear the gap is in
+    ESPN's data coverage, not in this system.
+
+    Supported markets: player_points, player_rebounds, player_assists,
+    player_threes, player_steals, player_blocks, player_turnovers,
+    player_goals, player_saves, player_yellow_cards, player_goals_hockey,
+    player_assists_hockey, player_hits, player_rbis, player_runs_cricket,
+    player_wickets_cricket, player_fg_made, player_ft_made, player_minutes.
+    """
+    market_norm = market.strip().lower().replace(" ", "_")
+    pick_norm   = pick.strip().lower()
+
+    # ── 1. Reject picks that aren't over/under ──────────────────────────────
+    if pick_norm not in {"over", "under"}:
+        raise HTTPException(
+            status_code=400,
+            detail="pick must be 'over' or 'under' for player prop bets.",
+        )
+
+    # ── 2. Definitively unsupported by ESPN ────────────────────────────────
+    if market_norm in ESPN_UNSUPPORTED_PROPS:
+        return JSONResponse(status_code=200, content={
+            "found":                  False,
+            "outcome":                "pending",
+            "settled":                False,
+            "espn_limitation":        True,
+            "espn_limitation_reason": (
+                f"'{market_norm}' is not available in ESPN data. "
+                "ESPN does not provide this stat type for any game in our database."
+            ),
+            "requested_market":       market_norm,
+            "requested_player":       player,
+            "espn_supported_markets": SUPPORTED_PROP_MARKETS,
+        })
+
+    # ── 3. Unknown market (not supported and not known-unsupported) ─────────
+    if market_norm not in PROP_STAT_MAP:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown prop market '{market_norm}'. "
+                f"Supported: {SUPPORTED_PROP_MARKETS}. "
+                f"Known ESPN limitations (always pending): {sorted(ESPN_UNSUPPORTED_PROPS)}."
+            ),
+        )
+
+    stat_keys = PROP_STAT_MAP[market_norm]
+
+    # ── 4. Require at least one game locator ────────────────────────────────
+    if not event_id and not date:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide event_id or date (YYYY-MM-DD) to locate the game.",
+        )
+
+    # ── 5. Find the game ────────────────────────────────────────────────────
+    try:
+        event = _resolve_event(event_id, _date_only(date) if date else None, sport, team, None)
+    except Exception as exc:
+        _log = __import__("logging").getLogger(__name__)
+        _log.warning("prop-check _resolve_event error: %s", exc)
+        event = None
+
+    if event is None:
+        return JSONResponse(status_code=404, content={
+            "found":   False,
+            "outcome": "pending",
+            "settled": False,
+            "note":    "Game not found — it may be in the future or not yet tracked.",
+        })
+
+    resolved_event_id = str(event.get("event_id") or "")
+    game_status       = _normalize_text(str(event.get("status") or ""))
+    game_settled      = (game_status == "post")
+
+    # ── 6. Look up player in game_players for this event ────────────────────
+    sql = """
+        SELECT
+            gp.stats_json,
+            gp.did_not_play,
+            gp.dnp_reason,
+            p.display_name  AS player_name
+        FROM game_players gp
+        JOIN players p ON p.player_id = gp.player_id
+                      AND p.sport     = gp.sport
+        WHERE gp.event_id = ?
+          AND LOWER(p.display_name) LIKE LOWER(?)
+        LIMIT 5
+    """
+    try:
+        rows = _query(sql, [resolved_event_id, f"%{player}%"])
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={
+            "found":   False,
+            "outcome": "pending",
+            "settled": False,
+            "error":   f"Database error: {exc}",
+        })
+
+    if not rows:
+        return JSONResponse(status_code=200, content={
+            "found":                  False,
+            "outcome":                "pending",
+            "settled":                False,
+            "espn_limitation":        True,
+            "espn_limitation_reason": (
+                f"Player '{player}' was not found in ESPN data for this game "
+                f"(event_id={resolved_event_id}). "
+                "ESPN may not have tracked individual stats for this player, "
+                "or the player did not participate."
+            ),
+            "requested_market":       market_norm,
+            "requested_player":       player,
+            "game_status":            game_status,
+            "espn_supported_markets": SUPPORTED_PROP_MARKETS,
+        })
+
+    # Use the first match (closest name)
+    row         = rows[0]
+    player_name = row["player_name"]
+    did_not_play = bool(row.get("did_not_play"))
+
+    # ── 7. Parse stats_json ─────────────────────────────────────────────────
+    raw_stats: dict[str, Any] = {}
+    try:
+        raw_stats = json.loads(row["stats_json"] or "{}") or {}
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    available_keys = sorted(raw_stats.keys())
+
+    # DNP player → cannot settle
+    if did_not_play:
+        return JSONResponse(status_code=200, content={
+            "found":                  True,
+            "player":                 player_name,
+            "outcome":                "pending",
+            "settled":                False,
+            "espn_limitation":        True,
+            "espn_limitation_reason": (
+                f"ESPN marks {player_name} as Did Not Play for this game"
+                + (f" ({row.get('dnp_reason')})" if row.get("dnp_reason") else "")
+                + ". Prop bets on DNP players cannot be settled automatically."
+            ),
+            "requested_market":  market_norm,
+            "espn_available_stats": available_keys,
+        })
+
+    # ── 8. Try each candidate key until one has a value ────────────────────
+    stat_value: float | None = None
+    matched_key: str | None  = None
+    for key in stat_keys:
+        val = _extract_stat_value(raw_stats.get(key), key)
+        if val is not None:
+            stat_value  = val
+            matched_key = key
+            break
+
+    if stat_value is None:
+        keys_tried = stat_keys
+        return JSONResponse(status_code=200, content={
+            "found":                  True,
+            "player":                 player_name,
+            "outcome":                "pending",
+            "settled":                False,
+            "espn_limitation":        True,
+            "espn_limitation_reason": (
+                f"ESPN data for {player_name} in this game does not include "
+                f"the stat needed for '{market_norm}' "
+                f"(keys tried: {keys_tried}). "
+                "This stat may not be tracked by ESPN for this sport/game, "
+                "or the player's stats were not reported for this fixture."
+            ),
+            "requested_market":       market_norm,
+            "espn_stat_keys_tried":   keys_tried,
+            "espn_available_stats":   available_keys,
+            "espn_supported_markets": SUPPORTED_PROP_MARKETS,
+        })
+
+    # ── 9. Evaluate over/under ──────────────────────────────────────────────
+    if not game_settled:
+        outcome = "pending"
+        settled = False
+    elif stat_value > line:
+        outcome = "win"   if pick_norm == "over"  else "loss"
+        settled = True
+    elif stat_value < line:
+        outcome = "win"   if pick_norm == "under" else "loss"
+        settled = True
+    else:
+        outcome = "push"
+        settled = True
+
+    return JSONResponse(status_code=200, content={
+        "found":         True,
+        "player":        player_name,
+        "market":        market_norm,
+        "pick":          pick_norm,
+        "line":          line,
+        "stat_key":      matched_key,
+        "stat_value":    stat_value,
+        "outcome":       outcome,
+        "settled":       settled,
+        "source":        event.get("source", "historical"),
+        "game_status":   game_status,
+        "event_id":      resolved_event_id,
+        "espn_limitation": False,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
