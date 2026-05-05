@@ -125,8 +125,8 @@ def _get_thread_conn() -> duckdb.DuckDBPyConnection:  # type: ignore[name-define
     conn = getattr(_thread_local, "conn", None)
     if conn is None:
         conn = duckdb.connect(DB_PATH, read_only=True)
-        conn.execute("SET memory_limit='4GB'")
-        conn.execute("SET threads=4")
+        # memory_limit and threads are DB-level settings owned by the write
+        # connection in update_db.py — read-only connections inherit them.
         _thread_local.conn = conn
     return conn
 

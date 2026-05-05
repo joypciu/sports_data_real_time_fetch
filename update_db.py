@@ -429,8 +429,7 @@ def auto_backfill_gaps(db_path: str, data_dir: str) -> int:
     max_dates: dict[str, date] = {}
     try:
         con = duckdb.connect(db_path, read_only=True)
-        con.execute("SET memory_limit='4GB'")
-        con.execute("SET threads=4")
+        # Read-only: don't call SET — DB-level settings are owned by the write connection.
         rows = con.execute(
             "SELECT sport, MAX(CAST(game_date AS DATE)) FROM games GROUP BY sport"
         ).fetchall()
