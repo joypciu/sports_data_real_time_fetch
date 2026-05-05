@@ -446,8 +446,27 @@ def _evaluate_market(
     line: float | None,
 ) -> dict[str, Any]:
     market_norm = _normalize_text(market)
-    if market_norm == "game spread":
-        market_norm = "spread"
+
+    # Normalize sport-specific spread/total aliases to the base market type.
+    # These are stored with their original name in the bet DB; stats_api
+    # resolves them here so the existing evaluation logic is fully reused.
+    _MARKET_ALIASES: dict[str, str] = {
+        "game spread":            "spread",
+        "point spread":           "spread",
+        "puck line":              "spread",   # hockey -1.5/+1.5
+        "run line":               "spread",   # baseball -1.5/+1.5
+        "puck_line":              "spread",
+        "run_line":               "spread",
+        "total goals":            "total",    # soccer / hockey
+        "total runs":             "total",    # baseball
+        "total corners":          "total",
+        "total_goals":            "total",
+        "total_runs":             "total",
+        "total_corners":          "total",
+    }
+    if market_norm in _MARKET_ALIASES:
+        market_norm = _MARKET_ALIASES[market_norm]
+
     pick_norm = _normalize_text(pick)
     home_score = _as_int(event.get("home_score"))
     away_score = _as_int(event.get("away_score"))
@@ -531,11 +550,66 @@ def _evaluate_market(
                 result = None
                 outcome = "push"
 
+    elif market_norm in ("both_teams_to_score", "both teams to score"):
+        # Settled from full-game final score: both teams scored when both scores > 0.
+        if pick_norm not in {"yes", "no"}:
+            raise HTTPException(
+                status_code=400,
+                detail="For both_teams_to_score, pick must be 'yes' or 'no'",
+            )
+        resolved_pick = pick_norm
+        if home_score is not None and away_score is not None and not pregame:
+            both_scored = home_score > 0 and away_score > 0
+            result = both_scored if pick_norm == "yes" else not both_scored
+            outcome = "win" if result else "loss"
+
     else:
-        raise HTTPException(
-            status_code=400,
-            detail="market must be one of moneyline, spread, game spread, or total",
-        )
+        # Period/specialty market — cannot be settled from the full-game score.
+        # Return a clear not_settleable response instead of raising 400 so that
+        # bets are stored and the caller gets a useful explanation.
+        return {
+            "found": True,
+            "source": event.get("source"),
+            "settled": False,
+            "market": market_norm,
+            "pick": pick,
+            "line": line,
+            "result": None,
+            "outcome": "not_settleable",
+            "espn_limitation": True,
+            "note": (
+                f"Market '{market}' requires period-specific or specialty data that is "
+                "not available in the full-game score. This bet must be settled manually "
+                "via POST /bets/{bet_id}/settle once the period result is known."
+            ),
+            "event": {
+                "event_id": str(event.get("event_id") or ""),
+                "date": str(event.get("date")) if event.get("date") is not None else None,
+                "sport": event.get("sport"),
+                "league": event.get("league"),
+                "name": event.get("name"),
+                "short_name": event.get("short_name"),
+                "status": event.get("status"),
+                "home_team": event.get("home_team"),
+                "away_team": event.get("away_team"),
+            },
+            "score": {
+                "home":  None if pregame else home_score,
+                "away":  None if pregame else away_score,
+                "total": None if pregame else total_score,
+            },
+            "pricing": {
+                "provider": event.get("provider"),
+                "game_total": _as_float(event.get("game_total")),
+                "over_odds": _as_int(event.get("over_odds")),
+                "under_odds": _as_int(event.get("under_odds")),
+                "draw_odds": _as_int(event.get("draw_odds")),
+                "home_ml": _as_int(event.get("home_ml")),
+                "away_ml": _as_int(event.get("away_ml")),
+                "home_spread": _as_float(event.get("home_spread")),
+                "away_spread": _as_float(event.get("away_spread")),
+            },
+        }
 
     return {
         "found": True,
