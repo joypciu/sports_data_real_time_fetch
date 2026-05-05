@@ -429,7 +429,8 @@ def auto_backfill_gaps(db_path: str, data_dir: str) -> int:
     max_dates: dict[str, date] = {}
     try:
         con = duckdb.connect(db_path, read_only=True)
-        con.execute("SET memory_limit='2GB'")
+        con.execute("SET memory_limit='4GB'")
+        con.execute("SET threads=4")
         rows = con.execute(
             "SELECT sport, MAX(CAST(game_date AS DATE)) FROM games GROUP BY sport"
         ).fetchall()
@@ -450,6 +451,7 @@ def auto_backfill_gaps(db_path: str, data_dir: str) -> int:
 
         if start_dt > yesterday:
             continue  # DB is current for this sport
+
 
         # Collect dates to fetch
         dates_to_fetch = []
