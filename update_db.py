@@ -237,7 +237,11 @@ def sync_live_games(db_path: str, live_dir: str) -> int:
     try:
         con = _connect_with_retry(db_path)
         try:
-            con.execute("DELETE FROM live_games")
+            # DROP + recreate is safer than DELETE for a volatile table —
+            # DuckDB can corrupt index state on DELETE when rows were inserted
+            # by a previous connection that died uncleanly (FatalException).
+            con.execute("DROP TABLE IF EXISTS live_games")
+            con.execute(build_db.DDL)  # recreates live_games via CREATE TABLE IF NOT EXISTS
             con.executemany(
                 """
                 INSERT INTO live_games (
