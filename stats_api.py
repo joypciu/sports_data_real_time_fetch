@@ -121,12 +121,16 @@ _DB_RETRY_BASE:  float = 0.1   # seconds; doubles each attempt (0.1 → 3.2 s to
 
 
 def _get_thread_conn() -> duckdb.DuckDBPyConnection:  # type: ignore[name-defined]
-    """Return this thread's persistent read-only DuckDB connection, creating it if needed."""
+    """Return this thread's persistent DuckDB connection, creating it if needed.
+
+    NOTE: read_only=True cannot coexist with the read-write connection opened
+    by update_db.py in the same process — DuckDB treats them as a configuration
+    conflict.  We open a plain (read-write capable) connection here; stats_api
+    only executes SELECT queries so no writes occur from this path.
+    """
     conn = getattr(_thread_local, "conn", None)
     if conn is None:
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        # memory_limit and threads are DB-level settings owned by the write
-        # connection in update_db.py — read-only connections inherit them.
+        conn = duckdb.connect(DB_PATH)
         _thread_local.conn = conn
     return conn
 

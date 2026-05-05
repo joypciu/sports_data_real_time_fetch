@@ -425,11 +425,14 @@ def auto_backfill_gaps(db_path: str, data_dir: str) -> int:
     yesterday = date.today() - timedelta(days=1)
     total_new = 0
 
-    # Get max dates from DB (read-only, fast)
+    # Get max dates from DB — must NOT use read_only=True in the same process as
+    # the read-write connections (update_db write conn + stats_api thread conns);
+    # DuckDB treats read_only vs read-write as a "different configuration" and
+    # raises ConnectionException.  A plain read-write connection that only runs
+    # SELECT is safe here.
     max_dates: dict[str, date] = {}
     try:
-        con = duckdb.connect(db_path, read_only=True)
-        # Read-only: don't call SET — DB-level settings are owned by the write connection.
+        con = duckdb.connect(db_path)
         rows = con.execute(
             "SELECT sport, MAX(CAST(game_date AS DATE)) FROM games GROUP BY sport"
         ).fetchall()
