@@ -401,6 +401,8 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
     con = duckdb.connect(args.db)
+    con.execute("SET memory_limit='4GB'")
+    con.execute("SET threads=4")
 
     if args.rebuild:
         print("Dropping existing tables...")

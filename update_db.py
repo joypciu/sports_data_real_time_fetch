@@ -84,7 +84,10 @@ def _connect_with_retry(db_path: str, retries: int = 6, delay: float = 2.0) -> d
     """
     for attempt in range(retries):
         try:
-            return duckdb.connect(db_path)
+            conn = duckdb.connect(db_path)
+            conn.execute("SET memory_limit='4GB'")
+            conn.execute("SET threads=4")
+            return conn
         except Exception as exc:
             if attempt == retries - 1:
                 raise

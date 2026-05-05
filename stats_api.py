@@ -125,6 +125,8 @@ def _get_thread_conn() -> duckdb.DuckDBPyConnection:  # type: ignore[name-define
     conn = getattr(_thread_local, "conn", None)
     if conn is None:
         conn = duckdb.connect(DB_PATH, read_only=True)
+        conn.execute("SET memory_limit='4GB'")
+        conn.execute("SET threads=2")
         _thread_local.conn = conn
     return conn
 
