@@ -118,14 +118,14 @@ STATS_API_TOKEN=secret python stats_api.py
 
 Endpoints:
 
-| Endpoint                                       | Description                                                          |
-| ---------------------------------------------- | -------------------------------------------------------------------- |
-| `GET /health`                                  | Liveness probe — checks DB connectivity and live_state.json presence |
-| `GET /stats/player?name=Raphinha&sport=soccer` | Per-player recent game stats (ILIKE name search)                     |
-| `GET /stats/team?name=Barcelona&sport=soccer`  | Win/loss record, last 5 results, top scorers                         |
-| `GET /stats/live?team=Barcelona`               | Live / pregame entries from `live/live_state.json`                   |
+| Endpoint                                       | Description                                                                      |
+| ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| `GET /health`                                  | Liveness probe — checks DB connectivity and live_state.json presence             |
+| `GET /stats/player?name=Raphinha&sport=soccer` | Per-player recent game stats (ILIKE name search)                                 |
+| `GET /stats/team?name=Barcelona&sport=soccer`  | Win/loss record, last 5 results, top scorers                                     |
+| `GET /stats/live?team=Barcelona`               | Live / pregame entries from `live/live_state.json`                               |
 | `GET /stats/market-check?...`                  | Resolve one event and evaluate `moneyline`, `spread` / `game spread`, or `total` |
-| `GET /stats/trends?team=OKC&sport=basketball`  | ATS, O/U, home/away splits + recent form for a team (from DuckDB)    |
+| `GET /stats/trends?team=OKC&sport=basketball`  | ATS, O/U, home/away splits + recent form for a team (from DuckDB)                |
 
 Authentication is optional: set `STATS_API_TOKEN` in `.env` to require a bearer token. Leave blank for VPS-internal use.
 
@@ -141,12 +141,12 @@ Background DB maintenance module — runs as Thread 3 inside `main.py`, or stand
 
 **Four jobs run on separate schedules:**
 
-| Job                           | Default interval | What it does                                                                                            |
-| ----------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------- |
-| Auto-backfill gaps            | Startup + every 6h | Detects missing date ranges per sport in DuckDB, fetches from ESPN, writes `historical_data/backfill_<league>.json` |
-| Incremental historical update | Every 5 minutes  | Scans `historical_data/*.json`, finds event IDs not in `games`, inserts via `build_db.load_file()` — uses UPSERT logic (skips finalized games, updates stale in-progress) |
-| Live-games sync               | Every 35 seconds | Reads `live/live_state.json`, `DELETE`s old `live_games` rows, `INSERT`s current pre/live/post snapshot |
-| Vacuum DB                     | Every 6 hours    | Runs `VACUUM ANALYZE` to reclaim space and update statistics |
+| Job                           | Default interval   | What it does                                                                                                                                                              |
+| ----------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Auto-backfill gaps            | Startup + every 6h | Detects missing date ranges per sport in DuckDB, fetches from ESPN, writes `historical_data/backfill_<league>.json`                                                       |
+| Incremental historical update | Every 5 minutes    | Scans `historical_data/*.json`, finds event IDs not in `games`, inserts via `build_db.load_file()` — uses UPSERT logic (skips finalized games, updates stale in-progress) |
+| Live-games sync               | Every 35 seconds   | Reads `live/live_state.json`, `DELETE`s old `live_games` rows, `INSERT`s current pre/live/post snapshot                                                                   |
+| Vacuum DB                     | Every 6 hours      | Runs `VACUUM ANALYZE` to reclaim space and update statistics                                                                                                              |
 
 The live sync only fires when `live_state.json` mtime has changed, so it adds zero DB pressure when the monitor is idle. After each game ingest, the Redis settlement cache keys (`stats_bridge:market:*`) are flushed so that pending bets re-evaluate against the fresh data.
 
@@ -159,6 +159,7 @@ python update_db.py --live-interval 20      # faster live sync
 ```
 
 **IMPORTANT — DuckDB connection rules:**
+
 - Never use `read_only=True` connections in the same process as read-write connections. Mixing modes causes a `FatalException: different configuration` crash that corrupts the DB.
 - All connections in `stats_api.py` use read-write mode (no `read_only=True` parameter).
 - `SET memory_limit='4GB'` and `SET threads=4` are set only on the write connection in `update_db.py`.
@@ -269,21 +270,21 @@ All test scripts live in `tests/`.
 
 **270 self-contained unit tests** across 23 numbered sections covering every module. No live API calls — all ESPN responses are mocked.
 
-| Section | Module             | Tests                                                                                                                                               |
-| ------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1–6     | `enrich_players`   | parse_players, parse_soccer_roster, enrich_game, SPORT_FILE_PREFIX, file helpers, enrich_file                                                       |
-| 7–9     | `daily_ingest`     | load_existing_ids, append_games, parse_game_to_dict                                                                                                 |
-| 10      | `fetch_matches`    | helper functions                                                                                                                                    |
-| 11–13   | `realtime_monitor` | helper functions, save_live_state (pregame + live + dated files), archive_finished_game                                                             |
-| 14      | Integration        | round-trip enrich_file → data integrity                                                                                                             |
-| 15–16   | `build_db`         | scalar helpers (\_ts, \_int, \_float, \_score), load_file in-memory DuckDB                                                                          |
-| 17      | DB Integration     | live sports.db row counts, schema, sport-specific edge cases                                                                                        |
-| 18      | `realtime_monitor` | detect_changes: GAME_STARTED/FINISHED, SCORE_UPDATE, PERIOD_CHANGE, WIN_PROB_SHIFT (live only), ODDS_MOVE (live) vs LINE_MOVE (pregame), TOTAL_MOVE |
-| 19      | `realtime_monitor` | Pregame rate-limiting: PREGAME_ODDS_REFRESH_EVERY, dated file correctness, refresh_extras param                                                     |
-| 20      | `build_db`         | live_games DDL: table exists, required columns, insert/delete, DROP_ALL includes live_games                                                         |
-| 21      | `update_db`        | incremental_historical_update (idempotent, multi-file), sync_live_games (all buckets, stale-row replacement, corrupt JSON, edge cases)              |
+| Section | Module             | Tests                                                                                                                                                         |
+| ------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1–6     | `enrich_players`   | parse_players, parse_soccer_roster, enrich_game, SPORT_FILE_PREFIX, file helpers, enrich_file                                                                 |
+| 7–9     | `daily_ingest`     | load_existing_ids, append_games, parse_game_to_dict                                                                                                           |
+| 10      | `fetch_matches`    | helper functions                                                                                                                                              |
+| 11–13   | `realtime_monitor` | helper functions, save_live_state (pregame + live + dated files), archive_finished_game                                                                       |
+| 14      | Integration        | round-trip enrich_file → data integrity                                                                                                                       |
+| 15–16   | `build_db`         | scalar helpers (\_ts, \_int, \_float, \_score), load_file in-memory DuckDB                                                                                    |
+| 17      | DB Integration     | live sports.db row counts, schema, sport-specific edge cases                                                                                                  |
+| 18      | `realtime_monitor` | detect_changes: GAME_STARTED/FINISHED, SCORE_UPDATE, PERIOD_CHANGE, WIN_PROB_SHIFT (live only), ODDS_MOVE (live) vs LINE_MOVE (pregame), TOTAL_MOVE           |
+| 19      | `realtime_monitor` | Pregame rate-limiting: PREGAME_ODDS_REFRESH_EVERY, dated file correctness, refresh_extras param                                                               |
+| 20      | `build_db`         | live_games DDL: table exists, required columns, insert/delete, DROP_ALL includes live_games                                                                   |
+| 21      | `update_db`        | incremental_historical_update (idempotent, multi-file), sync_live_games (all buckets, stale-row replacement, corrupt JSON, edge cases)                        |
 | 22      | `stats_api`        | `/stats/market-check` evaluation for historical/live total, spread, moneyline, invalid-date validation, and pre-game guard (outcome: pending when status=pre) |
-| 23      | `main`             | Module structure, thread targets (\_run_api, \_run_monitor, \_run_updater), signatures, signal handling                                             |
+| 23      | `main`             | Module structure, thread targets (\_run_api, \_run_monitor, \_run_updater), signatures, signal handling                                                       |
 
 ```bash
 pytest tests/test_suite.py        # 270 tests
