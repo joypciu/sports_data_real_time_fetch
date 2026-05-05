@@ -234,8 +234,13 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
     if not games:
         return 0, 0, 0
 
-    existing_events: set[str] = {
-        r[0] for r in con.execute("SELECT event_id FROM games").fetchall()
+    # Only skip games already finalized (status='post' with real scores).
+    # Games archived mid-play (status='pre'/'in', or scores still null) must
+    # be re-processed so their final score gets written via the UPSERT below.
+    finalized_events: set[str] = {
+        r[0] for r in con.execute(
+            "SELECT event_id FROM games WHERE status='post' AND home_score IS NOT NULL"
+        ).fetchall()
     }
 
     rows_games:        list[tuple] = []
@@ -246,7 +251,7 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
 
     for g in games:
         event_id = str(g.get("event_id", ""))
-        if not event_id or event_id in existing_events:
+        if not event_id or event_id in finalized_events:
             continue
 
         sport  = g.get("sport", "")
@@ -341,7 +346,8 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
     if not rows_games:
         return 0, 0, 0
 
-    # DuckDB fastest bulk path: register pandas DataFrame, then INSERT SELECT
+    # DuckDB fastest bulk path: register pandas DataFrame, then INSERT SELECT.
+    # teams: safe to ignore duplicates (team metadata never changes meaningfully).
     def _bulk_ignore(table: str, cols: list[str], rows: list[tuple]) -> None:
         if not rows:
             return
@@ -352,18 +358,48 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
 
     _bulk_ignore("teams", ["team_id","sport","team_name","team_abbr"], rows_teams)
 
-    _bulk_ignore("games", [
-        "event_id","sport","league","name","short_name","game_date",
-        "status","status_detail","period","clock",
-        "home_score","away_score","provider",
-        "game_total","over_odds","under_odds","open_spread","open_total",
-        "draw_odds","home_win_pct","away_win_pct","home_formation","away_formation",
-    ], rows_games)
+    # games: UPSERT — update status/scores for games that were previously
+    # ingested while still in-progress (status='pre'/'in' or scores null).
+    if rows_games:
+        df = pd.DataFrame(rows_games, columns=[
+            "event_id","sport","league","name","short_name","game_date",
+            "status","status_detail","period","clock",
+            "home_score","away_score","provider",
+            "game_total","over_odds","under_odds","open_spread","open_total",
+            "draw_odds","home_win_pct","away_win_pct","home_formation","away_formation",
+        ])
+        con.register("_df_tmp", df)
+        con.execute("""
+            INSERT INTO games SELECT * FROM _df_tmp
+            ON CONFLICT (event_id) DO UPDATE SET
+                status        = EXCLUDED.status,
+                status_detail = EXCLUDED.status_detail,
+                period        = EXCLUDED.period,
+                clock         = EXCLUDED.clock,
+                home_score    = COALESCE(EXCLUDED.home_score, games.home_score),
+                away_score    = COALESCE(EXCLUDED.away_score, games.away_score),
+                home_win_pct  = COALESCE(EXCLUDED.home_win_pct, games.home_win_pct),
+                away_win_pct  = COALESCE(EXCLUDED.away_win_pct, games.away_win_pct)
+        """)
+        con.unregister("_df_tmp")
 
-    _bulk_ignore("game_teams", [
-        "id","event_id","team_id","sport","home_away",
-        "score","is_winner","moneyline","spread","spread_odds","team_total",
-    ], rows_game_teams)
+    # game_teams: UPSERT scores and winner flag.
+    if rows_game_teams:
+        df = pd.DataFrame(rows_game_teams, columns=[
+            "id","event_id","team_id","sport","home_away",
+            "score","is_winner","moneyline","spread","spread_odds","team_total",
+        ])
+        con.register("_df_tmp", df)
+        con.execute("""
+            INSERT INTO game_teams SELECT * FROM _df_tmp
+            ON CONFLICT (id) DO UPDATE SET
+                score      = COALESCE(EXCLUDED.score, game_teams.score),
+                is_winner  = COALESCE(EXCLUDED.is_winner, game_teams.is_winner),
+                moneyline  = COALESCE(EXCLUDED.moneyline, game_teams.moneyline),
+                spread     = COALESCE(EXCLUDED.spread, game_teams.spread),
+                spread_odds = COALESCE(EXCLUDED.spread_odds, game_teams.spread_odds)
+        """)
+        con.unregister("_df_tmp")
 
     if rows_players:
         df = pd.DataFrame(rows_players, columns=["player_id","sport","display_name","position","team_id","team_name"])
@@ -385,6 +421,8 @@ def load_file(con: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int, int]
     ], rows_game_players)
 
     stats_written = sum(1 for r in rows_game_players if r[-1] is not None)
+    # rows_games includes both new inserts and score-updates; caller treats
+    # non-zero return as "something changed" (triggers log + Redis flush).
     return len(rows_games), len(rows_players), stats_written
 
 

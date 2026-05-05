@@ -40,6 +40,9 @@ import json
 import logging
 import os
 import time
+import urllib.request
+import urllib.parse
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
@@ -298,6 +301,206 @@ def vacuum_db(db_path: str) -> None:
         log.exception("Error running VACUUM")
 
 
+# ---------------------------------------------------------------------------
+# 4. Redis settlement cache invalidation
+# ---------------------------------------------------------------------------
+
+def _flush_settlement_cache() -> int:
+    """Delete all Redis keys matching stats_bridge:market:* and stats_bridge:*.
+    Called after new games are ingested so stale 'pending' settlements are evicted.
+    Returns number of keys deleted.
+    """
+    try:
+        from redis_cache import get_redis_client  # type: ignore[import]
+        client = get_redis_client()
+        if client is None:
+            return 0
+        deleted = 0
+        for pattern in ("stats_bridge:market:*", "stats_bridge:*"):
+            cursor = 0
+            while True:
+                cursor, keys = client.scan(cursor, match=pattern, count=200)
+                if keys:
+                    deleted += client.delete(*keys)
+                if cursor == 0:
+                    break
+        if deleted:
+            log.info("Flushed %d stale settlement cache keys from Redis.", deleted)
+        return deleted
+    except Exception as exc:
+        log.debug("Redis flush skipped: %s", exc)
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# 5. Auto-backfill: fill date gaps from ESPN public scoreboard API
+# ---------------------------------------------------------------------------
+
+_ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports"
+
+# (espn_sport_path, espn_league_path, internal_sport, internal_league)
+_BACKFILL_LEAGUES: dict[str, tuple[str, str, str, str]] = {
+    "mlb":  ("baseball",    "mlb", "baseball",   "mlb"),
+    "nba":  ("basketball",  "nba", "basketball", "nba"),
+    "nhl":  ("hockey",      "nhl", "hockey",     "nhl"),
+}
+
+
+def _espn_fetch_scoreboard(sport_path: str, league_path: str, date_str: str) -> list[dict]:
+    """Fetch ESPN public scoreboard for a date (YYYYMMDD). Returns raw events list."""
+    url = f"{_ESPN_BASE}/{sport_path}/{league_path}/scoreboard"
+    params = urllib.parse.urlencode({"dates": date_str, "limit": 100})
+    try:
+        req = urllib.request.Request(
+            f"{url}?{params}",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        return data.get("events", [])
+    except Exception as exc:
+        log.debug("ESPN fetch failed for %s/%s %s: %s", sport_path, league_path, date_str, exc)
+        return []
+
+
+def _espn_parse_event(event: dict, sport: str, league: str) -> dict | None:
+    """Convert a raw ESPN event to the build_db.load_file JSON format."""
+    event_id = str(event.get("id", ""))
+    if not event_id:
+        return None
+    comps = event.get("competitions", [])
+    if not comps:
+        return None
+    comp = comps[0]
+    competitors = comp.get("competitors", [])
+    home_raw = next((c for c in competitors if c.get("homeAway") == "home"), {})
+    away_raw = next((c for c in competitors if c.get("homeAway") == "away"), {})
+    if not home_raw or not away_raw:
+        return None
+
+    def _team(raw: dict) -> dict:
+        t = raw.get("team", {})
+        sc = raw.get("score")
+        return {
+            "team_id":   str(t.get("id", "")),
+            "team_name": t.get("displayName", t.get("name", "")),
+            "team_abbr": t.get("abbreviation", ""),
+            "score":     str(sc) if sc is not None else None,
+            "is_winner": raw.get("winner"),
+        }
+
+    st  = comp.get("status", {})
+    stt = st.get("type", {})
+    # Only backfill finished games
+    if stt.get("state", "pre") != "post":
+        return None
+
+    return {
+        "event_id":      event_id,
+        "name":          event.get("name", ""),
+        "short_name":    event.get("shortName", ""),
+        "date":          event.get("date", ""),
+        "status":        "post",
+        "status_detail": stt.get("description", "Final"),
+        "period":        st.get("period", 0),
+        "clock":         st.get("displayClock", "0:00"),
+        "sport":         sport,
+        "league":        league,
+        "home":          _team(home_raw),
+        "away":          _team(away_raw),
+        "players":       [],
+    }
+
+
+def auto_backfill_gaps(db_path: str, data_dir: str) -> int:
+    """Detect missing date ranges per sport and fetch from ESPN public API.
+
+    For each tracked league, finds the latest game date in DuckDB and fetches
+    all completed games for dates between that date and yesterday (inclusive).
+    Writes results to historical_data/backfill_<league>.json so
+    incremental_historical_update picks them up on the next tick.
+
+    Returns total new games written across all leagues.
+    """
+    yesterday = date.today() - timedelta(days=1)
+    total_new = 0
+
+    # Get max dates from DB (read-only, fast)
+    max_dates: dict[str, date] = {}
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+        con.execute("SET memory_limit='2GB'")
+        rows = con.execute(
+            "SELECT sport, MAX(CAST(game_date AS DATE)) FROM games GROUP BY sport"
+        ).fetchall()
+        con.close()
+        for sport, max_dt in rows:
+            if max_dt:
+                max_dates[sport] = max_dt
+    except Exception as exc:
+        log.warning("auto_backfill: could not read max dates from DB: %s", exc)
+        return 0
+
+    for league_key, (sport_path, league_path, sport, league) in _BACKFILL_LEAGUES.items():
+        max_dt = max_dates.get(sport)
+        if max_dt is None:
+            start_dt = yesterday - timedelta(days=7)  # no data at all, go back a week
+        else:
+            start_dt = max_dt + timedelta(days=1)
+
+        if start_dt > yesterday:
+            continue  # DB is current for this sport
+
+        # Collect dates to fetch
+        dates_to_fetch = []
+        cur = start_dt
+        while cur <= yesterday:
+            dates_to_fetch.append(cur)
+            cur += timedelta(days=1)
+
+        if not dates_to_fetch:
+            continue
+
+        log.info(
+            "auto_backfill: %s missing %d days (%s → %s), fetching from ESPN...",
+            league_key, len(dates_to_fetch),
+            dates_to_fetch[0].isoformat(), dates_to_fetch[-1].isoformat(),
+        )
+
+        # Load existing backfill file to avoid duplicates
+        out_path = os.path.join(data_dir, f"backfill_{league_key}.json")
+        existing_ids: set[str] = set()
+        existing_games: list[dict] = []
+        if os.path.exists(out_path):
+            try:
+                with open(out_path) as f:
+                    existing_games = json.load(f)
+                existing_ids = {str(g.get("event_id", "")) for g in existing_games}
+            except Exception:
+                existing_games = []
+
+        new_games: list[dict] = []
+        for dt in dates_to_fetch:
+            events = _espn_fetch_scoreboard(sport_path, league_path, dt.strftime("%Y%m%d"))
+            for ev in events:
+                game = _espn_parse_event(ev, sport, league)
+                if game and game["event_id"] not in existing_ids:
+                    new_games.append(game)
+                    existing_ids.add(game["event_id"])
+            time.sleep(0.2)  # polite rate limiting
+
+        if new_games:
+            all_games = existing_games + new_games
+            tmp = out_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(all_games, f)
+            os.replace(tmp, out_path)
+            log.info("auto_backfill: wrote %d new games to %s", len(new_games), out_path)
+            total_new += len(new_games)
+
+    return total_new
+
+
 def run_updater_loop(
     db_path:       str = DEFAULT_DB,
     data_dir:      str = DEFAULT_DATA_DIR,
@@ -326,22 +529,39 @@ def run_updater_loop(
         log.exception("Could not bootstrap schema — updater may fail")
 
     live_state_path = os.path.join(live_dir, "live_state.json")
-    last_live_mtime: float = 0.0
-    last_hist_run:   float = 0.0   # 0 → run immediately on first tick
-    last_live_run:   float = 0.0
-    last_vacuum_run: float = 0.0
+    last_live_mtime:  float = 0.0
+    last_hist_run:    float = 0.0   # 0 → run immediately on first tick
+    last_live_run:    float = 0.0
+    last_vacuum_run:  float = 0.0
+    last_backfill_run: float = 0.0  # 0 → run immediately on first tick
+
+    BACKFILL_INTERVAL = 6 * 3600   # re-check for gaps every 6 hours
 
     while True:
         now = time.monotonic()
+
+        # ── Auto-backfill gap detection (on startup + every 6 h) ─────────────
+        if now - last_backfill_run >= BACKFILL_INTERVAL:
+            try:
+                new_games = auto_backfill_gaps(db_path, data_dir)
+                if new_games:
+                    log.info("auto_backfill wrote %d new games — triggering immediate ingest.", new_games)
+                    # Force the incremental updater to run right away
+                    last_hist_run = 0.0
+            except Exception:
+                log.exception("auto_backfill_gaps failed")
+            last_backfill_run = now
 
         # ── Historical incremental update ────────────────────────────────────
         if now - last_hist_run >= hist_interval:
             g, p, s = incremental_historical_update(db_path, data_dir)
             if g:
-                print(
-                    f"[update_db] Inserted {g} new games, "
-                    f"{p} player-game rows, {s} stat rows."
+                log.info(
+                    "Inserted/updated %d games, %d player-game rows, %d stat rows.",
+                    g, p, s,
                 )
+                # Evict stale settlement cache so API returns fresh results
+                _flush_settlement_cache()
             last_hist_run = now
 
         # ── Live-games sync (only when live_state.json actually changed) ─────
