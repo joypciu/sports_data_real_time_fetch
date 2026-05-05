@@ -107,7 +107,9 @@ python realtime_monitor.py --no-players       # skip player box score pulls
 
 ### `stats_api.py`
 
-Internal read-only FastAPI service (port 8001) that exposes the DuckDB database and live state to other services (used by the Cache API's optional `include_stats` enrichment and `/event/check` market evaluation).
+Internal FastAPI service (port 8001) that exposes the DuckDB database and live state to other services (used by the Cache API's optional `include_stats` enrichment and `/event/check` market evaluation).
+
+**DuckDB connection mode:** All thread-local connections use read-write mode (`duckdb.connect(DB_PATH)` — no `read_only=True`). This is required because DuckDB does not allow mixing read-only and read-write connections in the same process.
 
 ```bash
 python stats_api.py                      # start on port 8001
@@ -137,20 +139,29 @@ Authentication is optional: set `STATS_API_TOKEN` in `.env` to require a bearer 
 
 Background DB maintenance module — runs as Thread 3 inside `main.py`, or standalone.
 
-**Two jobs run on separate schedules:**
+**Four jobs run on separate schedules:**
 
 | Job                           | Default interval | What it does                                                                                            |
 | ----------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------- |
-| Incremental historical update | Every 5 minutes  | Scans `historical_data/*.json`, finds event IDs not in `games`, inserts via `build_db.load_file()`      |
+| Auto-backfill gaps            | Startup + every 6h | Detects missing date ranges per sport in DuckDB, fetches from ESPN, writes `historical_data/backfill_<league>.json` |
+| Incremental historical update | Every 5 minutes  | Scans `historical_data/*.json`, finds event IDs not in `games`, inserts via `build_db.load_file()` — uses UPSERT logic (skips finalized games, updates stale in-progress) |
 | Live-games sync               | Every 35 seconds | Reads `live/live_state.json`, `DELETE`s old `live_games` rows, `INSERT`s current pre/live/post snapshot |
+| Vacuum DB                     | Every 6 hours    | Runs `VACUUM ANALYZE` to reclaim space and update statistics |
 
-The live sync only fires when `live_state.json` mtime has changed, so it adds zero DB pressure when the monitor is idle.
+The live sync only fires when `live_state.json` mtime has changed, so it adds zero DB pressure when the monitor is idle. After each game ingest, the Redis settlement cache keys (`stats_bridge:market:*`) are flushed so that pending bets re-evaluate against the fresh data.
+
+**Auto-backfill:** On startup, `auto_backfill_gaps()` queries DuckDB for the most recent game date per sport. If there is a gap between that date and today, it fetches ESPN scoreboard data for the missing days and drops the results into `historical_data/` for the incremental updater to pick up on its next cycle. This ensures bets placed on recently completed games settle automatically without any manual intervention.
 
 ```bash
 python update_db.py                         # run the loop standalone
 python update_db.py --hist-interval 600     # slower historical rescans
 python update_db.py --live-interval 20      # faster live sync
 ```
+
+**IMPORTANT — DuckDB connection rules:**
+- Never use `read_only=True` connections in the same process as read-write connections. Mixing modes causes a `FatalException: different configuration` crash that corrupts the DB.
+- All connections in `stats_api.py` use read-write mode (no `read_only=True` parameter).
+- `SET memory_limit='4GB'` and `SET threads=4` are set only on the write connection in `update_db.py`.
 
 ### `main.py`
 
