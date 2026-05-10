@@ -109,7 +109,7 @@ python realtime_monitor.py --no-players       # skip player box score pulls
 
 Fetches live games from two external bookmaker feeds — **365scores** and **1xbet** — and generates synthetic market odds from live scores. Used by `realtime_monitor.py` to augment ESPN coverage with games ESPN does not track.
 
-**Sports covered:** Soccer, basketball, ice hockey, baseball (from 365scores); soccer, basketball, ice hockey (from 1xbet).
+**Sports covered:** Soccer, basketball, ice hockey, baseball (from 365scores); soccer, basketball, ice hockey, cricket, tennis, table tennis, volleyball (from 1xbet).
 
 **Virtual game filter:** Games with team names matching cyber/virtual/esport patterns, or leagues with names like "Cyber", "Virtual", "LFL", or short-form tags (2x2–6x6) are automatically excluded.
 
@@ -121,12 +121,16 @@ Fetches live games from two external bookmaker feeds — **365scores** and **1xb
 
 When a bookmaker feed does not provide market odds, `generate_odds()` derives synthetic moneyline, spread, and total from the live score using sport-specific probability models:
 
-| Sport      | Model                                                                              |
-| ---------- | ---------------------------------------------------------------------------------- |
-| Soccer     | Sigmoid on score diff scaled by time elapsed; draw probability added to favourite  |
-| Basketball | Score diff / sqrt(minutes remaining × 3)                                           |
-| Hockey     | Score diff / sqrt(minutes remaining × 0.5)                                         |
-| Baseball   | Score diff × 0.8 × fraction of innings complete                                    |
+| Sport        | Model                                                                              |
+| ------------ | ---------------------------------------------------------------------------------- |
+| Soccer       | Sigmoid on score diff scaled by time elapsed; draw probability added to favourite  |
+| Basketball   | Score diff / sqrt(minutes remaining × 3)                                           |
+| Hockey       | Score diff / sqrt(minutes remaining × 0.5)                                         |
+| Baseball     | Score diff × 0.8 × fraction of innings complete                                    |
+| Cricket      | Score diff (runs) → sigmoid; displays innings number and overs from 1xbet SC.S     |
+| Tennis       | Sets won difference → sigmoid; period = current set number                         |
+| Table Tennis | Sets won difference → sigmoid; period = current set number                         |
+| Volleyball   | Sets won difference → sigmoid; period = current set number                         |
 
 Win probabilities are converted to American odds (`_prob_to_american`). Spread is set to ±0.5 of the score diff; total is set to the live combined score plus a sport-specific expected remaining total. All generated odds carry `"provider": "generated"`.
 
