@@ -143,6 +143,65 @@ def _parse_hockey_seconds_remaining(status_text: str, period: int = 0) -> float:
     return mins_left * 60 + periods_after * 1200
 
 
+def _parse_period(sport: str, status_text: str) -> int:
+    """
+    Parse current period/quarter/half/inning from a status string.
+    Returns 0 when the period cannot be determined.
+    """
+    if not status_text:
+        return 0
+    st = status_text.strip().upper()
+
+    if sport == "soccer":
+        if "2ND HALF" in st or "2ND" in st:
+            return 2
+        if "1ST HALF" in st or "HT" in st or "1ST" in st:
+            return 1
+        # Minute-based: >45 → 2nd half
+        m = re.search(r"(\d+)", st)
+        if m:
+            return 2 if int(m.group(1)) > 45 else 1
+        return 0
+
+    if sport == "basketball":
+        m = re.search(r"Q(\d)", st)
+        if m:
+            return int(m.group(1))
+        if "OT" in st or "OVERTIME" in st:
+            return 5
+        if "2ND HALF" in st:
+            return 3
+        if "1ST HALF" in st or "HALFTIME" in st or "HALF" in st:
+            return 2
+        # Ordinal numbers: "3RD QUARTER" etc.
+        ord_m = re.search(r"(\d)(ST|ND|RD|TH)\s*(QUARTER|QTR)", st)
+        if ord_m:
+            return int(ord_m.group(1))
+        return 0
+
+    if sport == "hockey":
+        ord_m = re.search(r"(\d)(ST|ND|RD|TH)?\s*P(ERIOD)?", st)
+        if ord_m:
+            return int(ord_m.group(1))
+        if "OT" in st or "OVERTIME" in st:
+            return 4
+        if "1ST" in st:
+            return 1
+        if "2ND" in st:
+            return 2
+        if "3RD" in st:
+            return 3
+        return 0
+
+    if sport == "baseball":
+        ord_m = re.search(r"(\d+)(ST|ND|RD|TH)?\s*INN(ING)?", st)
+        if ord_m:
+            return int(ord_m.group(1))
+        return 0
+
+    return 0
+
+
 def _parse_baseball_outs_remaining(status_text: str) -> float:
     """Estimate outs remaining in an MLB game from status text."""
     st = (status_text or "").strip().upper()
@@ -400,8 +459,9 @@ def _fetch_365scores_live() -> list[dict]:
         gt          = g.get("gameTimeDisplay", "")
         full_status = f"{status_text} {gt}".strip()
         league_key  = _365_league_key(comp)
+        period      = _parse_period(sport, full_status)
 
-        odds = generate_odds(sport, home_score, away_score, full_status)
+        odds = generate_odds(sport, home_score, away_score, full_status, period)
         event_id = f"365s_{g.get('id', '')}"
 
         result.append({
@@ -414,7 +474,7 @@ def _fetch_365scores_live() -> list[dict]:
             "league_key":    league_key,
             "status":        "in",
             "status_detail": full_status,
-            "period":        0,
+            "period":        period,
             "clock":         gt,
             "home": {
                 "team_id":   str(home_c.get("id", "")),
@@ -499,6 +559,9 @@ def _fetch_1xbet_live() -> list[dict]:
         sc  = m.get("SC", {}) or {}
         fs  = sc.get("FS", {}) or {}
         sls = sc.get("SLS", "In Progress") or "In Progress"
+        # CP = current period (int); CPS = human-readable label e.g. "2nd quarter"
+        cp  = sc.get("CP", 0) or 0
+        cps = sc.get("CPS", "") or ""
 
         try:
             home_score = int(fs.get("S1", 0) or 0)
@@ -506,9 +569,13 @@ def _fetch_1xbet_live() -> list[dict]:
         except (ValueError, TypeError):
             home_score = away_score = 0
 
-        league_key = raw_league[:40].lower().replace(" ", "_") or sport
-        odds       = generate_odds(sport, home_score, away_score, str(sls))
-        event_id   = f"1xb_{m.get('I', '')}"
+        league_key  = raw_league[:40].lower().replace(" ", "_") or sport
+        sls_str     = str(sls)
+        # Use CP directly; fall back to text parsing only if CP is missing
+        period      = int(cp) if cp else _parse_period(sport, cps or sls_str)
+        clock_label = cps if cps else sls_str
+        odds        = generate_odds(sport, home_score, away_score, clock_label, period)
+        event_id    = f"1xb_{m.get('I', '')}"
 
         result.append({
             "event_id":      event_id,
@@ -519,9 +586,9 @@ def _fetch_1xbet_live() -> list[dict]:
             "league":        league_key,
             "league_key":    league_key,
             "status":        "in",
-            "status_detail": str(sls),
-            "period":        0,
-            "clock":         str(sls),
+            "status_detail": sls_str,
+            "period":        period,
+            "clock":         clock_label,
             "home": {
                 "team_id":   "",
                 "team_name": home_name,
