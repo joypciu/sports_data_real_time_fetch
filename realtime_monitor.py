@@ -44,6 +44,15 @@ from typing import Any
 
 import httpx
 
+try:
+    from live_sources import fetch_external_live as _fetch_external_live
+    _EXTERNAL_SOURCES_AVAILABLE = True
+except ImportError:
+    _EXTERNAL_SOURCES_AVAILABLE = False
+
+# How often to refresh external sources (365scores + 1xbet) in poll cycles
+EXTERNAL_REFRESH_EVERY = 2  # every 2nd poll cycle (~60s at 30s interval)
+
 # ---------------------------------------------------------------------------
 # Leagues (same mapping as fetch_matches.py)
 # ---------------------------------------------------------------------------
@@ -318,6 +327,17 @@ def build_game_state(
                 chosen.get("drawOdds") or (chosen.get("draw") or {}).get("moneyLine")
             ),
         }
+
+    # If ESPN returned no odds for a live game, generate them from the score
+    # so every live game always has moneyline / spread / total available.
+    if not odds and state == "in" and _EXTERNAL_SOURCES_AVAILABLE:
+        try:
+            from live_sources import generate_odds as _gen_odds  # type: ignore
+            hs = _parse_int(home.get("score") or 0) or 0
+            as_ = _parse_int(away.get("score") or 0) or 0
+            odds = _gen_odds(sport, hs, as_, detail, period)
+        except Exception:
+            pass
 
     # Win probability — also rate-limited for pregame
     prob = fetch_win_prob(http, sport, league, event_id) if refresh_extras else {}
@@ -1227,6 +1247,56 @@ def run(args: argparse.Namespace) -> None:
                     fetch_players, poll_count, data_dir=data_dir,
                 )
                 event_log.extend(new_events)
+
+                # Merge external sources (365scores + 1xbet) every N cycles.
+                # External games get event_ids prefixed "365s_" or "1xb_" so
+                # they never collide with ESPN event ids, and they are kept in
+                # a separate key-space in the states dict.
+                if _EXTERNAL_SOURCES_AVAILABLE and poll_count % EXTERNAL_REFRESH_EVERY == 0:
+                    try:
+                        ext = _fetch_external_live()
+
+                        # Build ESPN token set to avoid adding duplicates
+                        espn_tokens: set[str] = set()
+                        for eid_espn, gs in states.items():
+                            if eid_espn.startswith(("365s_", "1xb_")):
+                                continue  # skip external entries
+                            h = (gs.get("home") or {}).get("team_name", "").lower().split()
+                            a = (gs.get("away") or {}).get("team_name", "").lower().split()
+                            if h and a:
+                                sp  = gs.get("sport", "")
+                                tok = f"{sp}:{min(h[-1], a[-1])}:{max(h[-1], a[-1])}"
+                                espn_tokens.add(tok)
+
+                        # Remove stale external entries (game no longer in live feed)
+                        current_ext_ids = set(ext.keys())
+                        stale = [k for k in list(states.keys())
+                                 if k.startswith(("365s_", "1xb_")) and k not in current_ext_ids]
+                        for k in stale:
+                            del states[k]
+
+                        # Add/refresh external games not already covered by ESPN
+                        added = updated = 0
+                        for eid, eg in ext.items():
+                            h = eg["home"]["team_name"].lower().split()
+                            a = eg["away"]["team_name"].lower().split()
+                            if not h or not a:
+                                continue
+                            sp  = eg.get("sport", "")
+                            tok = f"{sp}:{min(h[-1], a[-1])}:{max(h[-1], a[-1])}"
+                            if tok in espn_tokens:
+                                continue  # already tracked by ESPN
+                            if eid in states:
+                                states[eid] = eg   # refresh score + odds
+                                updated += 1
+                            else:
+                                states[eid] = eg
+                                added += 1
+
+                        if added or updated:
+                            print(c(f"  [external] +{added} new  ~{updated} refreshed  -{len(stale)} removed  (365scores/1xbet)", "grey"))
+                    except Exception as _ext_exc:
+                        print(c(f"  [external] Error: {_ext_exc}", "red"), file=sys.stderr)
 
                 # Persist
                 save_live_state(states, out_dir)

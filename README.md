@@ -105,6 +105,59 @@ python realtime_monitor.py --leagues nba nhl
 python realtime_monitor.py --no-players       # skip player box score pulls
 ```
 
+### `live_sources.py`
+
+Fetches live games from two external bookmaker feeds — **365scores** and **1xbet** — and generates synthetic market odds from live scores. Used by `realtime_monitor.py` to augment ESPN coverage with games ESPN does not track.
+
+**Sports covered:** Soccer, basketball, ice hockey, baseball (from 365scores); soccer, basketball, ice hockey (from 1xbet).
+
+**Virtual game filter:** Games with team names matching cyber/virtual/esport patterns, or leagues with names like "Cyber", "Virtual", "LFL", or short-form tags (2x2–6x6) are automatically excluded.
+
+**Deduplication:** Games appearing in both sources are merged using a token built from `{sport}:{sorted team name last words}`. Games already tracked by ESPN are also deduplicated and skipped.
+
+**Event ID format:** 365scores games use `365s_{id}` prefix; 1xbet games use `1xb_{id}` prefix — these never collide with ESPN numeric IDs.
+
+#### Odds generation
+
+When a bookmaker feed does not provide market odds, `generate_odds()` derives synthetic moneyline, spread, and total from the live score using sport-specific probability models:
+
+| Sport      | Model                                                                              |
+| ---------- | ---------------------------------------------------------------------------------- |
+| Soccer     | Sigmoid on score diff scaled by time elapsed; draw probability added to favourite  |
+| Basketball | Score diff / sqrt(minutes remaining × 3)                                           |
+| Hockey     | Score diff / sqrt(minutes remaining × 0.5)                                         |
+| Baseball   | Score diff × 0.8 × fraction of innings complete                                    |
+
+Win probabilities are converted to American odds (`_prob_to_american`). Spread is set to ±0.5 of the score diff; total is set to the live combined score plus a sport-specific expected remaining total. All generated odds carry `"provider": "generated"`.
+
+**ESPN live fallback:** `realtime_monitor.py` also calls `generate_odds()` for any ESPN-tracked live game that ESPN returns no odds for.
+
+#### External source merge in `realtime_monitor.py`
+
+Every second poll cycle (~60 s at 30 s interval), `run()` calls `fetch_external_live()` and merges results into the in-memory `states` dict:
+
+- Games already tracked by ESPN are skipped (no duplicate entries)
+- New external games are added with `event_id` = `365s_*` or `1xb_*`
+- Existing external games are refreshed with updated scores and generated odds
+- Games that have left the live feed are removed (stale-entry cleanup)
+
+External games are written to `live_state.json` alongside ESPN games and are immediately visible to `stats_api.py`.
+
+```python
+from live_sources import fetch_external_live, generate_odds
+
+# Fetch all live external games (deduplicated)
+games = fetch_external_live()          # dict[event_id, game_state_dict]
+
+# Generate odds from a live score
+odds = generate_odds("soccer", home_score=2, away_score=1,
+                     status_text="65'", period=2)
+# Returns: {"moneyline": {"home": -220, "away": +350},
+#           "spread": {"home": -0.5, "line": -110, "away": +0.5},
+#           "total": {"line": 3.5, "over": -115, "under": -105},
+#           "provider": "generated"}
+```
+
 ### `stats_api.py`
 
 Internal FastAPI service (port 8001) that exposes the DuckDB database and live state to other services (used by the Cache API's optional `include_stats` enrichment and `/event/check` market evaluation).
