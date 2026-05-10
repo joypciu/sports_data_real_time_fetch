@@ -1014,32 +1014,38 @@ def stats_team(
 def stats_live(
     team:   Optional[str] = Query(None, description="Team name filter (partial match)"),
     player: Optional[str] = Query(None, description="Player name filter (partial match)"),
+    sport:  Optional[str] = Query(None, description="Sport filter (e.g. basketball, hockey, soccer, cricket, tennis, table_tennis, volleyball)"),
     _:      None          = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return current live / pregame entries from live_state.json.
-    Pass team or player to narrow results; omit both to return all live games.
+    Pass sport, team, or player to narrow results; omit all to return everything.
     """
+    state = _read_live_state()
+
+    def _sport_match(entry: dict) -> bool:
+        if not sport:
+            return True
+        return entry.get("sport", "").lower() == sport.lower()
+
     if not team and not player:
-        # Return everything that is currently live
-        state  = _read_live_state()
+        live    = [e for e in state["live"]    if _sport_match(e)]
+        pregame = [e for e in state["pregame"] if _sport_match(e)]
         return JSONResponse({
-            "live_count":    len(state["live"]),
-            "pregame_count": len(state["pregame"]),
-            "live":          state["live"],
-            "pregame":       state["pregame"],
+            "live_count":    len(live),
+            "pregame_count": len(pregame),
+            "live":          live,
+            "pregame":       pregame,
         })
 
-    state   = _read_live_state()
-    matches = {
-        "live":    [e for e in state["live"]    if _matches_filter(e, team, player)],
-        "pregame": [e for e in state["pregame"] if _matches_filter(e, team, player)],
-    }
+    live    = [e for e in state["live"]    if _sport_match(e) and _matches_filter(e, team, player)]
+    pregame = [e for e in state["pregame"] if _sport_match(e) and _matches_filter(e, team, player)]
     return JSONResponse({
-        "found":         bool(matches["live"] or matches["pregame"]),
-        "live_count":    len(matches["live"]),
-        "pregame_count": len(matches["pregame"]),
-        **matches,
+        "found":         bool(live or pregame),
+        "live_count":    len(live),
+        "pregame_count": len(pregame),
+        "live":          live,
+        "pregame":       pregame,
     })
 
 
