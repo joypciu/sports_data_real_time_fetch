@@ -61,10 +61,14 @@ _365_LEAGUE_MAP: list[tuple[str, str]] = [
 
 # 1xbet sport name → our sport label
 _1XBET_SPORT_MAP: dict[str, str] = {
-    "Football":   "soccer",
-    "Basketball": "basketball",
-    "Ice Hockey": "hockey",
-    "Baseball":   "baseball",
+    "Football":    "soccer",
+    "Basketball":  "basketball",
+    "Ice Hockey":  "hockey",
+    "Baseball":    "baseball",
+    "Cricket":     "cricket",
+    "Tennis":      "tennis",
+    "Table Tennis": "table_tennis",
+    "Volleyball":  "volleyball",
 }
 
 # Patterns that identify virtual/cyber/simulated matches in 1xbet data
@@ -197,6 +201,24 @@ def _parse_period(sport: str, status_text: str) -> int:
         ord_m = re.search(r"(\d+)(ST|ND|RD|TH)?\s*INN(ING)?", st)
         if ord_m:
             return int(ord_m.group(1))
+        return 0
+
+    if sport == "cricket":
+        # Innings number from text like "1st Innings", "2nd Innings"
+        ord_m = re.search(r"(\d+)(ST|ND|RD|TH)?\s*INN(ING)?", st)
+        if ord_m:
+            return int(ord_m.group(1))
+        return 0
+
+    if sport in ("tennis", "table_tennis", "volleyball"):
+        # Set number from text like "3rd set", "2nd set"
+        ord_m = re.search(r"(\d+)(ST|ND|RD|TH)?\s*SET", st)
+        if ord_m:
+            return int(ord_m.group(1))
+        # Bare number like "6 Set"
+        num_m = re.search(r"^(\d+)\s*SET", st)
+        if num_m:
+            return int(num_m.group(1))
         return 0
 
     return 0
@@ -388,6 +410,74 @@ def generate_odds(
             "under_odds": _prob_to_american(1 - over_prob),
         }
 
+    elif sport == "cricket":
+        # Score = runs; treat like baseball but innings-based
+        # S1/S2 are total runs; a lead matters more in later innings
+        total_runs = home_score + away_score
+        if total_runs == 0:
+            home_prob = 0.5
+        else:
+            # Simple: team with more runs is favoured, scaled by lead magnitude
+            lead_frac = diff / max(1, total_runs)
+            home_prob = _sigmoid(lead_frac * 3.0)
+        away_prob = 1 - home_prob
+        return {
+            "provider":          "generated",
+            "home_ml":           _prob_to_american(home_prob),
+            "away_ml":           _prob_to_american(away_prob),
+            "draw_odds":         None,
+            "home_spread":       None,
+            "away_spread":       None,
+            "home_spread_odds":  None,
+            "away_spread_odds":  None,
+            "game_total":        None,
+            "over_odds":         None,
+            "under_odds":        None,
+        }
+
+    elif sport in ("tennis", "table_tennis"):
+        # S1/S2 are sets won; current set score not in FS
+        if home_score == away_score:
+            home_prob = 0.5
+        else:
+            # Each set won counts; more sets ahead → bigger favourite
+            home_prob = _sigmoid((home_score - away_score) * 1.5)
+        away_prob = 1 - home_prob
+        return {
+            "provider":          "generated",
+            "home_ml":           _prob_to_american(home_prob),
+            "away_ml":           _prob_to_american(away_prob),
+            "draw_odds":         None,
+            "home_spread":       None,
+            "away_spread":       None,
+            "home_spread_odds":  None,
+            "away_spread_odds":  None,
+            "game_total":        None,
+            "over_odds":         None,
+            "under_odds":        None,
+        }
+
+    elif sport == "volleyball":
+        # S1/S2 are sets won; same model as tennis
+        if home_score == away_score:
+            home_prob = 0.5
+        else:
+            home_prob = _sigmoid((home_score - away_score) * 1.5)
+        away_prob = 1 - home_prob
+        return {
+            "provider":          "generated",
+            "home_ml":           _prob_to_american(home_prob),
+            "away_ml":           _prob_to_american(away_prob),
+            "draw_odds":         None,
+            "home_spread":       None,
+            "away_spread":       None,
+            "home_spread_odds":  None,
+            "away_spread_odds":  None,
+            "game_total":        None,
+            "over_odds":         None,
+            "under_odds":        None,
+        }
+
     # Fallback: no odds generated
     return {}
 
@@ -568,6 +658,80 @@ def _fetch_1xbet_live() -> list[dict]:
             away_score = int(fs.get("S2", 0) or 0)
         except (ValueError, TypeError):
             home_score = away_score = 0
+
+        # Cricket-specific: use SC.P for innings, SC.S for rich score display
+        if sport == "cricket":
+            innings = sc.get("P") or 0
+            try:
+                period = int(innings)
+            except (TypeError, ValueError):
+                period = 0
+
+            # Parse rich score from SC.S (e.g. "131/5" includes wickets)
+            s_list = sc.get("S") or []
+            t1_score = t2_score = ""
+            for entry in s_list:
+                k = entry.get("Key", "")
+                v = entry.get("Value", "")
+                if k == "Team1Scores":
+                    t1_score = str(v)
+                elif k == "Team2Scores":
+                    t2_score = str(v)
+            # InnsStats: "innings;wickets;overs" e.g. "2;5;24.4"
+            inns_stats = next((e.get("Value","") for e in s_list if e.get("Key")=="InnsStats"), "")
+            clock_label = f"Innings {period}" if period else "In Progress"
+            if inns_stats:
+                parts = str(inns_stats).split(";")
+                if len(parts) >= 3:
+                    clock_label = f"Inn {parts[0]}, {parts[2]} overs"
+
+            # Use run totals from FS for odds; display score includes wickets
+            home_display = t1_score or str(home_score)
+            away_display = t2_score or str(away_score)
+            odds = generate_odds(sport, home_score, away_score, clock_label, period)
+
+            league_key = raw_league[:40].lower().replace(" ", "_") or sport
+            event_id   = f"1xb_{m.get('I', '')}"
+            result.append({
+                "event_id":      event_id,
+                "name":          f"{away_name} at {home_name}",
+                "short_name":    f"{away_name} @ {home_name}",
+                "date":          today,
+                "sport":         sport,
+                "league":        league_key,
+                "league_key":    league_key,
+                "status":        "in",
+                "status_detail": str(sls),
+                "period":        period,
+                "clock":         clock_label,
+                "home": {
+                    "team_id":   "",
+                    "team_name": home_name,
+                    "team_abbr": home_name[:4].upper(),
+                    "score":     home_display,
+                    "is_winner": None,
+                    "record":    "",
+                },
+                "away": {
+                    "team_id":   "",
+                    "team_name": away_name,
+                    "team_abbr": away_name[:4].upper(),
+                    "score":     away_display,
+                    "is_winner": None,
+                    "record":    "",
+                },
+                "odds":      odds,
+                "win_prob":  {},
+                "players":   [],
+                "situation": {},
+                "broadcasts": [],
+                "venue": "",
+                "city":  "",
+                "_source":     "1xbet",
+                "_headline":   raw_league,
+                "_fetched_at": now_str,
+            })
+            continue  # skip the generic append below
 
         league_key  = raw_league[:40].lower().replace(" ", "_") or sport
         sls_str     = str(sls)
