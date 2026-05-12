@@ -243,11 +243,17 @@ def sync_live_games(db_path: str, live_dir: str) -> int:
     try:
         con = _connect_with_retry(db_path)
         try:
-            # DROP + recreate is safer than DELETE for a volatile table —
-            # DuckDB can corrupt index state on DELETE when rows were inserted
-            # by a previous connection that died uncleanly (FatalException).
-            con.execute("DROP TABLE IF EXISTS live_games")
-            con.execute(build_db.DDL)  # recreates live_games via CREATE TABLE IF NOT EXISTS
+            # Prefer DELETE over DROP+CREATE to avoid unbounded file growth.
+            # DuckDB does not auto-reclaim space from dropped tables, so the
+            # old DROP-every-35s pattern bloated the DB from ~200 MB to 33 GB.
+            # Fall back to DROP+CREATE only if DELETE fails (e.g. corrupt index
+            # after an unclean shutdown).
+            try:
+                con.execute("DELETE FROM live_games")
+            except Exception:
+                log.warning("DELETE FROM live_games failed — falling back to DROP+CREATE")
+                con.execute("DROP TABLE IF EXISTS live_games")
+                con.execute(build_db.DDL)
             con.executemany(
                 """
                 INSERT INTO live_games (
