@@ -1825,6 +1825,13 @@ ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset({
     "player_pass_yards", "player_rush_yards", "player_receiving_yards",
     "player_pass_tds", "player_rush_tds", "player_receiving_tds",
     "player_receptions", "player_pass_attempts",
+    "player_tackles", "player_sacks", "player_interceptions", "player_carry_yards",
+    # Soccer props ESPN does not expose in box scores
+    "player_shots_on_target", "player_offsides", "player_cards",
+    # Tennis props — not in ESPN box scores
+    "player_aces", "player_double_faults", "player_sets_won",
+    # Baseball props ESPN does not expose per-player in box scores
+    "player_strikeouts", "player_earned_runs",
 })
 
 SUPPORTED_PROP_MARKETS: list[str] = sorted(PROP_STAT_MAP.keys())
