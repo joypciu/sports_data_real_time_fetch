@@ -1803,9 +1803,12 @@ PROP_STAT_MAP: dict[str, list[str]] = {
     "player_goals_hockey":   ["G"],
     "player_assists_hockey": ["A"],
     # ── Baseball (MLB) ──────────────────────────────────────────────────────
-    # Confirmed keys: H, RBI, ERA
+    # Confirmed ESPN keys: H, RBI
     "player_hits":        ["H"],
     "player_rbis":        ["RBI"],
+    # Settled via MLB Stats API (statsapi.mlb.com) — not ESPN
+    "player_strikeouts":  ["K"],
+    "player_earned_runs": ["ER"],
     # ── Cricket ─────────────────────────────────────────────────────────────
     "player_runs_cricket":    ["BAT_INN1_RUNS", "BAT_INN2_RUNS"],
     "player_wickets_cricket": ["BWL_INN1_WICKETS", "BWL_INN2_WICKETS"],
@@ -1830,8 +1833,6 @@ ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset({
     "player_shots_on_target", "player_offsides", "player_cards",
     # Tennis props — not in ESPN box scores
     "player_aces", "player_double_faults", "player_sets_won",
-    # Baseball props ESPN does not expose per-player in box scores
-    "player_strikeouts", "player_earned_runs",
 })
 
 SUPPORTED_PROP_MARKETS: list[str] = sorted(PROP_STAT_MAP.keys())
@@ -1880,6 +1881,9 @@ def stats_prop_check(
     player_goals, player_saves, player_yellow_cards, player_goals_hockey,
     player_assists_hockey, player_hits, player_rbis, player_runs_cricket,
     player_wickets_cricket, player_fg_made, player_ft_made, player_minutes.
+
+    MLB Stats API markets (settled via statsapi.mlb.com, not ESPN):
+    player_strikeouts, player_earned_runs.
     """
     market_norm = market.strip().lower().replace(" ", "_")
     pick_norm   = pick.strip().lower()
@@ -1905,6 +1909,57 @@ def stats_prop_check(
             "requested_market":       market_norm,
             "requested_player":       player,
             "espn_supported_markets": SUPPORTED_PROP_MARKETS,
+        })
+
+    # ── 2b. MLB Stats API markets (strikeouts, earned_runs) ───────────────
+    import mlb_stats as _mlb  # lazy — avoids startup failure if httpx not yet ready
+    if market_norm in _mlb.MLB_PROP_STAT_MAP:
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to locate the MLB game.",
+            )
+        result = _mlb.prop_check(
+            player=player,
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team,
+        )
+        if not result.get("found"):
+            return JSONResponse(status_code=200, content={
+                "found":       False,
+                "outcome":     "pending",
+                "settled":     False,
+                "source":      "mlb_stats_api",
+                "note":        result.get("note", "MLB Stats API lookup did not find data."),
+                "game_pk":     result.get("game_pk"),
+                "game_status": result.get("game_status"),
+                "available_pitchers": result.get("available_pitchers"),
+            })
+        settled    = result["settled"]
+        stat_value = result["stat_value"]
+        if not settled:
+            outcome = "pending"
+        elif stat_value > line:
+            outcome = "win"  if pick_norm == "over"  else "loss"
+        elif stat_value < line:
+            outcome = "win"  if pick_norm == "under" else "loss"
+        else:
+            outcome = "push"
+        return JSONResponse(status_code=200, content={
+            "found":       True,
+            "player":      result["player"],
+            "market":      market_norm,
+            "pick":        pick_norm,
+            "line":        line,
+            "stat_key":    result["stat_key"],
+            "stat_value":  stat_value,
+            "outcome":     outcome,
+            "settled":     settled,
+            "source":      "mlb_stats_api",
+            "game_pk":     result["game_pk"],
+            "game_status": result["game_status"],
+            "espn_limitation": False,
         })
 
     # ── 3. Unknown market (not supported and not known-unsupported) ─────────
