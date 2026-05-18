@@ -46,12 +46,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # ---------------------------------------------------------------------------
 
 _THIS_DIR = Path(__file__).parent.resolve()
-DB_PATH   = str(_THIS_DIR / "db" / "sports.db")
-LIVE_DIR  = str(_THIS_DIR / "live")
+DB_PATH = str(_THIS_DIR / "db" / "sports.db")
+LIVE_DIR = str(_THIS_DIR / "live")
 ARCHIVE_DIR = str(_THIS_DIR / "archive")
 
-_TOKEN    = os.getenv("STATS_API_TOKEN", "").strip()
-_PORT     = int(os.getenv("STATS_API_PORT", "8001"))
+_TOKEN = os.getenv("STATS_API_TOKEN", "").strip()
+_PORT = int(os.getenv("STATS_API_PORT", "8001"))
 
 # ---------------------------------------------------------------------------
 # App
@@ -82,6 +82,7 @@ def _verify_token(
 # Archive helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_json_archive(table_name: str) -> list[dict[str, Any]]:
     """Load archived data from JSON file for a given table."""
     archive_path = os.path.join(ARCHIVE_DIR, f"old_{table_name}.json")
@@ -99,7 +100,7 @@ def _get_cutoff_date() -> str:
     """Calculate cutoff date (today - 2 months)."""
     today = datetime.now(timezone.utc)
     cutoff = today - timedelta(days=60)  # 2 months approx
-    return cutoff.strftime('%Y-%m-%d')
+    return cutoff.strftime("%Y-%m-%d")
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +117,8 @@ def _get_cutoff_date() -> str:
 # ---------------------------------------------------------------------------
 
 _thread_local: threading.local = threading.local()
-_DB_MAX_RETRIES: int   = 5
-_DB_RETRY_BASE:  float = 0.1   # seconds; doubles each attempt (0.1 → 3.2 s total)
+_DB_MAX_RETRIES: int = 5
+_DB_RETRY_BASE: float = 0.1  # seconds; doubles each attempt (0.1 → 3.2 s total)
 
 
 def _get_thread_conn() -> duckdb.DuckDBPyConnection:  # type: ignore[name-defined]
@@ -152,14 +153,14 @@ def _query(sql: str, params: list | None = None) -> list[dict[str, Any]]:
     for attempt in range(_DB_MAX_RETRIES):
         try:
             conn = _get_thread_conn()
-            rel  = conn.execute(sql, params or [])
+            rel = conn.execute(sql, params or [])
             cols = [d[0] for d in rel.description]
             return [dict(zip(cols, row)) for row in rel.fetchall()]
         except Exception as exc:
             _drop_thread_conn()  # force reconnect on next attempt
             last_exc = exc
             if attempt < _DB_MAX_RETRIES - 1:
-                time.sleep(_DB_RETRY_BASE * (2 ** attempt))  # 0.1 0.2 0.4 0.8 1.6 s
+                time.sleep(_DB_RETRY_BASE * (2**attempt))  # 0.1 0.2 0.4 0.8 1.6 s
     assert last_exc is not None
     raise last_exc
 
@@ -167,6 +168,7 @@ def _query(sql: str, params: list | None = None) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Live state helpers
 # ---------------------------------------------------------------------------
+
 
 def _read_live_state() -> dict[str, list]:
     """Load live_state.json; return empty sections on any error."""
@@ -176,8 +178,8 @@ def _read_live_state() -> dict[str, list]:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         return {
-            "pregame":  data.get("pregame", []),
-            "live":     data.get("live", []),
+            "pregame": data.get("pregame", []),
+            "live": data.get("live", []),
             "finished": data.get("finished", []),
         }
     except (FileNotFoundError, json.JSONDecodeError):
@@ -239,7 +241,9 @@ def _date_only(value: Any) -> str | None:
         return None
 
 
-def _team_matches(query: str | None, team_name: str | None, team_abbr: str | None) -> bool:
+def _team_matches(
+    query: str | None, team_name: str | None, team_abbr: str | None
+) -> bool:
     if not query:
         return False
     query_norm = _normalize_text(query)
@@ -256,27 +260,26 @@ def _team_matches(query: str | None, team_name: str | None, team_abbr: str | Non
     )
 
 
-def _matchup_matches(event: dict[str, Any], team: str | None, opponent: str | None) -> bool:
+def _matchup_matches(
+    event: dict[str, Any], team: str | None, opponent: str | None
+) -> bool:
     if not team and not opponent:
         return True
 
     if team and opponent:
-        forward = (
-            _team_matches(team, event.get("home_team"), event.get("home_abbr"))
-            and _team_matches(opponent, event.get("away_team"), event.get("away_abbr"))
-        )
-        reverse = (
-            _team_matches(team, event.get("away_team"), event.get("away_abbr"))
-            and _team_matches(opponent, event.get("home_team"), event.get("home_abbr"))
-        )
+        forward = _team_matches(
+            team, event.get("home_team"), event.get("home_abbr")
+        ) and _team_matches(opponent, event.get("away_team"), event.get("away_abbr"))
+        reverse = _team_matches(
+            team, event.get("away_team"), event.get("away_abbr")
+        ) and _team_matches(opponent, event.get("home_team"), event.get("home_abbr"))
         return forward or reverse
 
     # Single team provided — match whichever side it's on
     single = team or opponent
-    return (
-        _team_matches(single, event.get("home_team"), event.get("home_abbr"))
-        or _team_matches(single, event.get("away_team"), event.get("away_abbr"))
-    )
+    return _team_matches(
+        single, event.get("home_team"), event.get("home_abbr")
+    ) or _team_matches(single, event.get("away_team"), event.get("away_abbr"))
 
 
 def _resolve_pick_side(pick: str, event: dict[str, Any]) -> str | None:
@@ -374,39 +377,43 @@ def _live_event_candidates(
             if not event_id:
                 if game_date and _date_only(entry.get("date")) != game_date:
                     continue
-                if sport and _normalize_text(entry.get("sport")) != _normalize_text(sport):
+                if sport and _normalize_text(entry.get("sport")) != _normalize_text(
+                    sport
+                ):
                     continue
 
             odds = entry.get("odds") or {}
             home = entry.get("home") or {}
             away = entry.get("away") or {}
-            candidates.append({
-                "event_id": str(entry.get("event_id") or ""),
-                "date": entry.get("date"),
-                "sport": entry.get("sport"),
-                "league": entry.get("league"),
-                "name": entry.get("name"),
-                "short_name": entry.get("short_name"),
-                "status": entry.get("status"),
-                "home_team": home.get("team_name"),
-                "home_abbr": home.get("team_abbr"),
-                "away_team": away.get("team_name"),
-                "away_abbr": away.get("team_abbr"),
-                "home_score": _as_int(home.get("score")),
-                "away_score": _as_int(away.get("score")),
-                "provider": odds.get("provider"),
-                "game_total": _as_float(odds.get("game_total")),
-                "over_odds": _as_int(odds.get("over_odds")),
-                "under_odds": _as_int(odds.get("under_odds")),
-                "draw_odds": _as_int(odds.get("draw_odds")),
-                "home_ml": _as_int(odds.get("home_ml")),
-                "away_ml": _as_int(odds.get("away_ml")),
-                "home_spread": _as_float(odds.get("home_spread")),
-                "away_spread": _as_float(odds.get("away_spread")),
-                "home_spread_odds": _as_int(odds.get("home_spread_odds")),
-                "away_spread_odds": _as_int(odds.get("away_spread_odds")),
-                "source": "live",
-            })
+            candidates.append(
+                {
+                    "event_id": str(entry.get("event_id") or ""),
+                    "date": entry.get("date"),
+                    "sport": entry.get("sport"),
+                    "league": entry.get("league"),
+                    "name": entry.get("name"),
+                    "short_name": entry.get("short_name"),
+                    "status": entry.get("status"),
+                    "home_team": home.get("team_name"),
+                    "home_abbr": home.get("team_abbr"),
+                    "away_team": away.get("team_name"),
+                    "away_abbr": away.get("team_abbr"),
+                    "home_score": _as_int(home.get("score")),
+                    "away_score": _as_int(away.get("score")),
+                    "provider": odds.get("provider"),
+                    "game_total": _as_float(odds.get("game_total")),
+                    "over_odds": _as_int(odds.get("over_odds")),
+                    "under_odds": _as_int(odds.get("under_odds")),
+                    "draw_odds": _as_int(odds.get("draw_odds")),
+                    "home_ml": _as_int(odds.get("home_ml")),
+                    "away_ml": _as_int(odds.get("away_ml")),
+                    "home_spread": _as_float(odds.get("home_spread")),
+                    "away_spread": _as_float(odds.get("away_spread")),
+                    "home_spread_odds": _as_int(odds.get("home_spread_odds")),
+                    "away_spread_odds": _as_int(odds.get("away_spread_odds")),
+                    "source": "live",
+                }
+            )
     return candidates
 
 
@@ -428,7 +435,10 @@ def _resolve_event(
         # DuckDB unavailable or temporarily locked — treat as not found so
         # callers receive a clean 404 rather than an unhandled 500.
         import logging
-        logging.getLogger(__name__).warning("DuckDB query failed in _resolve_event: %s", exc)
+
+        logging.getLogger(__name__).warning(
+            "DuckDB query failed in _resolve_event: %s", exc
+        )
         return None
 
     for event in historical_candidates:
@@ -451,18 +461,18 @@ def _evaluate_market(
     # These are stored with their original name in the bet DB; stats_api
     # resolves them here so the existing evaluation logic is fully reused.
     _MARKET_ALIASES: dict[str, str] = {
-        "game spread":            "spread",
-        "point spread":           "spread",
-        "puck line":              "spread",   # hockey -1.5/+1.5
-        "run line":               "spread",   # baseball -1.5/+1.5
-        "puck_line":              "spread",
-        "run_line":               "spread",
-        "total goals":            "total",    # soccer / hockey
-        "total runs":             "total",    # baseball
-        "total corners":          "total",
-        "total_goals":            "total",
-        "total_runs":             "total",
-        "total_corners":          "total",
+        "game spread": "spread",
+        "point spread": "spread",
+        "puck line": "spread",  # hockey -1.5/+1.5
+        "run line": "spread",  # baseball -1.5/+1.5
+        "puck_line": "spread",
+        "run_line": "spread",
+        "total goals": "total",  # soccer / hockey
+        "total runs": "total",  # baseball
+        "total corners": "total",
+        "total_goals": "total",
+        "total_runs": "total",
+        "total_corners": "total",
     }
     if market_norm in _MARKET_ALIASES:
         market_norm = _MARKET_ALIASES[market_norm]
@@ -471,9 +481,11 @@ def _evaluate_market(
     home_score = _as_int(event.get("home_score"))
     away_score = _as_int(event.get("away_score"))
     status_norm = _normalize_text(str(event.get("status") or ""))
-    settled  = status_norm == "post"
-    pregame  = status_norm == "pre"   # scores are 0-0 and meaningless
-    total_score = None if home_score is None or away_score is None else home_score + away_score
+    settled = status_norm == "post"
+    pregame = status_norm == "pre"  # scores are 0-0 and meaningless
+    total_score = (
+        None if home_score is None or away_score is None else home_score + away_score
+    )
 
     result: bool | None = None
     outcome = "pending"
@@ -506,7 +518,9 @@ def _evaluate_market(
             )
         resolved_pick = side
         if resolved_line is None:
-            resolved_line = _as_float(event.get("home_spread" if side == "home" else "away_spread"))
+            resolved_line = _as_float(
+                event.get("home_spread" if side == "home" else "away_spread")
+            )
         if resolved_line is None:
             raise HTTPException(
                 status_code=400,
@@ -584,7 +598,9 @@ def _evaluate_market(
             ),
             "event": {
                 "event_id": str(event.get("event_id") or ""),
-                "date": str(event.get("date")) if event.get("date") is not None else None,
+                "date": (
+                    str(event.get("date")) if event.get("date") is not None else None
+                ),
                 "sport": event.get("sport"),
                 "league": event.get("league"),
                 "name": event.get("name"),
@@ -594,8 +610,8 @@ def _evaluate_market(
                 "away_team": event.get("away_team"),
             },
             "score": {
-                "home":  None if pregame else home_score,
-                "away":  None if pregame else away_score,
+                "home": None if pregame else home_score,
+                "away": None if pregame else away_score,
                 "total": None if pregame else total_score,
             },
             "pricing": {
@@ -632,8 +648,8 @@ def _evaluate_market(
             "away_team": event.get("away_team"),
         },
         "score": {
-            "home":  None if pregame else home_score,
-            "away":  None if pregame else away_score,
+            "home": None if pregame else home_score,
+            "away": None if pregame else away_score,
             "total": None if pregame else total_score,
         },
         "pricing": {
@@ -654,10 +670,11 @@ def _evaluate_market(
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.get("/health")
 def health(_: None = Depends(_verify_token)) -> JSONResponse:
     """Liveness probe — verifies DB is accessible and live dir exists."""
-    db_ok   = False
+    db_ok = False
     live_ok = os.path.isfile(os.path.join(LIVE_DIR, "live_state.json"))
     try:
         rows = _query("SELECT COUNT(*) AS n FROM games")
@@ -669,10 +686,12 @@ def health(_: None = Depends(_verify_token)) -> JSONResponse:
 
 @app.get("/stats/player")
 def stats_player(
-    name:  str           = Query(..., description="Player display_name (partial match)"),
-    sport: Optional[str] = Query(None, description="Sport filter (e.g. soccer, basketball)"),
-    limit: int           = Query(10, ge=1, le=100, description="Max games to return"),
-    _:     None          = Depends(_verify_token),
+    name: str = Query(..., description="Player display_name (partial match)"),
+    sport: Optional[str] = Query(
+        None, description="Sport filter (e.g. soccer, basketball)"
+    ),
+    limit: int = Query(10, ge=1, le=100, description="Max games to return"),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return recent per-game statistics for a player matched by display_name.
@@ -735,29 +754,33 @@ def stats_player(
         # Group into games → players; one DB row per game-player now, stats in JSON blob
         games_map: dict[str, dict] = {}
         for row in rows:
-            eid   = str(row["event_id"])
+            eid = str(row["event_id"])
             pname = row["display_name"]
             if eid not in games_map:
                 games_map[eid] = {
-                    "event_id":   eid,
-                    "date":       str(row["date"]) if row["date"] else None,
-                    "sport":      row["sport"],
-                    "league":     row["league"],
-                    "home_team":  row["home_team"],
-                    "away_team":  row["away_team"],
+                    "event_id": eid,
+                    "date": str(row["date"]) if row["date"] else None,
+                    "sport": row["sport"],
+                    "league": row["league"],
+                    "home_team": row["home_team"],
+                    "away_team": row["away_team"],
                     "home_score": row["home_score"],
                     "away_score": row["away_score"],
-                    "status":     row["status"],
-                    "players":    {},
+                    "status": row["status"],
+                    "players": {},
                 }
             gm = games_map[eid]
             if pname not in gm["players"]:
                 gm["players"][pname] = {
                     "display_name": pname,
-                    "team":         row["team_name"],
-                    "position":     row["position"],
-                    "is_starter":   bool(row["is_starter"]) if row["is_starter"] is not None else None,
-                    "stats":        json.loads(row["stats_json"] or "{}"),
+                    "team": row["team_name"],
+                    "position": row["position"],
+                    "is_starter": (
+                        bool(row["is_starter"])
+                        if row["is_starter"] is not None
+                        else None
+                    ),
+                    "stats": json.loads(row["stats_json"] or "{}"),
                 }
 
         # Convert to list, collapse players dict to list, cap at limit games
@@ -783,7 +806,9 @@ def stats_player(
             # Load archive
             archive_data = _load_json_archive("player_stats")
             # Filter by player_id
-            player_archive = [stat for stat in archive_data if stat.get("player_id") == player_id]
+            player_archive = [
+                stat for stat in archive_data if stat.get("player_id") == player_id
+            ]
             if player_archive:
                 source = "archive"
                 # Group by game_id, similar to DB logic
@@ -798,7 +823,11 @@ def stats_player(
                             game = game_rows[0]
                             games_map[str(game_id)] = {
                                 "event_id": str(game["event_id"]),
-                                "date": str(game["game_date"]) if game["game_date"] else None,
+                                "date": (
+                                    str(game["game_date"])
+                                    if game["game_date"]
+                                    else None
+                                ),
                                 "sport": game["sport"],
                                 "league": game["league"],
                                 "home_team": None,  # Would need to join, simplify
@@ -812,21 +841,23 @@ def stats_player(
                                         "team": None,  # Would need to get from players table
                                         "position": None,
                                         "is_starter": None,
-                                        "stats": stat  # Simplified, just the stat dict
+                                        "stats": stat,  # Simplified, just the stat dict
                                     }
-                                }
+                                },
                             }
                 result = list(games_map.values())
 
-    return JSONResponse({"found": bool(result), "count": len(result), "source": source, "games": result})
+    return JSONResponse(
+        {"found": bool(result), "count": len(result), "source": source, "games": result}
+    )
 
 
 @app.get("/stats/team")
 def stats_team(
-    name:  str           = Query(..., description="Team name (partial match)"),
+    name: str = Query(..., description="Team name (partial match)"),
     sport: Optional[str] = Query(None, description="Sport filter"),
-    limit: int           = Query(5, ge=1, le=50, description="Max recent games"),
-    _:     None          = Depends(_verify_token),
+    limit: int = Query(5, ge=1, le=50, description="Max recent games"),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return win/loss record, last *limit* results, and top 3 scorers for a team.
@@ -928,34 +959,35 @@ def stats_team(
         scorers_params.append(sport)
 
     try:
-        rec_rows    = _query(record_sql, rec_params)
+        rec_rows = _query(record_sql, rec_params)
         recent_rows = _query(recent_sql, recent_params)
         scorer_rows = _query(scorers_sql, scorers_params)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    found = bool(recent_rows) or bool(rec_rows and rec_rows[0].get("total_games", 0) > 0)
+    found = bool(recent_rows) or bool(
+        rec_rows and rec_rows[0].get("total_games", 0) > 0
+    )
     source = "database"
 
     if found:
-        record  = rec_rows[0] if rec_rows else {}
-        recent  = [
+        record = rec_rows[0] if rec_rows else {}
+        recent = [
             {
-                "event_id":   str(r["event_id"]),
-                "date":       str(r["date"]) if r["date"] else None,
-                "sport":      r["sport"],
-                "league":     r["league"],
-                "home_team":  r["home_team"] or None,
-                "away_team":  r["away_team"] or None,
+                "event_id": str(r["event_id"]),
+                "date": str(r["date"]) if r["date"] else None,
+                "sport": r["sport"],
+                "league": r["league"],
+                "home_team": r["home_team"] or None,
+                "away_team": r["away_team"] or None,
                 "home_score": r["home_score"],
                 "away_score": r["away_score"],
-                "status":     r["status"],
+                "status": r["status"],
             }
             for r in recent_rows
         ]
         scorers = [
-            {"player": r["display_name"], "total": r["total"]}
-            for r in scorer_rows
+            {"player": r["display_name"], "total": r["total"]} for r in scorer_rows
         ]
     else:
         # Fallback to archive
@@ -986,36 +1018,49 @@ def stats_team(
                         game_rows = _query(game_sql, [game_id])
                         if game_rows:
                             game = game_rows[0]
-                            recent.append({
-                                "event_id": str(game["event_id"]),
-                                "date": str(game["game_date"]) if game["game_date"] else None,
-                                "sport": game["sport"],
-                                "league": game["league"],
-                                "home_team": None,
-                                "away_team": None,
-                                "home_score": game["home_score"],
-                                "away_score": game["away_score"],
-                                "status": game["status"],
-                            })
+                            recent.append(
+                                {
+                                    "event_id": str(game["event_id"]),
+                                    "date": (
+                                        str(game["game_date"])
+                                        if game["game_date"]
+                                        else None
+                                    ),
+                                    "sport": game["sport"],
+                                    "league": game["league"],
+                                    "home_team": None,
+                                    "away_team": None,
+                                    "home_score": game["home_score"],
+                                    "away_score": game["away_score"],
+                                    "status": game["status"],
+                                }
+                            )
                 record = {}  # Can't compute record from archive easily
                 scorers = []  # Can't compute scorers from archive easily
 
-    return JSONResponse({
-        "found":       bool(recent),
-        "source":      source,
-        "team_filter": name,
-        "record":      record,
-        "recent":      recent,
-        "top_scorers": scorers,
-    })
+    return JSONResponse(
+        {
+            "found": bool(recent),
+            "source": source,
+            "team_filter": name,
+            "record": record,
+            "recent": recent,
+            "top_scorers": scorers,
+        }
+    )
 
 
 @app.get("/stats/live")
 def stats_live(
-    team:   Optional[str] = Query(None, description="Team name filter (partial match)"),
-    player: Optional[str] = Query(None, description="Player name filter (partial match)"),
-    sport:  Optional[str] = Query(None, description="Sport filter (e.g. basketball, hockey, soccer, cricket, tennis, table_tennis, volleyball)"),
-    _:      None          = Depends(_verify_token),
+    team: Optional[str] = Query(None, description="Team name filter (partial match)"),
+    player: Optional[str] = Query(
+        None, description="Player name filter (partial match)"
+    ),
+    sport: Optional[str] = Query(
+        None,
+        description="Sport filter (e.g. basketball, hockey, soccer, cricket, tennis, table_tennis, volleyball)",
+    ),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return current live / pregame entries from live_state.json.
@@ -1029,24 +1074,34 @@ def stats_live(
         return entry.get("sport", "").lower() == sport.lower()
 
     if not team and not player:
-        live    = [e for e in state["live"]    if _sport_match(e)]
+        live = [e for e in state["live"] if _sport_match(e)]
         pregame = [e for e in state["pregame"] if _sport_match(e)]
-        return JSONResponse({
-            "live_count":    len(live),
-            "pregame_count": len(pregame),
-            "live":          live,
-            "pregame":       pregame,
-        })
+        return JSONResponse(
+            {
+                "live_count": len(live),
+                "pregame_count": len(pregame),
+                "live": live,
+                "pregame": pregame,
+            }
+        )
 
-    live    = [e for e in state["live"]    if _sport_match(e) and _matches_filter(e, team, player)]
-    pregame = [e for e in state["pregame"] if _sport_match(e) and _matches_filter(e, team, player)]
-    return JSONResponse({
-        "found":         bool(live or pregame),
-        "live_count":    len(live),
-        "pregame_count": len(pregame),
-        "live":          live,
-        "pregame":       pregame,
-    })
+    live = [
+        e for e in state["live"] if _sport_match(e) and _matches_filter(e, team, player)
+    ]
+    pregame = [
+        e
+        for e in state["pregame"]
+        if _sport_match(e) and _matches_filter(e, team, player)
+    ]
+    return JSONResponse(
+        {
+            "found": bool(live or pregame),
+            "live_count": len(live),
+            "pregame_count": len(pregame),
+            "live": live,
+            "pregame": pregame,
+        }
+    )
 
 
 @app.get("/stats/market-check")
@@ -1055,10 +1110,17 @@ def stats_market_check(
     date: Optional[str] = Query(None, description="Game date in YYYY-MM-DD format"),
     sport: Optional[str] = Query(None, description="Optional sport filter"),
     team: Optional[str] = Query(None, description="One team in the matchup"),
-    opponent: Optional[str] = Query(None, description="The opposing team in the matchup"),
+    opponent: Optional[str] = Query(
+        None, description="The opposing team in the matchup"
+    ),
     market: str = Query(..., description="moneyline, spread, or total"),
-    pick: str = Query(..., description="Pick to evaluate: team/home/away/draw for moneyline or spread, over/under for total"),
-    line: Optional[float] = Query(None, description="Optional custom line; if omitted, stored line is used"),
+    pick: str = Query(
+        ...,
+        description="Pick to evaluate: team/home/away/draw for moneyline or spread, over/under for total",
+    ),
+    line: Optional[float] = Query(
+        None, description="Optional custom line; if omitted, stored line is used"
+    ),
     _: None = Depends(_verify_token),
 ) -> JSONResponse:
     if not event_id and not (date and (team or opponent)):
@@ -1097,17 +1159,19 @@ def stats_market_check(
 # Event log helpers
 # ---------------------------------------------------------------------------
 
+
 def _iter_event_files(date_from: str | None, date_to: str | None):
     """Yield (date_str, path) for every events_YYYYMMDD.jsonl in LIVE_DIR."""
     try:
         names = sorted(
-            f for f in os.listdir(LIVE_DIR)
+            f
+            for f in os.listdir(LIVE_DIR)
             if f.startswith("events_") and f.endswith(".jsonl")
         )
     except OSError:
         return
     for name in names:
-        date_str = name[len("events_"):-len(".jsonl")]  # "20260415"
+        date_str = name[len("events_") : -len(".jsonl")]  # "20260415"
         if date_from and date_str < date_from.replace("-", ""):
             continue
         if date_to and date_str > date_to.replace("-", ""):
@@ -1115,23 +1179,32 @@ def _iter_event_files(date_from: str | None, date_to: str | None):
         yield date_str, os.path.join(LIVE_DIR, name)
 
 
-def _event_matches(ev: dict[str, Any], sport: str | None, league: str | None,
-                   event_type: str | None, team: str | None,
-                   event_id: str | None) -> bool:
+def _event_matches(
+    ev: dict[str, Any],
+    sport: str | None,
+    league: str | None,
+    event_type: str | None,
+    team: str | None,
+    event_id: str | None,
+) -> bool:
     if sport and _normalize_text(ev.get("sport")) != _normalize_text(sport):
         return False
     if league:
         ev_league = _normalize_text(ev.get("league", ""))
-        if _normalize_text(league) not in ev_league and ev_league not in _normalize_text(league):
+        if _normalize_text(
+            league
+        ) not in ev_league and ev_league not in _normalize_text(league):
             return False
-    if event_type and _normalize_text(ev.get("type", ev.get("event_type", ""))) != _normalize_text(event_type):
+    if event_type and _normalize_text(
+        ev.get("type", ev.get("event_type", ""))
+    ) != _normalize_text(event_type):
         return False
     if event_id and str(ev.get("event_id", "")) != str(event_id):
         return False
     if team:
         game_label = _normalize_text(ev.get("game", ev.get("short_name", "")))
-        home_abbr  = _normalize_text(ev.get("home_abbr", ev.get("home", "")))
-        away_abbr  = _normalize_text(ev.get("away_abbr", ev.get("away", "")))
+        home_abbr = _normalize_text(ev.get("home_abbr", ev.get("home", "")))
+        away_abbr = _normalize_text(ev.get("away_abbr", ev.get("away", "")))
         t = _normalize_text(team)
         if t not in game_label and t not in home_abbr and t not in away_abbr:
             return False
@@ -1142,18 +1215,36 @@ def _event_matches(ev: dict[str, Any], sport: str | None, league: str | None,
 # Event log endpoints
 # ---------------------------------------------------------------------------
 
+
 @app.get("/stats/events")
 def stats_events(
-    sport:      Optional[str] = Query(None, description="Sport filter: basketball, baseball, soccer, hockey"),
-    league:     Optional[str] = Query(None, description="League filter: nba, mlb, nhl, eng.1, esp.1 …"),
-    event_type: Optional[str] = Query(None, alias="type", description="Event type: LINE_MOVE, SCORE_UPDATE, TOTAL_MOVE, PERIOD_CHANGE, ODDS_MOVE, WIN_PROB_SHIFT, GAME_STARTED, GAME_FINISHED, NEW_GAME_DISCOVERED"),
-    team:       Optional[str] = Query(None, description="Team abbreviation or partial name (matched against game label)"),
-    event_id:   Optional[str] = Query(None, description="Exact ESPN event_id to filter a specific game"),
-    date_from:  Optional[str] = Query(None, description="Start date inclusive (YYYY-MM-DD)"),
-    date_to:    Optional[str] = Query(None, description="End date inclusive (YYYY-MM-DD)"),
-    limit:      int           = Query(50, ge=1, le=500, description="Max events to return"),
-    offset:     int           = Query(0, ge=0, description="Skip this many matching events (for pagination)"),
-    _:          None          = Depends(_verify_token),
+    sport: Optional[str] = Query(
+        None, description="Sport filter: basketball, baseball, soccer, hockey"
+    ),
+    league: Optional[str] = Query(
+        None, description="League filter: nba, mlb, nhl, eng.1, esp.1 …"
+    ),
+    event_type: Optional[str] = Query(
+        None,
+        alias="type",
+        description="Event type: LINE_MOVE, SCORE_UPDATE, TOTAL_MOVE, PERIOD_CHANGE, ODDS_MOVE, WIN_PROB_SHIFT, GAME_STARTED, GAME_FINISHED, NEW_GAME_DISCOVERED",
+    ),
+    team: Optional[str] = Query(
+        None,
+        description="Team abbreviation or partial name (matched against game label)",
+    ),
+    event_id: Optional[str] = Query(
+        None, description="Exact ESPN event_id to filter a specific game"
+    ),
+    date_from: Optional[str] = Query(
+        None, description="Start date inclusive (YYYY-MM-DD)"
+    ),
+    date_to: Optional[str] = Query(None, description="End date inclusive (YYYY-MM-DD)"),
+    limit: int = Query(50, ge=1, le=500, description="Max events to return"),
+    offset: int = Query(
+        0, ge=0, description="Skip this many matching events (for pagination)"
+    ),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Query the historical event log (LINE_MOVE, SCORE_UPDATE, etc.) with filters.
@@ -1187,21 +1278,27 @@ def stats_events(
             continue
 
     total_matched = len(matched)
-    page = matched[offset: offset + limit]
+    page = matched[offset : offset + limit]
 
-    return JSONResponse({
-        "found":         total_matched > 0,
-        "total_matched": total_matched,
-        "returned":      len(page),
-        "offset":        offset,
-        "limit":         limit,
-        "filters": {
-            "sport": sport, "league": league, "type": event_type,
-            "team": team, "event_id": event_id,
-            "date_from": date_from, "date_to": date_to,
-        },
-        "events": page,
-    })
+    return JSONResponse(
+        {
+            "found": total_matched > 0,
+            "total_matched": total_matched,
+            "returned": len(page),
+            "offset": offset,
+            "limit": limit,
+            "filters": {
+                "sport": sport,
+                "league": league,
+                "type": event_type,
+                "team": team,
+                "event_id": event_id,
+                "date_from": date_from,
+                "date_to": date_to,
+            },
+            "events": page,
+        }
+    )
 
 
 @app.get("/stats/events/summary")
@@ -1214,11 +1311,12 @@ def stats_events_summary(
     Useful for understanding what activity has been recorded.
     """
     from collections import Counter
-    by_type:   Counter = Counter()
-    by_sport:  Counter = Counter()
+
+    by_type: Counter = Counter()
+    by_sport: Counter = Counter()
     by_league: Counter = Counter()
-    by_date:   Counter = Counter()
-    games: dict[str, dict[str, Any]] = {}   # event_id -> {game, sport, league, count}
+    by_date: Counter = Counter()
+    games: dict[str, dict[str, Any]] = {}  # event_id -> {game, sport, league, count}
 
     for date_str, path in _iter_event_files(None, None):
         try:
@@ -1231,22 +1329,22 @@ def stats_events_summary(
                         ev = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    etype  = ev.get("type", ev.get("event_type", "UNKNOWN"))
-                    sport  = ev.get("sport", "unknown")
+                    etype = ev.get("type", ev.get("event_type", "UNKNOWN"))
+                    sport = ev.get("sport", "unknown")
                     league = ev.get("league", "unknown")
-                    eid    = str(ev.get("event_id", ""))
-                    by_type[etype]               += 1
-                    by_sport[sport]              += 1
+                    eid = str(ev.get("event_id", ""))
+                    by_type[etype] += 1
+                    by_sport[sport] += 1
                     by_league[f"{sport}/{league}"] += 1
-                    by_date[date_str]            += 1
+                    by_date[date_str] += 1
                     if eid:
                         if eid not in games:
                             games[eid] = {
                                 "event_id": eid,
-                                "game":     ev.get("game", ev.get("short_name", "")),
-                                "sport":    sport,
-                                "league":   league,
-                                "count":    0,
+                                "game": ev.get("game", ev.get("short_name", "")),
+                                "sport": sport,
+                                "league": league,
+                                "count": 0,
                             }
                         games[eid]["count"] += 1
         except OSError:
@@ -1256,29 +1354,32 @@ def stats_events_summary(
     top_games = sorted(games.values(), key=lambda g: -g["count"])[:20]
     date_keys = sorted(by_date.keys())
 
-    return JSONResponse({
-        "total_events":   total,
-        "unique_games":   len(games),
-        "date_range": {
-            "from": date_keys[0] if date_keys else None,
-            "to":   date_keys[-1] if date_keys else None,
-            "days": len(date_keys),
-        },
-        "by_type":   dict(sorted(by_type.items(),   key=lambda x: -x[1])),
-        "by_sport":  dict(sorted(by_sport.items(),  key=lambda x: -x[1])),
-        "by_league": dict(sorted(by_league.items(), key=lambda x: -x[1])),
-        "top_games_by_activity": top_games,
-    })
+    return JSONResponse(
+        {
+            "total_events": total,
+            "unique_games": len(games),
+            "date_range": {
+                "from": date_keys[0] if date_keys else None,
+                "to": date_keys[-1] if date_keys else None,
+                "days": len(date_keys),
+            },
+            "by_type": dict(sorted(by_type.items(), key=lambda x: -x[1])),
+            "by_sport": dict(sorted(by_sport.items(), key=lambda x: -x[1])),
+            "by_league": dict(sorted(by_league.items(), key=lambda x: -x[1])),
+            "top_games_by_activity": top_games,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Game Timeline endpoint
 # ---------------------------------------------------------------------------
 
+
 @app.get("/stats/game/timeline")
 def stats_game_timeline(
-    event_id: str  = Query(..., description="ESPN event ID"),
-    _:        None = Depends(_verify_token),
+    event_id: str = Query(..., description="ESPN event ID"),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return every recorded event for a single game in chronological order.
@@ -1310,33 +1411,36 @@ def stats_game_timeline(
         first = matched[0]
         game_meta = {
             "event_id": event_id,
-            "game":     first.get("game", first.get("short_name", "")),
-            "sport":    first.get("sport"),
-            "league":   first.get("league"),
+            "game": first.get("game", first.get("short_name", "")),
+            "sport": first.get("sport"),
+            "league": first.get("league"),
         }
 
-    return JSONResponse({
-        "found":       bool(matched),
-        "event_id":    event_id,
-        "game":        game_meta.get("game"),
-        "sport":       game_meta.get("sport"),
-        "league":      game_meta.get("league"),
-        "event_count": len(matched),
-        "events":      matched,
-    })
+    return JSONResponse(
+        {
+            "found": bool(matched),
+            "event_id": event_id,
+            "game": game_meta.get("game"),
+            "sport": game_meta.get("sport"),
+            "league": game_meta.get("league"),
+            "event_count": len(matched),
+            "events": matched,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Head-to-Head History endpoint
 # ---------------------------------------------------------------------------
 
+
 @app.get("/stats/matchups")
 def stats_matchups(
-    team:     str           = Query(..., description="One team name or abbreviation"),
-    opponent: str           = Query(..., description="Opposing team name or abbreviation"),
-    sport:    Optional[str] = Query(None, description="Sport filter"),
-    limit:    int           = Query(10, ge=1, le=50, description="Max games to return"),
-    _:        None          = Depends(_verify_token),
+    team: str = Query(..., description="One team name or abbreviation"),
+    opponent: str = Query(..., description="Opposing team name or abbreviation"),
+    sport: Optional[str] = Query(None, description="Sport filter"),
+    limit: int = Query(10, ge=1, le=50, description="Max games to return"),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return historical head-to-head games between two teams, most recent first.
@@ -1393,13 +1497,13 @@ def stats_matchups(
     results = []
     for r in rows:
         if not (
-            _team_matches(team, r["home_team"], r["home_abbr"]) or
-            _team_matches(team, r["away_team"], r["away_abbr"])
+            _team_matches(team, r["home_team"], r["home_abbr"])
+            or _team_matches(team, r["away_team"], r["away_abbr"])
         ):
             continue
         if not (
-            _team_matches(opponent, r["home_team"], r["home_abbr"]) or
-            _team_matches(opponent, r["away_team"], r["away_abbr"])
+            _team_matches(opponent, r["home_team"], r["home_abbr"])
+            or _team_matches(opponent, r["away_team"], r["away_abbr"])
         ):
             continue
 
@@ -1415,57 +1519,72 @@ def stats_matchups(
         else:
             winner = None
 
-        results.append({
-            "event_id":   str(r["event_id"]),
-            "date":       str(r["date"]) if r["date"] else None,
-            "sport":      r["sport"],
-            "league":     r["league"],
-            "short_name": r["short_name"],
-            "home_team":  r["home_team"] or None,
-            "away_team":  r["away_team"] or None,
-            "home_score": home_score,
-            "away_score": away_score,
-            "winner":     winner,
-            "status":     r["status"],
-        })
+        results.append(
+            {
+                "event_id": str(r["event_id"]),
+                "date": str(r["date"]) if r["date"] else None,
+                "sport": r["sport"],
+                "league": r["league"],
+                "short_name": r["short_name"],
+                "home_team": r["home_team"] or None,
+                "away_team": r["away_team"] or None,
+                "home_score": home_score,
+                "away_score": away_score,
+                "winner": winner,
+                "status": r["status"],
+            }
+        )
         if len(results) >= limit:
             break
 
     # Tally head-to-head record
     team_norm = _normalize_text(team)
     team_wins = sum(
-        1 for g in results
-        if g["winner"] and _normalize_text(g["winner"]) != "draw"
+        1
+        for g in results
+        if g["winner"]
+        and _normalize_text(g["winner"]) != "draw"
         and team_norm in _normalize_text(g["winner"])
     )
-    opp_wins = len([g for g in results if g["winner"] and not (
-        _normalize_text(g["winner"]) == "draw" or team_norm in _normalize_text(g["winner"])
-    )])
+    opp_wins = len(
+        [
+            g
+            for g in results
+            if g["winner"]
+            and not (
+                _normalize_text(g["winner"]) == "draw"
+                or team_norm in _normalize_text(g["winner"])
+            )
+        ]
+    )
     draws = sum(1 for g in results if g["winner"] == "draw")
 
-    return JSONResponse({
-        "found":    bool(results),
-        "team":     team,
-        "opponent": opponent,
-        "sport":    sport,
-        "h2h_record": {
-            "team_wins":     team_wins,
-            "opponent_wins": opp_wins,
-            "draws":         draws,
-            "total_games":   len(results),
-        },
-        "games": results,
-    })
+    return JSONResponse(
+        {
+            "found": bool(results),
+            "team": team,
+            "opponent": opponent,
+            "sport": sport,
+            "h2h_record": {
+                "team_wins": team_wins,
+                "opponent_wins": opp_wins,
+                "draws": draws,
+                "total_games": len(results),
+            },
+            "games": results,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Odds History endpoint
 # ---------------------------------------------------------------------------
 
+
 @app.get("/stats/game/odds-history")
 def stats_game_odds_history(
-    event_id: str  = Query(..., description="ESPN event ID"),
-    _:        None = Depends(_verify_token),
+    event_id: str = Query(..., description="ESPN event ID"),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return the full timeline of how odds moved for one game —
@@ -1499,8 +1618,8 @@ def stats_game_odds_history(
     if matched:
         first = matched[0]
         game_meta = {
-            "game":   first.get("game", first.get("short_name", "")),
-            "sport":  first.get("sport"),
+            "game": first.get("game", first.get("short_name", "")),
+            "sport": first.get("sport"),
             "league": first.get("league"),
         }
 
@@ -1516,29 +1635,36 @@ def stats_game_odds_history(
             opening[field] = ev["old_value"]
         closing[field] = val
 
-    return JSONResponse({
-        "found":       bool(matched),
-        "event_id":    event_id,
-        "game":        game_meta.get("game"),
-        "sport":       game_meta.get("sport"),
-        "league":      game_meta.get("league"),
-        "move_count":  len(matched),
-        "opening":     opening,
-        "closing":     closing,
-        "history":     matched,
-    })
+    return JSONResponse(
+        {
+            "found": bool(matched),
+            "event_id": event_id,
+            "game": game_meta.get("game"),
+            "sport": game_meta.get("sport"),
+            "league": game_meta.get("league"),
+            "move_count": len(matched),
+            "opening": opening,
+            "closing": closing,
+            "history": matched,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Injuries endpoint
 # ---------------------------------------------------------------------------
 
+
 @app.get("/stats/injuries")
 def stats_injuries(
-    sport:  Optional[str] = Query(None, description="Sport filter: basketball, soccer, hockey, baseball, football"),
-    team:   Optional[str] = Query(None, description="Team name or abbreviation (partial match)"),
+    sport: Optional[str] = Query(
+        None, description="Sport filter: basketball, soccer, hockey, baseball, football"
+    ),
+    team: Optional[str] = Query(
+        None, description="Team name or abbreviation (partial match)"
+    ),
     player: Optional[str] = Query(None, description="Player name (partial match)"),
-    _:      None          = Depends(_verify_token),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return current injury and availability status for players.
@@ -1549,42 +1675,67 @@ def stats_injuries(
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
-        return JSONResponse({"found": False, "injuries": [], "error": "Injury data not yet available — refreshes every 10 minutes"})
+        return JSONResponse(
+            {
+                "found": False,
+                "injuries": [],
+                "error": "Injury data not yet available — refreshes every 10 minutes",
+            }
+        )
 
     injuries: list[dict[str, Any]] = data.get("injuries", [])
 
     if sport:
-        injuries = [i for i in injuries if _normalize_text(i.get("sport", "")) == _normalize_text(sport)]
+        injuries = [
+            i
+            for i in injuries
+            if _normalize_text(i.get("sport", "")) == _normalize_text(sport)
+        ]
     if team:
         t = _normalize_text(team)
         injuries = [
-            i for i in injuries
+            i
+            for i in injuries
             if t in _normalize_text(i.get("team_name", ""))
             or t in _normalize_text(i.get("team_abbr", ""))
         ]
     if player:
         p = _normalize_text(player)
-        injuries = [i for i in injuries if p in _normalize_text(i.get("player_name", ""))]
+        injuries = [
+            i for i in injuries if p in _normalize_text(i.get("player_name", ""))
+        ]
 
-    return JSONResponse({
-        "found":      bool(injuries),
-        "count":      len(injuries),
-        "fetched_at": data.get("fetched_at"),
-        "injuries":   injuries,
-    })
+    return JSONResponse(
+        {
+            "found": bool(injuries),
+            "count": len(injuries),
+            "fetched_at": data.get("fetched_at"),
+            "injuries": injuries,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Team Trends endpoint  (ATS / O-U / home-away splits)
 # ---------------------------------------------------------------------------
 
+
 @app.get("/stats/trends")
 def stats_trends(
-    team:   str           = Query(..., description="Team name or abbreviation"),
-    sport:  Optional[str] = Query(None, description="Sport filter: basketball, soccer, hockey, baseball"),
-    league: Optional[str] = Query(None, description="League filter: nba, mlb, nhl, eng.1 …"),
-    limit:  int           = Query(50, ge=5, le=200, description="Number of recent completed games to analyse (default 50)"),
-    _:      None          = Depends(_verify_token),
+    team: str = Query(..., description="Team name or abbreviation"),
+    sport: Optional[str] = Query(
+        None, description="Sport filter: basketball, soccer, hockey, baseball"
+    ),
+    league: Optional[str] = Query(
+        None, description="League filter: nba, mlb, nhl, eng.1 …"
+    ),
+    limit: int = Query(
+        50,
+        ge=5,
+        le=200,
+        description="Number of recent completed games to analyse (default 50)",
+    ),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Return ATS (against the spread), over/under, and home/away performance
@@ -1594,7 +1745,7 @@ def stats_trends(
     O/U  — combined final score vs the posted game total line.
     Splits include home-only and away-only breakdowns.
     """
-    sport_clause  = "AND LOWER(g.sport)  = LOWER(?)" if sport  else ""
+    sport_clause = "AND LOWER(g.sport)  = LOWER(?)" if sport else ""
     league_clause = "AND LOWER(g.league) = LOWER(?)" if league else ""
 
     sql = f"""
@@ -1628,8 +1779,10 @@ def stats_trends(
 
     team_like = f"%{team}%"
     params: list[Any] = [team_like, team.lower()]
-    if sport:  params.append(sport)
-    if league: params.append(league)
+    if sport:
+        params.append(sport)
+    if league:
+        params.append(league)
     params.append(limit)
 
     try:
@@ -1638,35 +1791,46 @@ def stats_trends(
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
 
     if not rows:
-        return JSONResponse({
-            "found": False,
-            "team":  team,
-            "sport": sport,
-            "games_analysed": 0,
-            "message": "No completed games found for this team in the database.",
-        })
+        return JSONResponse(
+            {
+                "found": False,
+                "team": team,
+                "sport": sport,
+                "games_analysed": 0,
+                "message": "No completed games found for this team in the database.",
+            }
+        )
 
     # ---- compute record accumulators ----
     def _blank():
-        return {"covers": 0, "losses": 0, "pushes": 0,
-                "overs": 0, "unders": 0, "ou_pushes": 0,
-                "wins": 0, "defeats": 0, "draws": 0, "games": 0}
+        return {
+            "covers": 0,
+            "losses": 0,
+            "pushes": 0,
+            "overs": 0,
+            "unders": 0,
+            "ou_pushes": 0,
+            "wins": 0,
+            "defeats": 0,
+            "draws": 0,
+            "games": 0,
+        }
 
     overall = _blank()
-    home    = _blank()
-    away    = _blank()
+    home = _blank()
+    away = _blank()
     recent_form: list[dict[str, Any]] = []
 
     for r in rows:
         hs = r["home_score"]
         as_ = r["away_score"]
-        gt  = r["game_total"]
-        side = r["my_side"]          # "home" or "away"
-        spd  = r["my_spread"]        # spread from DB for this team's side
+        gt = r["game_total"]
+        side = r["my_side"]  # "home" or "away"
+        spd = r["my_spread"]  # spread from DB for this team's side
 
         bucket = home if side == "home" else away
         overall["games"] += 1
-        bucket["games"]  += 1
+        bucket["games"] += 1
 
         # --- win / loss / draw (straight up) ---
         if hs is not None and as_ is not None:
@@ -1676,16 +1840,16 @@ def stats_trends(
                 my_score, opp_score = as_, hs
 
             if my_score > opp_score:
-                overall["wins"]    += 1
-                bucket["wins"]     += 1
+                overall["wins"] += 1
+                bucket["wins"] += 1
                 su = "W"
             elif my_score < opp_score:
                 overall["defeats"] += 1
-                bucket["defeats"]  += 1
+                bucket["defeats"] += 1
                 su = "L"
             else:
-                overall["draws"]   += 1
-                bucket["draws"]    += 1
+                overall["draws"] += 1
+                bucket["draws"] += 1
                 su = "D"
 
             # --- ATS ---
@@ -1694,15 +1858,15 @@ def stats_trends(
                 covered_score = my_score + spd
                 if covered_score > opp_score:
                     overall["covers"] += 1
-                    bucket["covers"]  += 1
+                    bucket["covers"] += 1
                     ats = "cover"
                 elif covered_score < opp_score:
                     overall["losses"] += 1
-                    bucket["losses"]  += 1
+                    bucket["losses"] += 1
                     ats = "loss"
                 else:
                     overall["pushes"] += 1
-                    bucket["pushes"]  += 1
+                    bucket["pushes"] += 1
                     ats = "push"
         else:
             su, ats, my_score, opp_score = "?", "N/A", None, None
@@ -1712,60 +1876,72 @@ def stats_trends(
         if gt is not None and hs is not None and as_ is not None:
             total = hs + as_
             if total > gt:
-                overall["overs"]  += 1
-                bucket["overs"]   += 1
+                overall["overs"] += 1
+                bucket["overs"] += 1
                 ou = "over"
             elif total < gt:
                 overall["unders"] += 1
-                bucket["unders"]  += 1
+                bucket["unders"] += 1
                 ou = "under"
             else:
                 overall["ou_pushes"] += 1
-                bucket["ou_pushes"]  += 1
+                bucket["ou_pushes"] += 1
                 ou = "push"
 
         if len(recent_form) < 10:
-            recent_form.append({
-                "event_id":  str(r["event_id"]),
-                "date":      str(r["game_date"]) if r["game_date"] else None,
-                "side":      side,
-                "score":     f"{int(my_score)}-{int(opp_score)}" if my_score is not None else None,
-                "su":        su,
-                "ats":       ats,
-                "ou":        ou,
-                "spread":    spd,
-            })
+            recent_form.append(
+                {
+                    "event_id": str(r["event_id"]),
+                    "date": str(r["game_date"]) if r["game_date"] else None,
+                    "side": side,
+                    "score": (
+                        f"{int(my_score)}-{int(opp_score)}"
+                        if my_score is not None
+                        else None
+                    ),
+                    "su": su,
+                    "ats": ats,
+                    "ou": ou,
+                    "spread": spd,
+                }
+            )
 
     def _pct(n, d):
         return round(n / d * 100, 1) if d else None
 
     def _fmt(b):
         ats_games = b["covers"] + b["losses"] + b["pushes"]
-        ou_games  = b["overs"]  + b["unders"]  + b["ou_pushes"]
+        ou_games = b["overs"] + b["unders"] + b["ou_pushes"]
         return {
             "games": b["games"],
             "su_record": f"{b['wins']}-{b['defeats']}-{b['draws']}",
             "ats": {
-                "covers": b["covers"], "losses": b["losses"], "pushes": b["pushes"],
+                "covers": b["covers"],
+                "losses": b["losses"],
+                "pushes": b["pushes"],
                 "cover_pct": _pct(b["covers"], ats_games),
             },
             "ou": {
-                "overs": b["overs"], "unders": b["unders"], "pushes": b["ou_pushes"],
+                "overs": b["overs"],
+                "unders": b["unders"],
+                "pushes": b["ou_pushes"],
                 "over_pct": _pct(b["overs"], ou_games),
             },
         }
 
-    return JSONResponse({
-        "found":          True,
-        "team":           team,
-        "sport":          sport,
-        "league":         league,
-        "games_analysed": overall["games"],
-        "overall":        _fmt(overall),
-        "home":           _fmt(home),
-        "away":           _fmt(away),
-        "recent_form":    recent_form,
-    })
+    return JSONResponse(
+        {
+            "found": True,
+            "team": team,
+            "sport": sport,
+            "league": league,
+            "games_analysed": overall["games"],
+            "overall": _fmt(overall),
+            "home": _fmt(home),
+            "away": _fmt(away),
+            "recent_form": recent_form,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1783,34 +1959,37 @@ def stats_trends(
 PROP_STAT_MAP: dict[str, list[str]] = {
     # ── Basketball (NBA) ────────────────────────────────────────────────────
     # Confirmed keys: PTS, REB, AST, MIN; slash-format: FG, 3PT, FT
-    "player_points":      ["PTS"],
-    "player_rebounds":    ["REB"],
-    "player_assists":     ["AST"],
-    "player_threes":      ["3PT"],          # slash "made-att" → first number used
-    "player_steals":      ["STL"],          # present in ESPN, not in verify_db checks
-    "player_blocks":      ["BLK"],          # present in ESPN, not in verify_db checks
-    "player_turnovers":   ["TOV", "TO"],
-    "player_minutes":     ["MIN"],
-    "player_fg_made":     ["FG"],           # slash "made-att" → first number
-    "player_ft_made":     ["FT"],           # slash "made-att" → first number
+    "player_points": ["PTS"],
+    "player_rebounds": ["REB"],
+    "player_assists": ["AST"],
+    "player_threes": ["3PT"],  # slash "made-att" → first number used
+    "player_steals": ["STL"],  # present in ESPN, not in verify_db checks
+    "player_blocks": ["BLK"],  # present in ESPN, not in verify_db checks
+    "player_turnovers": ["TOV", "TO"],
+    "player_minutes": ["MIN"],
+    "player_fg_made": ["FG"],  # slash "made-att" → first number
+    "player_ft_made": ["FT"],  # slash "made-att" → first number
     # ── Soccer ──────────────────────────────────────────────────────────────
     # Confirmed keys: G, SV, YC
-    "player_goals":       ["G"],
-    "player_saves":       ["SV"],
-    "player_yellow_cards":["YC"],
+    "player_goals": ["G"],
+    "player_saves": ["SV"],
+    "player_yellow_cards": ["YC"],
     # ── Hockey (NHL) ────────────────────────────────────────────────────────
     # Confirmed keys: G, A, TOI
-    "player_goals_hockey":   ["G"],
+    "player_goals_hockey": ["G"],
     "player_assists_hockey": ["A"],
     # ── Baseball (MLB) ──────────────────────────────────────────────────────
     # Confirmed ESPN keys: H, RBI
-    "player_hits":        ["H"],
-    "player_rbis":        ["RBI"],
+    "player_hits": ["H"],
+    "player_rbis": ["RBI"],
     # Settled via MLB Stats API (statsapi.mlb.com) — not ESPN
-    "player_strikeouts":  ["K"],
+    "player_strikeouts": ["K"],
     "player_earned_runs": ["ER"],
+    # Settled via MLB Period Props (inning-by-inning and period-based markets)
+    "player_bases": ["_PERIOD_PROPS"],  # sentinel
+    "player_singles": ["_PERIOD_PROPS"],  # sentinel
     # ── Cricket ─────────────────────────────────────────────────────────────
-    "player_runs_cricket":    ["BAT_INN1_RUNS", "BAT_INN2_RUNS"],
+    "player_runs_cricket": ["BAT_INN1_RUNS", "BAT_INN2_RUNS"],
     "player_wickets_cricket": ["BWL_INN1_WICKETS", "BWL_INN2_WICKETS"],
 }
 
@@ -1820,20 +1999,40 @@ _SLASH_STAT_KEYS: frozenset[str] = frozenset({"FG", "3PT", "FT", "H-AB", "PC-ST"
 
 # Markets ESPN definitively does not provide in any game data.
 # Returning this list in the limitation response proves the gap is ESPN's, not ours.
-ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset({
-    "anytime_scorer", "first_scorer", "last_scorer",
-    "first_td", "last_td", "first_basket",
-    "player_double_double", "player_triple_double", "player_hat_trick",
-    # American-football props — ESPN tracks NFL but our ingest does not collect them
-    "player_pass_yards", "player_rush_yards", "player_receiving_yards",
-    "player_pass_tds", "player_rush_tds", "player_receiving_tds",
-    "player_receptions", "player_pass_attempts",
-    "player_tackles", "player_sacks", "player_interceptions", "player_carry_yards",
-    # Soccer props ESPN does not expose in box scores
-    "player_shots_on_target", "player_offsides", "player_cards",
-    # Tennis props — not in ESPN box scores
-    "player_aces", "player_double_faults", "player_sets_won",
-})
+ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset(
+    {
+        "anytime_scorer",
+        "first_scorer",
+        "last_scorer",
+        "first_td",
+        "last_td",
+        "first_basket",
+        "player_double_double",
+        "player_triple_double",
+        "player_hat_trick",
+        # American-football props — ESPN tracks NFL but our ingest does not collect them
+        "player_pass_yards",
+        "player_rush_yards",
+        "player_receiving_yards",
+        "player_pass_tds",
+        "player_rush_tds",
+        "player_receiving_tds",
+        "player_receptions",
+        "player_pass_attempts",
+        "player_tackles",
+        "player_sacks",
+        "player_interceptions",
+        "player_carry_yards",
+        # Soccer props ESPN does not expose in box scores
+        "player_shots_on_target",
+        "player_offsides",
+        "player_cards",
+        # Tennis props — not in ESPN box scores
+        "player_aces",
+        "player_double_faults",
+        "player_sets_won",
+    }
+)
 
 SUPPORTED_PROP_MARKETS: list[str] = sorted(PROP_STAT_MAP.keys())
 
@@ -1856,15 +2055,22 @@ def _extract_stat_value(raw: Any, stat_key: str) -> float | None:
 
 @app.get("/stats/prop-check")
 def stats_prop_check(
-    player:   str           = Query(...,  description="Player display name (partial match, case-insensitive)"),
-    market:   str           = Query(...,  description="Prop market: player_points | player_rebounds | player_assists | player_threes | player_goals | player_hits | player_rbis | … (see espn_supported_markets in response)"),
-    pick:     str           = Query(...,  description="over | under"),
-    line:     float         = Query(...,  description="The prop line to evaluate (e.g. 25.5)"),
+    player: str = Query(
+        ..., description="Player display name (partial match, case-insensitive)"
+    ),
+    market: str = Query(
+        ...,
+        description="Prop market: player_points | player_rebounds | player_assists | player_threes | player_goals | player_hits | player_rbis | … (see espn_supported_markets in response)",
+    ),
+    pick: str = Query(..., description="over | under"),
+    line: float = Query(..., description="The prop line to evaluate (e.g. 25.5)"),
     event_id: Optional[str] = Query(None, description="ESPN event_id — most precise"),
-    date:     Optional[str] = Query(None, description="Game date YYYY-MM-DD"),
-    sport:    Optional[str] = Query(None, description="Sport filter"),
-    team:     Optional[str] = Query(None, description="Team filter (helps narrow player search)"),
-    _:        None          = Depends(_verify_token),
+    date: Optional[str] = Query(None, description="Game date YYYY-MM-DD"),
+    sport: Optional[str] = Query(None, description="Sport filter"),
+    team: Optional[str] = Query(
+        None, description="Team filter (helps narrow player search)"
+    ),
+    _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
     Evaluate a player prop bet against ESPN historical data.
@@ -1886,7 +2092,7 @@ def stats_prop_check(
     player_strikeouts, player_earned_runs.
     """
     market_norm = market.strip().lower().replace(" ", "_")
-    pick_norm   = pick.strip().lower()
+    pick_norm = pick.strip().lower()
 
     # ── 1. Reject picks that aren't over/under ──────────────────────────────
     if pick_norm not in {"over", "under"}:
@@ -1897,22 +2103,87 @@ def stats_prop_check(
 
     # ── 2. Definitively unsupported by ESPN ────────────────────────────────
     if market_norm in ESPN_UNSUPPORTED_PROPS:
-        return JSONResponse(status_code=200, content={
-            "found":                  False,
-            "outcome":                "pending",
-            "settled":                False,
-            "espn_limitation":        True,
-            "espn_limitation_reason": (
-                f"'{market_norm}' is not available in ESPN data. "
-                "ESPN does not provide this stat type for any game in our database."
-            ),
-            "requested_market":       market_norm,
-            "requested_player":       player,
-            "espn_supported_markets": SUPPORTED_PROP_MARKETS,
-        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": False,
+                "outcome": "pending",
+                "settled": False,
+                "espn_limitation": True,
+                "espn_limitation_reason": (
+                    f"'{market_norm}' is not available in ESPN data. "
+                    "ESPN does not provide this stat type for any game in our database."
+                ),
+                "requested_market": market_norm,
+                "requested_player": player,
+                "espn_supported_markets": SUPPORTED_PROP_MARKETS,
+            },
+        )
 
-    # ── 2b. MLB Stats API markets (strikeouts, earned_runs) ───────────────
+    # ── 2b. MLB Period Props markets (inning/period-based) ─────────────────
+    import mlb_period_props as _mlb_period
+
+    if market_norm in _mlb_period.PERIOD_PROP_STAT_MAP:
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to locate the MLB game.",
+            )
+        result = _mlb_period.prop_check(
+            player=player,
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team,
+            pick=pick_norm,
+            line=line,
+        )
+        if not result.get("found"):
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": False,
+                    "outcome": "pending",
+                    "settled": False,
+                    "source": "mlb_period_props",
+                    "note": result.get(
+                        "note", "MLB Period Props lookup did not find data."
+                    ),
+                    "game_pk": result.get("game_pk"),
+                    "game_status": result.get("game_status"),
+                    "available_hitters": result.get("available_hitters"),
+                },
+            )
+        settled = result["settled"]
+        stat_value = result["stat_value"]
+        if not settled:
+            outcome = "pending"
+        elif stat_value > line:
+            outcome = "win" if pick_norm == "over" else "loss"
+        elif stat_value < line:
+            outcome = "win" if pick_norm == "under" else "loss"
+        else:
+            outcome = "push"
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": True,
+                "player": result.get("player", player),
+                "market": market_norm,
+                "pick": pick_norm,
+                "line": line,
+                "stat_value": stat_value,
+                "outcome": outcome,
+                "settled": settled,
+                "source": "mlb_period_props",
+                "game_pk": result["game_pk"],
+                "game_status": result["game_status"],
+                "espn_limitation": False,
+            },
+        )
+
+    # ── 2c. MLB Stats API markets (strikeouts, earned_runs) ───────────────
     import mlb_stats as _mlb  # lazy — avoids startup failure if httpx not yet ready
+
     if market_norm in _mlb.MLB_PROP_STAT_MAP:
         if not date:
             raise HTTPException(
@@ -1926,41 +2197,49 @@ def stats_prop_check(
             team=team,
         )
         if not result.get("found"):
-            return JSONResponse(status_code=200, content={
-                "found":       False,
-                "outcome":     "pending",
-                "settled":     False,
-                "source":      "mlb_stats_api",
-                "note":        result.get("note", "MLB Stats API lookup did not find data."),
-                "game_pk":     result.get("game_pk"),
-                "game_status": result.get("game_status"),
-                "available_pitchers": result.get("available_pitchers"),
-            })
-        settled    = result["settled"]
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": False,
+                    "outcome": "pending",
+                    "settled": False,
+                    "source": "mlb_stats_api",
+                    "note": result.get(
+                        "note", "MLB Stats API lookup did not find data."
+                    ),
+                    "game_pk": result.get("game_pk"),
+                    "game_status": result.get("game_status"),
+                    "available_pitchers": result.get("available_pitchers"),
+                },
+            )
+        settled = result["settled"]
         stat_value = result["stat_value"]
         if not settled:
             outcome = "pending"
         elif stat_value > line:
-            outcome = "win"  if pick_norm == "over"  else "loss"
+            outcome = "win" if pick_norm == "over" else "loss"
         elif stat_value < line:
-            outcome = "win"  if pick_norm == "under" else "loss"
+            outcome = "win" if pick_norm == "under" else "loss"
         else:
             outcome = "push"
-        return JSONResponse(status_code=200, content={
-            "found":       True,
-            "player":      result["player"],
-            "market":      market_norm,
-            "pick":        pick_norm,
-            "line":        line,
-            "stat_key":    result["stat_key"],
-            "stat_value":  stat_value,
-            "outcome":     outcome,
-            "settled":     settled,
-            "source":      "mlb_stats_api",
-            "game_pk":     result["game_pk"],
-            "game_status": result["game_status"],
-            "espn_limitation": False,
-        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": True,
+                "player": result["player"],
+                "market": market_norm,
+                "pick": pick_norm,
+                "line": line,
+                "stat_key": result["stat_key"],
+                "stat_value": stat_value,
+                "outcome": outcome,
+                "settled": settled,
+                "source": "mlb_stats_api",
+                "game_pk": result["game_pk"],
+                "game_status": result["game_status"],
+                "espn_limitation": False,
+            },
+        )
 
     # ── 3. Unknown market (not supported and not known-unsupported) ─────────
     if market_norm not in PROP_STAT_MAP:
@@ -1984,23 +2263,28 @@ def stats_prop_check(
 
     # ── 5. Find the game ────────────────────────────────────────────────────
     try:
-        event = _resolve_event(event_id, _date_only(date) if date else None, sport, team, None)
+        event = _resolve_event(
+            event_id, _date_only(date) if date else None, sport, team, None
+        )
     except Exception as exc:
         _log = __import__("logging").getLogger(__name__)
         _log.warning("prop-check _resolve_event error: %s", exc)
         event = None
 
     if event is None:
-        return JSONResponse(status_code=404, content={
-            "found":   False,
-            "outcome": "pending",
-            "settled": False,
-            "note":    "Game not found — it may be in the future or not yet tracked.",
-        })
+        return JSONResponse(
+            status_code=404,
+            content={
+                "found": False,
+                "outcome": "pending",
+                "settled": False,
+                "note": "Game not found — it may be in the future or not yet tracked.",
+            },
+        )
 
     resolved_event_id = str(event.get("event_id") or "")
-    game_status       = _normalize_text(str(event.get("status") or ""))
-    game_settled      = (game_status == "post")
+    game_status = _normalize_text(str(event.get("status") or ""))
+    game_settled = game_status == "post"
 
     # ── 6. Look up player in game_players for this event ────────────────────
     sql = """
@@ -2019,33 +2303,39 @@ def stats_prop_check(
     try:
         rows = _query(sql, [resolved_event_id, f"%{player}%"])
     except Exception as exc:
-        return JSONResponse(status_code=503, content={
-            "found":   False,
-            "outcome": "pending",
-            "settled": False,
-            "error":   f"Database error: {exc}",
-        })
+        return JSONResponse(
+            status_code=503,
+            content={
+                "found": False,
+                "outcome": "pending",
+                "settled": False,
+                "error": f"Database error: {exc}",
+            },
+        )
 
     if not rows:
-        return JSONResponse(status_code=200, content={
-            "found":                  False,
-            "outcome":                "pending",
-            "settled":                False,
-            "espn_limitation":        True,
-            "espn_limitation_reason": (
-                f"Player '{player}' was not found in ESPN data for this game "
-                f"(event_id={resolved_event_id}). "
-                "ESPN may not have tracked individual stats for this player, "
-                "or the player did not participate."
-            ),
-            "requested_market":       market_norm,
-            "requested_player":       player,
-            "game_status":            game_status,
-            "espn_supported_markets": SUPPORTED_PROP_MARKETS,
-        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": False,
+                "outcome": "pending",
+                "settled": False,
+                "espn_limitation": True,
+                "espn_limitation_reason": (
+                    f"Player '{player}' was not found in ESPN data for this game "
+                    f"(event_id={resolved_event_id}). "
+                    "ESPN may not have tracked individual stats for this player, "
+                    "or the player did not participate."
+                ),
+                "requested_market": market_norm,
+                "requested_player": player,
+                "game_status": game_status,
+                "espn_supported_markets": SUPPORTED_PROP_MARKETS,
+            },
+        )
 
     # Use the first match (closest name)
-    row         = rows[0]
+    row = rows[0]
     player_name = row["player_name"]
     did_not_play = bool(row.get("did_not_play"))
 
@@ -2060,81 +2350,90 @@ def stats_prop_check(
 
     # DNP player → cannot settle
     if did_not_play:
-        return JSONResponse(status_code=200, content={
-            "found":                  True,
-            "player":                 player_name,
-            "outcome":                "pending",
-            "settled":                False,
-            "espn_limitation":        True,
-            "espn_limitation_reason": (
-                f"ESPN marks {player_name} as Did Not Play for this game"
-                + (f" ({row.get('dnp_reason')})" if row.get("dnp_reason") else "")
-                + ". Prop bets on DNP players cannot be settled automatically."
-            ),
-            "requested_market":  market_norm,
-            "espn_available_stats": available_keys,
-        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": True,
+                "player": player_name,
+                "outcome": "pending",
+                "settled": False,
+                "espn_limitation": True,
+                "espn_limitation_reason": (
+                    f"ESPN marks {player_name} as Did Not Play for this game"
+                    + (f" ({row.get('dnp_reason')})" if row.get("dnp_reason") else "")
+                    + ". Prop bets on DNP players cannot be settled automatically."
+                ),
+                "requested_market": market_norm,
+                "espn_available_stats": available_keys,
+            },
+        )
 
     # ── 8. Try each candidate key until one has a value ────────────────────
     stat_value: float | None = None
-    matched_key: str | None  = None
+    matched_key: str | None = None
     for key in stat_keys:
         val = _extract_stat_value(raw_stats.get(key), key)
         if val is not None:
-            stat_value  = val
+            stat_value = val
             matched_key = key
             break
 
     if stat_value is None:
         keys_tried = stat_keys
-        return JSONResponse(status_code=200, content={
-            "found":                  True,
-            "player":                 player_name,
-            "outcome":                "pending",
-            "settled":                False,
-            "espn_limitation":        True,
-            "espn_limitation_reason": (
-                f"ESPN data for {player_name} in this game does not include "
-                f"the stat needed for '{market_norm}' "
-                f"(keys tried: {keys_tried}). "
-                "This stat may not be tracked by ESPN for this sport/game, "
-                "or the player's stats were not reported for this fixture."
-            ),
-            "requested_market":       market_norm,
-            "espn_stat_keys_tried":   keys_tried,
-            "espn_available_stats":   available_keys,
-            "espn_supported_markets": SUPPORTED_PROP_MARKETS,
-        })
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": True,
+                "player": player_name,
+                "outcome": "pending",
+                "settled": False,
+                "espn_limitation": True,
+                "espn_limitation_reason": (
+                    f"ESPN data for {player_name} in this game does not include "
+                    f"the stat needed for '{market_norm}' "
+                    f"(keys tried: {keys_tried}). "
+                    "This stat may not be tracked by ESPN for this sport/game, "
+                    "or the player's stats were not reported for this fixture."
+                ),
+                "requested_market": market_norm,
+                "espn_stat_keys_tried": keys_tried,
+                "espn_available_stats": available_keys,
+                "espn_supported_markets": SUPPORTED_PROP_MARKETS,
+            },
+        )
 
     # ── 9. Evaluate over/under ──────────────────────────────────────────────
     if not game_settled:
         outcome = "pending"
         settled = False
     elif stat_value > line:
-        outcome = "win"   if pick_norm == "over"  else "loss"
+        outcome = "win" if pick_norm == "over" else "loss"
         settled = True
     elif stat_value < line:
-        outcome = "win"   if pick_norm == "under" else "loss"
+        outcome = "win" if pick_norm == "under" else "loss"
         settled = True
     else:
         outcome = "push"
         settled = True
 
-    return JSONResponse(status_code=200, content={
-        "found":         True,
-        "player":        player_name,
-        "market":        market_norm,
-        "pick":          pick_norm,
-        "line":          line,
-        "stat_key":      matched_key,
-        "stat_value":    stat_value,
-        "outcome":       outcome,
-        "settled":       settled,
-        "source":        event.get("source", "historical"),
-        "game_status":   game_status,
-        "event_id":      resolved_event_id,
-        "espn_limitation": False,
-    })
+    return JSONResponse(
+        status_code=200,
+        content={
+            "found": True,
+            "player": player_name,
+            "market": market_norm,
+            "pick": pick_norm,
+            "line": line,
+            "stat_key": matched_key,
+            "stat_value": stat_value,
+            "outcome": outcome,
+            "settled": settled,
+            "source": event.get("source", "historical"),
+            "game_status": game_status,
+            "event_id": resolved_event_id,
+            "espn_limitation": False,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
