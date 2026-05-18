@@ -1986,6 +1986,11 @@ PROP_STAT_MAP: dict[str, list[str]] = {
     "player_strikeouts": ["K"],
     "player_earned_runs": ["ER"],
     # Settled via MLB Period Props (inning-by-inning and period-based markets)
+    "moneyline": ["_PERIOD_PROPS"],  # sentinel
+    "run_line": ["_PERIOD_PROPS"],  # sentinel
+    "team_total": ["_PERIOD_PROPS"],  # sentinel
+    "total_runs": ["_PERIOD_PROPS"],  # sentinel
+    "total_runs_odd_even": ["_PERIOD_PROPS"],  # sentinel
     "player_bases": ["_PERIOD_PROPS"],  # sentinel
     "player_singles": ["_PERIOD_PROPS"],  # sentinel
     # ── Cricket ─────────────────────────────────────────────────────────────

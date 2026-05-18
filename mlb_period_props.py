@@ -64,6 +64,12 @@ PERIOD_PROP_STAT_MAP: dict[str, tuple] = {
     "1st_half_run_line": ((0, 4), "run_line"),
     # Period team totals
     "1st_half_team_total": ((0, 4), "team_total"),
+    # Full-game markets
+    "total_runs": ("game", "total_runs"),
+    "total_runs_odd_even": ("game", "odd_even"),
+    "moneyline": ("game", "moneyline"),
+    "run_line": ("game", "run_line"),
+    "team_total": ("game", "team_total"),
     # Player-level extensions
     "player_bases": (None, "player_bases"),  # total bases
     "player_singles": (None, "player_singles"),
@@ -169,6 +175,13 @@ def _extract_inning_runs(
         home_runs += inning.get("home", {}).get("runs", 0) or 0
         away_runs += inning.get("away", {}).get("runs", 0) or 0
     return home_runs, away_runs
+
+
+def _extract_game_runs(innings: list) -> tuple[int, int]:
+    """Extract full-game runs by summing all available innings in the feed."""
+    if not innings:
+        return 0, 0
+    return _extract_inning_runs(innings, (0, len(innings) - 1))
 
 
 def _is_odd(n: int) -> bool:
@@ -293,7 +306,10 @@ def prop_check(
 
     if market_type == "total_runs":
         # Return total runs in the inning(s)
-        home_runs, away_runs = _extract_inning_runs(innings, inning_range)
+        if inning_range == "game":
+            home_runs, away_runs = _extract_game_runs(innings)
+        else:
+            home_runs, away_runs = _extract_inning_runs(innings, inning_range)
         total = home_runs + away_runs
 
         return {
@@ -307,7 +323,10 @@ def prop_check(
 
     elif market_type == "odd_even":
         # Return 1 if odd, 0 if even
-        home_runs, away_runs = _extract_inning_runs(innings, inning_range)
+        if inning_range == "game":
+            home_runs, away_runs = _extract_game_runs(innings)
+        else:
+            home_runs, away_runs = _extract_inning_runs(innings, inning_range)
         total = home_runs + away_runs
         result = 1 if _is_odd(total) else 0
 
@@ -322,7 +341,10 @@ def prop_check(
 
     elif market_type == "moneyline":
         # Return home win prob (> 0.5 if home ahead, < 0.5 if away ahead)
-        home_runs, away_runs = _extract_inning_runs(innings, inning_range)
+        if inning_range == "game":
+            home_runs, away_runs = _extract_game_runs(innings)
+        else:
+            home_runs, away_runs = _extract_inning_runs(innings, inning_range)
 
         if home_runs > away_runs:
             result = 1.0  # home won the period
@@ -342,7 +364,10 @@ def prop_check(
 
     elif market_type == "run_line":
         # Return run differential (home - away)
-        home_runs, away_runs = _extract_inning_runs(innings, inning_range)
+        if inning_range == "game":
+            home_runs, away_runs = _extract_game_runs(innings)
+        else:
+            home_runs, away_runs = _extract_inning_runs(innings, inning_range)
         diff = home_runs - away_runs
 
         return {
@@ -356,7 +381,10 @@ def prop_check(
 
     elif market_type == "team_total":
         # Return runs for the specified team in the period
-        home_runs, away_runs = _extract_inning_runs(innings, inning_range)
+        if inning_range == "game":
+            home_runs, away_runs = _extract_game_runs(innings)
+        else:
+            home_runs, away_runs = _extract_inning_runs(innings, inning_range)
 
         # Determine which team to return
         team_side = None
