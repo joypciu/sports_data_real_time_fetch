@@ -1157,14 +1157,21 @@ def stats_market_check(
     pick_norm = pick.strip().lower()
     import mlb_period_props as _mlb_period
 
-    mlb_entry = _mlb_period.PERIOD_PROP_STAT_MAP.get(market_norm)
+    # Backward-compatible aliases used by bet-tracking API naming.
+    mlb_aliases: dict[str, str] = {
+        "1st_5_innings_moneyline": "1st_half_moneyline",
+        "1st_5_innings_total": "1st_half_total_runs",
+        "1st_5_innings_team_total": "1st_half_team_total",
+    }
+    market_norm_mlb = mlb_aliases.get(market_norm, market_norm)
+
+    mlb_entry = _mlb_period.PERIOD_PROP_STAT_MAP.get(market_norm_mlb)
     mlb_inning_range = mlb_entry[0] if mlb_entry else None
     mlb_market_type = mlb_entry[1] if mlb_entry else None
     event_sport = _normalize_text(str(event.get("sport") or ""))
-    # Route ONLY baseball period markets here (tuple inning range).
-    # Do not hijack full-game markets (moneyline/run_line/total/team_total)
-    # or player props (handled by /stats/prop-check).
-    if event_sport == "baseball" and (isinstance(mlb_inning_range, tuple) or market_norm in {"team_total", "total_runs_odd_even"}):
+    # MLB-first routing: for baseball, always prefer mlb_period_props when market is known there.
+    # Player props are handled in /stats/prop-check and will not reach this endpoint.
+    if event_sport == "baseball" and mlb_entry is not None:
         if not date:
             raise HTTPException(
                 status_code=400,
@@ -1172,7 +1179,7 @@ def stats_market_check(
             )
         result = _mlb_period.prop_check(
             player=None,  # period markets don't have players
-            market=market_norm,
+            market=market_norm_mlb,
             game_date=_date_only(date),
             team=team,
             pick=pick,
