@@ -7,7 +7,7 @@ Handles:
   - Inning totals (1st-9th inning total runs + odd/even)
   - Period totals (1st 3, 1st 7, 1st half)
   - Period moneylines and run lines
-  - Player bases and singles (enhanced)
+    - MLB batting props from Baseball Savant boxscore data
   - Team totals by period
 
 Data sources:
@@ -71,8 +71,13 @@ PERIOD_PROP_STAT_MAP: dict[str, tuple] = {
     "run_line": ("game", "run_line"),
     "team_total": ("game", "team_total"),
     # Player-level extensions
+    "player_runs": (None, "player_runs"),
+    "player_home_runs": (None, "player_home_runs"),
+    "player_doubles": (None, "player_doubles"),
+    "player_triples": (None, "player_triples"),
     "player_bases": (None, "player_bases"),  # total bases
     "player_singles": (None, "player_singles"),
+    "player_hits_runs_rbis": (None, "player_hits_runs_rbis"),
 }
 
 
@@ -191,7 +196,7 @@ def _is_odd(n: int) -> bool:
 def _collect_hitters(boxscore: dict) -> dict[str, dict]:
     """
     Walk boxscore.teams hitters (from gf["boxscore"]).
-    Returns {fullName: {"hits": X, "total_bases": Y, "singles": Z}}.
+    Returns {fullName: batting-stat dict}.
     Baseball Savant boxscore includes totalBases directly, so no calculation needed.
     """
     hitters: dict[str, dict] = {}
@@ -209,12 +214,17 @@ def _collect_hitters(boxscore: dict) -> dict[str, dict]:
             home_runs = batting.get("homeRuns", 0) or 0
             total_bases = batting.get("totalBases", 0) or 0  # direct field in Savant
             singles = max(0, hits - doubles - triples - home_runs)
-            if hits > 0 or total_bases > 0:
-                hitters[full_name] = {
-                    "hits": hits,
-                    "total_bases": total_bases,
-                    "singles": singles,
-                }
+            hitters[full_name] = {
+                "runs": batting.get("runs", 0) or 0,
+                "hits": hits,
+                "rbis": batting.get("rbi", 0) or 0,
+                "total_bases": total_bases,
+                "singles": singles,
+                "home_runs": home_runs,
+                "doubles": doubles,
+                "triples": triples,
+                "hits_runs_rbis": (hits + (batting.get("runs", 0) or 0) + (batting.get("rbi", 0) or 0)),
+            }
     return hitters
 
 
@@ -234,6 +244,17 @@ def _match_player(player_name: str, candidates: dict[str, Any]) -> Optional[str]
             return name
 
     return None
+
+
+_PLAYER_PROP_FIELDS: dict[str, str] = {
+    "player_runs": "runs",
+    "player_home_runs": "home_runs",
+    "player_doubles": "doubles",
+    "player_triples": "triples",
+    "player_bases": "total_bases",
+    "player_singles": "singles",
+    "player_hits_runs_rbis": "hits_runs_rbis",
+}
 
 
 def prop_check(
@@ -289,6 +310,8 @@ def prop_check(
             "found": False,
             "game_pk": game_pk,
             "game_status": game_status,
+            "home_score": None,
+            "away_score": None,
             "settled": settled,
             "note": f"Baseball Savant /gf fetch failed: {exc}",
             "source": "mlb_period_props",
@@ -296,6 +319,9 @@ def prop_check(
 
     innings = gf.get("scoreboard", {}).get("linescore", {}).get("innings", [])
     boxscore = gf.get("boxscore", {})
+
+    # Extract final game score
+    home_score, away_score = _extract_game_runs(innings)
 
     # Refine settled status from Savant (more reliable than schedule)
     if gf.get("game_status_code") == "F":
@@ -317,6 +343,8 @@ def prop_check(
             "stat_value": total,
             "game_pk": game_pk,
             "game_status": game_status,
+            "home_score": home_score,
+            "away_score": away_score,
             "settled": settled,
             "source": "mlb_period_props",
         }
@@ -335,6 +363,8 @@ def prop_check(
             "stat_value": result,  # 1 = odd, 0 = even
             "game_pk": game_pk,
             "game_status": game_status,
+            "home_score": home_score,
+            "away_score": away_score,
             "settled": settled,
             "source": "mlb_period_props",
         }
@@ -358,6 +388,8 @@ def prop_check(
             "stat_value": result,
             "game_pk": game_pk,
             "game_status": game_status,
+            "home_score": home_score,
+            "away_score": away_score,
             "settled": settled,
             "source": "mlb_period_props",
         }
@@ -375,6 +407,8 @@ def prop_check(
             "stat_value": diff,
             "game_pk": game_pk,
             "game_status": game_status,
+            "home_score": home_score,
+            "away_score": away_score,
             "settled": settled,
             "source": "mlb_period_props",
         }
@@ -412,6 +446,8 @@ def prop_check(
                 "found": False,
                 "game_pk": game_pk,
                 "game_status": game_status,
+                "home_score": home_score,
+                "away_score": away_score,
                 "settled": settled,
                 "note": f"Could not determine team side for team={team!r}",
                 "source": "mlb_period_props",
@@ -422,18 +458,22 @@ def prop_check(
             "stat_value": result,
             "game_pk": game_pk,
             "game_status": game_status,
+            "home_score": home_score,
+            "away_score": away_score,
             "settled": settled,
             "source": "mlb_period_props",
         }
 
-    elif market_type == "player_bases":
-        # Total bases for a player
+    elif market_type in _PLAYER_PROP_FIELDS:
+        # Batter props for a player (runs, home runs, doubles, triples, bases, singles)
         hitters = _collect_hitters(boxscore)
         if not hitters:
             return {
                 "found": False,
                 "game_pk": game_pk,
                 "game_status": game_status,
+                "home_score": home_score,
+                "away_score": away_score,
                 "settled": settled,
                 "note": "No hitter data in boxscore yet.",
                 "source": "mlb_period_props",
@@ -445,55 +485,23 @@ def prop_check(
                 "found": False,
                 "game_pk": game_pk,
                 "game_status": game_status,
+                "home_score": home_score,
+                "away_score": away_score,
                 "settled": settled,
                 "note": f"Player '{player}' not found in hitter stats.",
                 "available_hitters": list(hitters.keys()),
                 "source": "mlb_period_props",
             }
 
-        stat_value = hitters[matched]["total_bases"]
+        stat_value = hitters[matched][_PLAYER_PROP_FIELDS[market_type]]
         return {
             "found": True,
             "player": matched,
             "stat_value": stat_value,
             "game_pk": game_pk,
             "game_status": game_status,
-            "settled": settled,
-            "source": "mlb_period_props",
-        }
-
-    elif market_type == "player_singles":
-        # Singles for a player
-        hitters = _collect_hitters(boxscore)
-        if not hitters:
-            return {
-                "found": False,
-                "game_pk": game_pk,
-                "game_status": game_status,
-                "settled": settled,
-                "note": "No hitter data in boxscore yet.",
-                "source": "mlb_period_props",
-            }
-
-        matched = _match_player(player, hitters)
-        if matched is None:
-            return {
-                "found": False,
-                "game_pk": game_pk,
-                "game_status": game_status,
-                "settled": settled,
-                "note": f"Player '{player}' not found in hitter stats.",
-                "available_hitters": list(hitters.keys()),
-                "source": "mlb_period_props",
-            }
-
-        stat_value = hitters[matched]["singles"]
-        return {
-            "found": True,
-            "player": matched,
-            "stat_value": stat_value,
-            "game_pk": game_pk,
-            "game_status": game_status,
+            "home_score": home_score,
+            "away_score": away_score,
             "settled": settled,
             "source": "mlb_period_props",
         }
