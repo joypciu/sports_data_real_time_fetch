@@ -1156,7 +1156,13 @@ def stats_market_check(
     market_norm = market.strip().lower().replace(" ", "_")
     import mlb_period_props as _mlb_period
 
-    if market_norm in _mlb_period.PERIOD_PROP_STAT_MAP:
+    mlb_entry = _mlb_period.PERIOD_PROP_STAT_MAP.get(market_norm)
+    mlb_inning_range = mlb_entry[0] if mlb_entry else None
+    event_sport = _normalize_text(str(event.get("sport") or ""))
+    # Route ONLY baseball period markets here (tuple inning range).
+    # Do not hijack full-game markets (moneyline/run_line/total/team_total)
+    # or player props (handled by /stats/prop-check).
+    if event_sport == "baseball" and isinstance(mlb_inning_range, tuple):
         if not date:
             raise HTTPException(
                 status_code=400,
@@ -1186,6 +1192,7 @@ def stats_market_check(
         stat_value = result["stat_value"]
         settled = result["settled"]
         # Evaluate moneyline/run_line based on stat_value
+        result_bool: bool | None = None
         if market_norm in ("moneyline", "1st_inning_moneyline", "1st_half_moneyline", "2nd_half_moneyline", "3rd_period_moneyline", "4th_quarter_moneyline"):
             # stat_value is 0.0 (away), 0.5 (tie), or 1.0 (home)
             # pick is team name or "home"/"away"
@@ -1196,6 +1203,10 @@ def stats_market_check(
                 outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
             else:
                 outcome = "pending"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
         elif market_norm in ("run_line", "1st_inning_run_line", "1st_half_run_line"):
             # stat_value is run differential (home - away), compare to line
             if line is None:
@@ -1206,6 +1217,10 @@ def stats_market_check(
                 outcome = "loss"
             else:
                 outcome = "push"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
         else:
             # total_runs, odd/even, team_total - for now default to pending
             outcome = "pending"
@@ -1218,6 +1233,7 @@ def stats_market_check(
                 "market": market_norm,
                 "pick": pick,
                 "line": line,
+                "result": result_bool,
                 "stat_value": stat_value,
                 "outcome": outcome,
                 "settled": settled,
