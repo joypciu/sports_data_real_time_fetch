@@ -1152,6 +1152,99 @@ def stats_market_check(
             },
         )
 
+    # ── Check if this is an MLB period market ────────────────────────────
+    market_norm = market.strip().lower().replace(" ", "_")
+    import mlb_period_props as _mlb_period
+
+    mlb_entry = _mlb_period.PERIOD_PROP_STAT_MAP.get(market_norm)
+    mlb_inning_range = mlb_entry[0] if mlb_entry else None
+    event_sport = _normalize_text(str(event.get("sport") or ""))
+    # Route ONLY baseball period markets here (tuple inning range).
+    # Do not hijack full-game markets (moneyline/run_line/total/team_total)
+    # or player props (handled by /stats/prop-check).
+    if event_sport == "baseball" and isinstance(mlb_inning_range, tuple):
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to resolve MLB period market.",
+            )
+        result = _mlb_period.prop_check(
+            player=None,  # period markets don't have players
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team,
+            pick=pick,
+            line=line,
+        )
+        if not result.get("found"):
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": False,
+                    "outcome": "pending",
+                    "settled": False,
+                    "source": "mlb_period_props",
+                    "note": result.get("note", "MLB Period Props lookup did not find data."),
+                    "game_pk": result.get("game_pk"),
+                    "game_status": result.get("game_status"),
+                },
+            )
+        stat_value = result["stat_value"]
+        settled = result["settled"]
+        # Evaluate moneyline/run_line based on stat_value
+        result_bool: bool | None = None
+        if market_norm in ("moneyline", "1st_inning_moneyline", "1st_half_moneyline", "2nd_half_moneyline", "3rd_period_moneyline", "4th_quarter_moneyline"):
+            # stat_value is 0.0 (away), 0.5 (tie), or 1.0 (home)
+            # pick is team name or "home"/"away"
+            side = _resolve_pick_side(pick, event)
+            if side == "home":
+                outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
+            elif side == "away":
+                outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
+            else:
+                outcome = "pending"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
+        elif market_norm in ("run_line", "1st_inning_run_line", "1st_half_run_line"):
+            # stat_value is run differential (home - away), compare to line
+            if line is None:
+                line = -1.5  # default run line
+            if stat_value > line:
+                outcome = "win"
+            elif stat_value < line:
+                outcome = "loss"
+            else:
+                outcome = "push"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
+        else:
+            # total_runs, odd/even, team_total - for now default to pending
+            outcome = "pending"
+            settled = False
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": True,
+                "market": market_norm,
+                "pick": pick,
+                "line": line,
+                "result": result_bool,
+                "stat_value": stat_value,
+                "outcome": outcome,
+                "settled": settled,
+                "source": "mlb_period_props",
+                "game_pk": result["game_pk"],
+                "game_status": result["game_status"],
+                "home_score": result.get("home_score"),
+                "away_score": result.get("away_score"),
+            },
+        )
+
     return JSONResponse(_evaluate_market(event, market, pick, line))
 
 
@@ -2039,7 +2132,15 @@ ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset(
     }
 )
 
-SUPPORTED_PROP_MARKETS: list[str] = sorted(PROP_STAT_MAP.keys())
+SUPPORTED_PROP_MARKETS: list[str] = sorted(
+    set(list(PROP_STAT_MAP.keys()) + [
+        "player_runs",
+        "player_home_runs",
+        "player_doubles",
+        "player_triples",
+        "player_hits_runs_rbis",
+    ])
+)
 
 
 def _extract_stat_value(raw: Any, stat_key: str) -> float | None:
@@ -2182,6 +2283,8 @@ def stats_prop_check(
                 "source": "mlb_period_props",
                 "game_pk": result["game_pk"],
                 "game_status": result["game_status"],
+                "home_score": result.get("home_score"),
+                "away_score": result.get("away_score"),
                 "espn_limitation": False,
             },
         )
