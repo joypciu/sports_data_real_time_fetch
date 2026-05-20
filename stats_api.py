@@ -1132,6 +1132,141 @@ def stats_market_check(
     if date and _date_only(date) is None:
         raise HTTPException(status_code=400, detail="date must be in YYYY-MM-DD format")
 
+    # ── Early MLB detection before event resolution ───────────────────────
+    market_norm = market.strip().lower().replace(" ", "_")
+    pick_norm = pick.strip().lower()
+    import mlb_period_props as _mlb_period
+
+    # Backward-compatible aliases used by bet-tracking API naming.
+    mlb_aliases: dict[str, str] = {
+        "1st_5_innings_moneyline": "1st_half_moneyline",
+        "1st_5_innings_total": "1st_half_total_runs",
+        "1st_5_innings_team_total": "1st_half_team_total",
+    }
+    market_norm_mlb = mlb_aliases.get(market_norm, market_norm)
+
+    mlb_entry = _mlb_period.PERIOD_PROP_STAT_MAP.get(market_norm_mlb)
+    mlb_inning_range = mlb_entry[0] if mlb_entry else None
+    mlb_market_type = mlb_entry[1] if mlb_entry else None
+    sport_norm = _normalize_text(sport or "")
+
+    # For baseball + known MLB market: try MLB period props first (has own game lookup).
+    # Only fall back to event resolution if MLB returns not found.
+    if sport_norm == "baseball" and mlb_entry is not None:
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to resolve MLB period market.",
+            )
+        result = _mlb_period.prop_check(
+            player=None,  # period markets don't have players
+            market=market_norm_mlb,
+            game_date=_date_only(date),
+            team=team,
+            pick=pick,
+            line=line,
+        )
+        if result.get("found"):
+            # MLB found and settled the market — process it
+            stat_value = result["stat_value"]
+            settled = result["settled"]
+            event = {}  # Minimal event for pick-side resolution if needed
+            # Evaluate using resolved MLB market type from mlb_period_props
+            result_bool: bool | None = None
+            if mlb_market_type == "moneyline":
+                # stat_value is 0.0 (away), 0.5 (tie), or 1.0 (home)
+                # pick is team name or "home"/"away"
+                side = _resolve_pick_side(pick, event or {})
+                if side == "home":
+                    outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
+                elif side == "away":
+                    outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
+                else:
+                    outcome = "pending"
+                if outcome == "win":
+                    result_bool = True
+                elif outcome == "loss":
+                    result_bool = False
+            elif mlb_market_type == "run_line":
+                # stat_value is run differential (home - away), compare to line
+                if line is None:
+                    line = -1.5  # default run line
+                if stat_value > line:
+                    outcome = "win"
+                elif stat_value < line:
+                    outcome = "loss"
+                else:
+                    outcome = "push"
+                if outcome == "win":
+                    result_bool = True
+                elif outcome == "loss":
+                    result_bool = False
+            elif mlb_market_type in {"total_runs", "team_total"}:
+                # stat_value is a run count; compare to provided over/under line
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                if outcome == "win":
+                    result_bool = True
+                elif outcome == "loss":
+                    result_bool = False
+            elif mlb_market_type == "odd_even":
+                # stat_value is 1 for odd, 0 for even
+                pick_oe = pick_norm
+                if pick_oe in {"over", "under"}:
+                    pick_oe = "odd" if pick_oe == "over" else "even"
+                if pick_oe not in {"odd", "even"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be odd/even for market '{market_norm}'",
+                    )
+                is_odd = bool(stat_value)
+                if is_odd and pick_oe == "odd":
+                    outcome = "win"
+                elif (not is_odd) and pick_oe == "even":
+                    outcome = "win"
+                else:
+                    outcome = "loss"
+                result_bool = outcome == "win"
+            else:
+                # Unknown MLB market type in this endpoint
+                outcome = "pending"
+                settled = False
+            
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "market": market_norm,
+                    "pick": pick,
+                    "line": line,
+                    "result": result_bool,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": "mlb_period_props",
+                    "game_pk": result["game_pk"],
+                    "game_status": result["game_status"],
+                    "home_score": result.get("home_score"),
+                    "away_score": result.get("away_score"),
+                },
+            )
+        # MLB market not found — fall through to normal event resolution below
+
+    # ── Normal event resolution for non-MLB or MLB not found ─────────────────
     event = _resolve_event(event_id, _date_only(date), sport, team, opponent)
     if event is None:
         return JSONResponse(
@@ -1152,147 +1287,6 @@ def stats_market_check(
             },
         )
 
-    # ── Check if this is an MLB period market ────────────────────────────
-    market_norm = market.strip().lower().replace(" ", "_")
-    pick_norm = pick.strip().lower()
-    import mlb_period_props as _mlb_period
-
-    # Backward-compatible aliases used by bet-tracking API naming.
-    mlb_aliases: dict[str, str] = {
-        "1st_5_innings_moneyline": "1st_half_moneyline",
-        "1st_5_innings_total": "1st_half_total_runs",
-        "1st_5_innings_team_total": "1st_half_team_total",
-    }
-    market_norm_mlb = mlb_aliases.get(market_norm, market_norm)
-
-    mlb_entry = _mlb_period.PERIOD_PROP_STAT_MAP.get(market_norm_mlb)
-    mlb_inning_range = mlb_entry[0] if mlb_entry else None
-    mlb_market_type = mlb_entry[1] if mlb_entry else None
-    event_sport = _normalize_text(str(event.get("sport") or ""))
-    # MLB-first routing: for baseball, always prefer mlb_period_props when market is known there.
-    # Player props are handled in /stats/prop-check and will not reach this endpoint.
-    if event_sport == "baseball" and mlb_entry is not None:
-        if not date:
-            raise HTTPException(
-                status_code=400,
-                detail="Provide date (YYYY-MM-DD) to resolve MLB period market.",
-            )
-        result = _mlb_period.prop_check(
-            player=None,  # period markets don't have players
-            market=market_norm_mlb,
-            game_date=_date_only(date),
-            team=team,
-            pick=pick,
-            line=line,
-        )
-        if not result.get("found"):
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "found": False,
-                    "outcome": "pending",
-                    "settled": False,
-                    "source": "mlb_period_props",
-                    "note": result.get("note", "MLB Period Props lookup did not find data."),
-                    "game_pk": result.get("game_pk"),
-                    "game_status": result.get("game_status"),
-                },
-            )
-        stat_value = result["stat_value"]
-        settled = result["settled"]
-        # Evaluate using resolved MLB market type from mlb_period_props
-        result_bool: bool | None = None
-        if mlb_market_type == "moneyline":
-            # stat_value is 0.0 (away), 0.5 (tie), or 1.0 (home)
-            # pick is team name or "home"/"away"
-            side = _resolve_pick_side(pick, event)
-            if side == "home":
-                outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
-            elif side == "away":
-                outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
-            else:
-                outcome = "pending"
-            if outcome == "win":
-                result_bool = True
-            elif outcome == "loss":
-                result_bool = False
-        elif mlb_market_type == "run_line":
-            # stat_value is run differential (home - away), compare to line
-            if line is None:
-                line = -1.5  # default run line
-            if stat_value > line:
-                outcome = "win"
-            elif stat_value < line:
-                outcome = "loss"
-            else:
-                outcome = "push"
-            if outcome == "win":
-                result_bool = True
-            elif outcome == "loss":
-                result_bool = False
-        elif mlb_market_type in {"total_runs", "team_total"}:
-            # stat_value is a run count; compare to provided over/under line
-            if line is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"line is required for market '{market_norm}'",
-                )
-            if pick_norm not in {"over", "under"}:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"pick must be over/under for market '{market_norm}'",
-                )
-            if stat_value > line:
-                outcome = "win" if pick_norm == "over" else "loss"
-            elif stat_value < line:
-                outcome = "win" if pick_norm == "under" else "loss"
-            else:
-                outcome = "push"
-            if outcome == "win":
-                result_bool = True
-            elif outcome == "loss":
-                result_bool = False
-        elif mlb_market_type == "odd_even":
-            # stat_value is 1 for odd, 0 for even
-            pick_oe = pick_norm
-            if pick_oe in {"over", "under"}:
-                pick_oe = "odd" if pick_oe == "over" else "even"
-            if pick_oe not in {"odd", "even"}:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"pick must be odd/even for market '{market_norm}'",
-                )
-            is_odd = bool(stat_value)
-            if is_odd and pick_oe == "odd":
-                outcome = "win"
-            elif (not is_odd) and pick_oe == "even":
-                outcome = "win"
-            else:
-                outcome = "loss"
-            result_bool = outcome == "win"
-        else:
-            # Unknown MLB market type in this endpoint
-            outcome = "pending"
-            settled = False
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "found": True,
-                "market": market_norm,
-                "pick": pick,
-                "line": line,
-                "result": result_bool,
-                "stat_value": stat_value,
-                "outcome": outcome,
-                "settled": settled,
-                "source": "mlb_period_props",
-                "game_pk": result["game_pk"],
-                "game_status": result["game_status"],
-                "home_score": result.get("home_score"),
-                "away_score": result.get("away_score"),
-            },
-        )
 
     return JSONResponse(_evaluate_market(event, market, pick, line))
 
@@ -2188,6 +2182,7 @@ SUPPORTED_PROP_MARKETS: list[str] = sorted(
         "player_doubles",
         "player_triples",
         "player_hits_runs_rbis",
+        "player_outs",
     ])
 )
 
