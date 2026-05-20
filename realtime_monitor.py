@@ -59,6 +59,7 @@ EXTERNAL_REFRESH_EVERY = 2  # every 2nd poll cycle (~60s at 30s interval)
 
 LEAGUES: dict[str, tuple[str, str]] = {
     "nba":        ("basketball",  "nba"),
+    "wnba":       ("basketball",  "wnba"),
     "ncaab":      ("basketball",  "mens-college-basketball"),
     "nhl":        ("hockey",      "nhl"),
     "nfl":        ("football",    "nfl"),
@@ -97,6 +98,7 @@ INJURY_REFRESH_EVERY = 20  # every 20th poll cycle (~10 min at 30s interval)
 # Sports/leagues to fetch injuries for (team-based sports only)
 INJURY_LEAGUES: list[tuple[str, str, str]] = [
     ("basketball", "nba",             "nba"),
+    ("basketball", "wnba",            "wnba"),
     ("hockey",     "nhl",             "nhl"),
     ("baseball",   "mlb",             "mlb"),
     ("soccer",     "eng.1",           "epl"),

@@ -38,6 +38,7 @@ CORE_API_BASE = "https://sports.core.api.espn.com"
 LEAGUES: dict[str, tuple[str, str]] = {
     # ---- Basketball -------------------------------------------------------
     "nba":         ("basketball", "nba"),
+    "wnba":        ("basketball", "wnba"),
     "ncaab":       ("basketball", "mens-college-basketball"),
     # ---- Hockey ------------------------------------------------------------
     "nhl":         ("hockey",     "nhl"),
