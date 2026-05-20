@@ -5,6 +5,7 @@ Thin client for the official MLB Stats API (statsapi.mlb.com).
 Settles MLB prop bets not available in ESPN data:
   - player_strikeouts  (pitching.strikeOuts)
   - player_earned_runs (pitching.earnedRuns)
+    - player_outs        (pitching.outs)
 
 No API key required.
 Called by stats_api.py when market is in MLB_PROP_STAT_MAP.
@@ -27,6 +28,7 @@ _TIMEOUT = 2.5  # sports_bridge gives stats_api 3s total; MLB call must finish f
 MLB_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
     "player_strikeouts":  ("pitching", "strikeOuts"),
     "player_earned_runs": ("pitching", "earnedRuns"),
+    "player_outs":        ("pitching", "outs"),
 }
 
 

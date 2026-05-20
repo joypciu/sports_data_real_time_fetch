@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import httpx
@@ -98,25 +99,24 @@ def find_game(
     on game_date (YYYY-MM-DD), optionally narrowed by team name substring.
     Uses statsapi.mlb.com schedule endpoint (reliable, no User-Agent required).
     """
-    try:
-        data = _get(
-            f"{_SCHEDULE_BASE}/schedule",
-            params={
-                "sportId": 1,
-                "date": game_date,
-                "gameType": "R",
-            },
-        )
-    except Exception as exc:
-        _log.warning("mlb schedule fetch failed: %s", exc)
-        return None
+    def _schedule_games(day: str) -> list[dict[str, Any]]:
+        try:
+            data = _get(
+                f"{_SCHEDULE_BASE}/schedule",
+                params={
+                    "sportId": 1,
+                    "date": day,
+                    "gameType": "R",
+                },
+            )
+        except Exception as exc:
+            _log.warning("mlb schedule fetch failed for %s: %s", day, exc)
+            return []
 
-    games: list[dict] = []
-    for date_entry in data.get("dates", []):
-        games.extend(date_entry.get("games", []))
-
-    if not games:
-        return None
+        games_out: list[dict[str, Any]] = []
+        for date_entry in data.get("dates", []):
+            games_out.extend(date_entry.get("games", []))
+        return games_out
 
     def _game_info(g: dict) -> dict:
         return {
@@ -124,32 +124,84 @@ def find_game(
             "status": g.get("status", {}).get("abstractGameState", "unknown"),
         }
 
-    if team_name:
-        name_lower = team_name.lower()
-        for g in games:
-            home = (
-                g.get("teams", {})
-                .get("home", {})
-                .get("team", {})
-                .get("name", "")
-                .lower()
-            )
-            away = (
-                g.get("teams", {})
-                .get("away", {})
-                .get("team", {})
-                .get("name", "")
-                .lower()
-            )
-            if (
-                name_lower in home
-                or name_lower in away
-                or home in name_lower
-                or away in name_lower
-            ):
-                return _game_info(g)
+    def _status_rank(status: str) -> int:
+        norm = (status or "").strip().lower()
+        if norm == "final":
+            return 0
+        if norm == "live":
+            return 1
+        if norm == "preview":
+            return 2
+        return 3
 
-    return _game_info(games[0])
+    def _pick_best(games: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if not games:
+            return None
+
+        if team_name:
+            name_lower = team_name.lower()
+            matched: list[dict[str, Any]] = []
+            for g in games:
+                home = (
+                    g.get("teams", {})
+                    .get("home", {})
+                    .get("team", {})
+                    .get("name", "")
+                    .lower()
+                )
+                away = (
+                    g.get("teams", {})
+                    .get("away", {})
+                    .get("team", {})
+                    .get("name", "")
+                    .lower()
+                )
+                if (
+                    name_lower in home
+                    or name_lower in away
+                    or home in name_lower
+                    or away in name_lower
+                ):
+                    matched.append(g)
+
+            if matched:
+                matched.sort(
+                    key=lambda g: _status_rank(
+                        g.get("status", {}).get("abstractGameState", "unknown")
+                    )
+                )
+                return _game_info(matched[0])
+
+        ordered = sorted(
+            games,
+            key=lambda g: _status_rank(
+                g.get("status", {}).get("abstractGameState", "unknown")
+            ),
+        )
+        return _game_info(ordered[0])
+
+    games = _schedule_games(game_date)
+    best_today = _pick_best(games)
+    if best_today is None:
+        return None
+
+    # UTC rollover guard: if requested date only has preview/live for the team,
+    # also inspect previous MLB day and prefer a Final there when available.
+    today_status = str(best_today.get("status") or "")
+    if team_name and _status_rank(today_status) > _status_rank("Final"):
+        try:
+            prev_day = (
+                datetime.strptime(game_date, "%Y-%m-%d").date() - timedelta(days=1)
+            ).isoformat()
+        except ValueError:
+            prev_day = None
+
+        if prev_day:
+            prev_best = _pick_best(_schedule_games(prev_day))
+            if prev_best and _status_rank(str(prev_best.get("status") or "")) == _status_rank("Final"):
+                return prev_best
+
+    return best_today
 
 
 def _get_gf(game_pk: int) -> dict:
