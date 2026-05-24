@@ -1266,6 +1266,196 @@ def stats_market_check(
             )
         # MLB market not found — fall through to normal event resolution below
 
+    # ── Soccer market check via SofaScore ────────────────────────────────────
+    import soccer_sofascore_props as _sofa
+
+    sofa_entry = _sofa.SOCCER_PROP_STAT_MAP.get(market_norm)
+    if sport_norm == "soccer" and sofa_entry is not None:
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to settle soccer market via SofaScore.",
+            )
+
+        sofa_result = _sofa.prop_check(
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team,
+            opponent=opponent,
+            selection=pick,   # used for scorer/card markets
+            pick=pick_norm,
+            line=line,
+        )
+
+        if sofa_result.get("found"):
+            stat_value = sofa_result["stat_value"]
+            settled = sofa_result.get("settled", False)
+            _, sofa_market_type = sofa_entry
+            outcome = "pending"
+            result_bool: bool | None = None
+
+            # ----- evaluate stat_value against pick/line -----
+            if sofa_market_type == "spread":
+                # stat_value = home_goals - away_goals
+                mini_event = {
+                    "home_team": sofa_result.get("home_team", ""),
+                    "away_team": sofa_result.get("away_team", ""),
+                }
+                side = _resolve_pick_side(pick, mini_event)
+                if side not in {"home", "away"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="For spread, pick must be home, away, or a matching team name",
+                    )
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="line is required for spread market",
+                    )
+                home_s = sofa_result.get("home_score", 0) or 0
+                away_s = sofa_result.get("away_score", 0) or 0
+                adjusted = (home_s if side == "home" else away_s) + line
+                opponent = away_s if side == "home" else home_s
+                if adjusted > opponent:
+                    outcome, result_bool = "win", True
+                elif adjusted < opponent:
+                    outcome, result_bool = "loss", False
+                else:
+                    outcome, result_bool = "push", None
+
+            elif sofa_market_type in ("moneyline", "draw_bet"):
+                # stat_value: 1.0 home-win | 0.5 draw | 0.0 away-win
+                mini_event = {
+                    "home_team": sofa_result.get("home_team", ""),
+                    "away_team": sofa_result.get("away_team", ""),
+                }
+                if sofa_market_type == "draw_bet":
+                    # pick: "draw"/"yes" → bet on draw; any team name → bet on that side
+                    p = pick_norm
+                    if p in ("draw", "yes", "over"):
+                        result_bool = (stat_value == 0.5)
+                    elif p in ("no", "under"):
+                        result_bool = (stat_value != 0.5)
+                    else:
+                        side = _resolve_pick_side(pick, mini_event)
+                        if side == "home":
+                            result_bool = (stat_value == 1.0)
+                        elif side == "away":
+                            result_bool = (stat_value == 0.0)
+                        else:
+                            result_bool = None
+                else:
+                    side = _resolve_pick_side(pick, mini_event)
+                    if side == "home":
+                        result_bool = (stat_value == 1.0)
+                    elif side == "away":
+                        result_bool = (stat_value == 0.0)
+                    elif side == "draw":
+                        result_bool = (stat_value == 0.5)
+                    else:
+                        result_bool = None
+                if result_bool is True:
+                    outcome = "win"
+                elif result_bool is False:
+                    outcome = "loss"
+
+            elif sofa_market_type == "btts":
+                p = pick_norm
+                if p in ("yes", "over"):
+                    result_bool = bool(stat_value)
+                elif p in ("no", "under"):
+                    result_bool = not bool(stat_value)
+                else:
+                    result_bool = None
+                if result_bool is not None:
+                    outcome = "win" if result_bool else "loss"
+
+            elif sofa_market_type in ("total_goals", "total_corners", "team_total_goals", "team_total_corners"):
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            elif sofa_market_type == "asian_total_goals":
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                outcome = _sofa._evaluate_asian_total(stat_value, line, pick_norm)
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            elif sofa_market_type in ("odd_even_goals", "odd_even_corners"):
+                p = pick_norm
+                if p in ("odd", "over"):
+                    p = "odd"
+                elif p in ("even", "under"):
+                    p = "even"
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be odd/even for market '{market_norm}'",
+                    )
+                is_odd = bool(stat_value)
+                result_bool = (p == "odd") == is_odd
+                outcome = "win" if result_bool else "loss"
+
+            elif sofa_market_type == "goal_both_halves":
+                p = pick_norm
+                if p in ("yes", "over"):
+                    result_bool = bool(stat_value)
+                elif p in ("no", "under"):
+                    result_bool = not bool(stat_value)
+                else:
+                    result_bool = None
+                if result_bool is not None:
+                    outcome = "win" if result_bool else "loss"
+
+            elif sofa_market_type in (
+                "anytime_goal_scorer", "first_goal_scorer",
+                "last_goal_scorer", "anytime_card_receiver",
+            ):
+                result_bool = bool(stat_value)
+                outcome = "win" if result_bool else "loss"
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "market": market_norm,
+                    "pick": pick,
+                    "line": line,
+                    "result": result_bool,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": "sofascore",
+                    "match_id": sofa_result.get("match_id"),
+                    "game_status": sofa_result.get("game_status"),
+                    "home_score": sofa_result.get("home_score"),
+                    "away_score": sofa_result.get("away_score"),
+                },
+            )
+        # SofaScore match not found — fall through to Fotmob / DuckDB resolution
+
     # ── Normal event resolution for non-MLB or MLB not found ─────────────────
     event = _resolve_event(event_id, _date_only(date), sport, team, opponent)
     if event is None:
