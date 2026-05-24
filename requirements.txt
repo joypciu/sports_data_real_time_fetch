@@ -1,5 +1,6 @@
 # Core data fetch & enrichment
 httpx
+curl_cffi          # Cloudflare-bypass HTTP client (used by soccer_sofascore_props)
 
 # Database
 duckdb
