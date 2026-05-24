@@ -282,13 +282,23 @@ def _matchup_matches(
     ) or _team_matches(single, event.get("away_team"), event.get("away_abbr"))
 
 
+_SPREAD_PICK_RE = re.compile(r"^(?P<team>.+?)\s+(?P<spread>[+-]?\d+(?:\.\d+)?)$")
+
+
+def _strip_spread_from_pick(pick: str) -> str:
+    """Return team-only portion of picks like 'NYK +1.5' or 'Cleveland Cavaliers -3.5'."""
+    m = _SPREAD_PICK_RE.match(pick.strip())
+    return m.group("team").strip() if m else pick.strip()
+
+
 def _resolve_pick_side(pick: str, event: dict[str, Any]) -> str | None:
-    pick_norm = _normalize_text(pick)
+    pick_clean = _strip_spread_from_pick(pick)
+    pick_norm = _normalize_text(pick_clean)
     if pick_norm in {"home", "away", "draw", "tie"}:
         return "draw" if pick_norm == "tie" else pick_norm
-    if _team_matches(pick, event.get("home_team"), event.get("home_abbr")):
+    if _team_matches(pick_clean, event.get("home_team"), event.get("home_abbr")):
         return "home"
-    if _team_matches(pick, event.get("away_team"), event.get("away_abbr")):
+    if _team_matches(pick_clean, event.get("away_team"), event.get("away_abbr")):
         return "away"
     return None
 
@@ -2624,6 +2634,7 @@ PROP_MARKET_ALIASES: dict[str, str] = {
 # Composite markets whose value is the sum of multiple box-score keys.
 COMPOSITE_PROP_MAP: dict[str, list[str]] = {
     "player_rebounds_assists": ["REB", "AST"],
+    "player_points_assists": ["PTS", "AST"],
     "player_points_rebounds_assists": ["PTS", "REB", "AST"],
 }
 
