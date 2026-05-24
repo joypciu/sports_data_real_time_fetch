@@ -410,6 +410,10 @@ def _live_event_candidates(
                     "away_abbr": away.get("team_abbr"),
                     "home_score": _as_int(home.get("score")),
                     "away_score": _as_int(away.get("score")),
+                    "home_is_winner": home.get("is_winner"),
+                    "away_is_winner": away.get("is_winner"),
+                    "period": entry.get("period", 0),
+                    "scheduled_rounds": entry.get("scheduled_rounds"),
                     "provider": odds.get("provider"),
                     "game_total": _as_float(odds.get("game_total")),
                     "over_odds": _as_int(odds.get("over_odds")),
@@ -425,6 +429,101 @@ def _live_event_candidates(
                 }
             )
     return candidates
+
+
+def _fetch_mma_event_espn(
+    game_date: str | None,
+    team: str | None,
+    opponent: str | None,
+) -> "dict[str, Any] | None":
+    """
+    Query ESPN UFC scoreboard for a specific bout by date and fighter names.
+    Tries the given date and ±1 day to handle UTC/local timezone offsets.
+    Returns an event dict compatible with _evaluate_market(), or None.
+    """
+    if not game_date:
+        return None
+    import httpx as _httpx
+    from datetime import date as _dt, timedelta as _td
+
+    date_str = game_date.replace("-", "")
+    dates_to_try: list[str] = [date_str]
+    try:
+        base = _dt.fromisoformat(game_date)
+        dates_to_try += [
+            (base - _td(days=1)).strftime("%Y%m%d"),
+            (base + _td(days=1)).strftime("%Y%m%d"),
+        ]
+    except Exception:
+        pass
+
+    search_names = [_normalize_text(n) for n in (team, opponent) if n]
+
+    for espn_date in dates_to_try:
+        url = (
+            f"https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
+            f"?dates={espn_date}"
+        )
+        try:
+            with _httpx.Client(timeout=5.0, follow_redirects=True) as client:
+                r = client.get(url)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+        except Exception:
+            continue
+
+        for event in data.get("events", []):
+            for comp in event.get("competitions", []):
+                competitors = comp.get("competitors", [])
+                espn_names = [
+                    _normalize_text(c.get("athlete", {}).get("displayName", ""))
+                    for c in competitors
+                ]
+                # Require at least one fighter name to match (partial OK)
+                matched = sum(
+                    any(sn in en or en in sn for en in espn_names if en)
+                    for sn in search_names
+                )
+                if search_names and matched < max(1, len(search_names) - 1):
+                    continue
+
+                f0 = competitors[0] if competitors else {}
+                f1 = competitors[1] if len(competitors) > 1 else {}
+
+                comp_fmt = comp.get("format", {})
+                reg = comp_fmt.get("regulation", {})
+                scheduled_rounds = reg.get("periods") or reg.get("totalPeriods") or 3
+
+                state_raw = comp.get("status", {}).get("type", {}).get("state", "post")
+                status = {"pre": "pre", "in": "in"}.get(state_raw, "post")
+                period = comp.get("status", {}).get("period", 0)
+
+                f0_name = f0.get("athlete", {}).get("displayName", "")
+                f1_name = f1.get("athlete", {}).get("displayName", "")
+
+                return {
+                    "event_id":        str(comp.get("id", "")),
+                    "date":            event.get("date", ""),
+                    "sport":           "mma",
+                    "league":          "ufc",
+                    "name":            f"{f0_name} vs {f1_name}",
+                    "short_name":      f"{f0_name} vs {f1_name}",
+                    "status":          status,
+                    "home_team":       f0_name,
+                    "home_abbr":       f0.get("athlete", {}).get("shortName", f0_name[:10]),
+                    "away_team":       f1_name,
+                    "away_abbr":       f1.get("athlete", {}).get("shortName", f1_name[:10]),
+                    "home_score":      None,
+                    "away_score":      None,
+                    "home_is_winner":  f0.get("winner"),
+                    "away_is_winner":  f1.get("winner"),
+                    "period":          period,
+                    "scheduled_rounds": scheduled_rounds,
+                    "source":          "espn_mma",
+                }
+
+    return None
 
 
 def _resolve_event(
@@ -455,6 +554,12 @@ def _resolve_event(
         if _matchup_matches(event, team, opponent):
             event["source"] = "historical"
             return event
+
+    # MMA fallback: query ESPN scoreboard directly for past bouts not yet in DuckDB
+    if _normalize_text(sport or "") == "mma":
+        mma_event = _fetch_mma_event_espn(game_date, team, opponent)
+        if mma_event:
+            return mma_event
 
     return None
 
@@ -510,7 +615,17 @@ def _evaluate_market(
                 detail="For moneyline, pick must be home, away, draw, or a matching team name",
             )
         resolved_pick = side
-        if home_score is not None and away_score is not None and not pregame:
+        sport_norm = _normalize_text(str(event.get("sport") or ""))
+        if sport_norm == "mma" and not pregame:
+            # MMA has no numeric score; use winner flag set by ESPN when bout finishes
+            if side == "home":
+                winner_flag = event.get("home_is_winner")
+            else:
+                winner_flag = event.get("away_is_winner")
+            if winner_flag is not None:
+                result = bool(winner_flag)
+                outcome = "win" if result else "loss"
+        elif home_score is not None and away_score is not None and not pregame:
             if side == "draw":
                 result = home_score == away_score
             elif side == "home":
@@ -568,6 +683,54 @@ def _evaluate_market(
                 result = pick_norm == "over"
                 outcome = "win" if result else "loss"
             elif total_score < resolved_line:
+                result = pick_norm == "under"
+                outcome = "win" if result else "loss"
+            else:
+                result = None
+                outcome = "push"
+
+    elif market_norm == "go_the_distance":
+        # MMA: did the fight last all scheduled rounds (go to judges' decision)?
+        # Accept yes/no and over/under as equivalent picks.
+        _YES_PICKS = {"yes", "over"}
+        _NO_PICKS  = {"no", "under"}
+        if pick_norm not in _YES_PICKS | _NO_PICKS:
+            raise HTTPException(
+                status_code=400,
+                detail="For go_the_distance, pick must be yes/over (went distance) or no/under (early finish)",
+            )
+        resolved_pick = "yes" if pick_norm in _YES_PICKS else "no"
+        period_reached = _as_int(event.get("period")) or 0
+        sched = _as_int(event.get("scheduled_rounds")) or 3
+        if settled:
+            went_distance = period_reached >= sched
+            result = went_distance if resolved_pick == "yes" else not went_distance
+            outcome = "win" if result else "loss"
+
+    elif market_norm == "total_rounds":
+        # MMA: over/under on number of rounds completed
+        if pick_norm not in {"over", "under"}:
+            raise HTTPException(
+                status_code=400,
+                detail="For total_rounds, pick must be over or under",
+            )
+        resolved_pick = pick_norm
+        if resolved_line is None:
+            raise HTTPException(
+                status_code=400,
+                detail="total_rounds requires a line (e.g. 2.5)",
+            )
+        period_reached = _as_int(event.get("period")) or 0
+        sched = _as_int(event.get("scheduled_rounds")) or 3
+        if settled:
+            # If the fight went the full distance, rounds = scheduled_rounds
+            # Otherwise rounds = period_reached (round fight ended in)
+            went_distance = period_reached >= sched
+            actual_rounds = sched if went_distance else period_reached
+            if actual_rounds > resolved_line:
+                result = pick_norm == "over"
+                outcome = "win" if result else "loss"
+            elif actual_rounds < resolved_line:
                 result = pick_norm == "under"
                 outcome = "win" if result else "loss"
             else:
