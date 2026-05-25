@@ -435,6 +435,22 @@ def generate_odds(
             "under_odds":        None,
         }
 
+    elif sport == "mma":
+        # MMA has no score; return minimal moneyline only (50/50 until finish is known)
+        return {
+            "provider":          "generated",
+            "home_ml":           -110,
+            "away_ml":           -110,
+            "draw_odds":         None,
+            "home_spread":       None,
+            "away_spread":       None,
+            "home_spread_odds":  None,
+            "away_spread_odds":  None,
+            "game_total":        None,
+            "over_odds":         None,
+            "under_odds":        None,
+        }
+
     elif sport in ("tennis", "table_tennis"):
         # S1/S2 are sets won; current set score not in FS
         if home_score == away_score:
