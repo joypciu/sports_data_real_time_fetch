@@ -241,6 +241,11 @@ def _date_only(value: Any) -> str | None:
         return None
 
 
+def _team_name_initials(team_name: str | None) -> str:
+    words = _normalize_text(team_name).split()
+    return "".join(w[0] for w in words if w)
+
+
 def _team_matches(
     query: str | None, team_name: str | None, team_abbr: str | None
 ) -> bool:
@@ -257,6 +262,7 @@ def _team_matches(
         or query_norm in name_norm
         or name_norm in query_norm
         or query_norm in abbr_norm
+        or (name_norm and query_norm == _team_name_initials(team_name))
     )
 
 
@@ -291,7 +297,13 @@ def _strip_spread_from_pick(pick: str) -> str:
     return m.group("team").strip() if m else pick.strip()
 
 
-def _resolve_pick_side(pick: str, event: dict[str, Any]) -> str | None:
+def _resolve_pick_side(
+    pick: str,
+    event: dict[str, Any],
+    *,
+    team_hint: str | None = None,
+    opponent_hint: str | None = None,
+) -> str | None:
     pick_clean = _strip_spread_from_pick(pick)
     pick_norm = _normalize_text(pick_clean)
     if pick_norm in {"home", "away", "draw", "tie"}:
@@ -300,6 +312,15 @@ def _resolve_pick_side(pick: str, event: dict[str, Any]) -> str | None:
         return "home"
     if _team_matches(pick_clean, event.get("away_team"), event.get("away_abbr")):
         return "away"
+
+    for hint in (team_hint, opponent_hint):
+        if not hint or not _team_matches(pick_clean, hint, None):
+            continue
+        if _team_matches(hint, event.get("home_team"), event.get("home_abbr")):
+            return "home"
+        if _team_matches(hint, event.get("away_team"), event.get("away_abbr")):
+            return "away"
+
     return None
 
 
@@ -1582,7 +1603,7 @@ def stats_market_check(
             outcome = "pending"
         elif nba_market_type == "moneyline":
             # stat_value: 1.0=home won, 0.0=away won, 0.5=tie
-            side = _resolve_pick_side(pick, event)
+            side = _resolve_pick_side(pick, event, team_hint=team, opponent_hint=opponent)
             if side == "home":
                 outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
             elif side == "away":
@@ -1600,7 +1621,7 @@ def stats_market_check(
 
         elif nba_market_type == "point_spread":
             # stat_value: period diff (home - away)
-            side = _resolve_pick_side(pick, event)
+            side = _resolve_pick_side(pick, event, team_hint=team, opponent_hint=opponent)
             if side not in {"home", "away"}:
                 raise HTTPException(
                     status_code=400,
