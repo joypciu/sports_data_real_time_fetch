@@ -35,6 +35,7 @@ DATA_DIR = "historical_data"
 # Maps league_key → data-file prefix in data/
 SPORT_FILE_PREFIX: dict[str, str] = {
     "nba":        "nba",
+    "wnba":       "nba",
     "ncaab":      "ncaab",
     "nhl":        "nhl",
     "nfl":        "nfl",

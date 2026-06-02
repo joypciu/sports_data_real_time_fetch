@@ -52,6 +52,7 @@ ARCHIVE_DIR = str(_THIS_DIR / "archive")
 
 _TOKEN = os.getenv("STATS_API_TOKEN", "").strip()
 _PORT = int(os.getenv("STATS_API_PORT", "8001"))
+_ESPN_HTTP_TIMEOUT = 2.5  # must stay under bet-tracking STATS_API_TIMEOUT (default 8s)
 
 # ---------------------------------------------------------------------------
 # App
@@ -241,6 +242,11 @@ def _date_only(value: Any) -> str | None:
         return None
 
 
+def _team_name_initials(team_name: str | None) -> str:
+    words = _normalize_text(team_name).split()
+    return "".join(w[0] for w in words if w)
+
+
 def _team_matches(
     query: str | None, team_name: str | None, team_abbr: str | None
 ) -> bool:
@@ -257,6 +263,7 @@ def _team_matches(
         or query_norm in name_norm
         or name_norm in query_norm
         or query_norm in abbr_norm
+        or (name_norm and query_norm == _team_name_initials(team_name))
     )
 
 
@@ -282,14 +289,39 @@ def _matchup_matches(
     ) or _team_matches(single, event.get("away_team"), event.get("away_abbr"))
 
 
-def _resolve_pick_side(pick: str, event: dict[str, Any]) -> str | None:
-    pick_norm = _normalize_text(pick)
+_SPREAD_PICK_RE = re.compile(r"^(?P<team>.+?)\s+(?P<spread>[+-]?\d+(?:\.\d+)?)$")
+
+
+def _strip_spread_from_pick(pick: str) -> str:
+    """Return team-only portion of picks like 'NYK +1.5' or 'Cleveland Cavaliers -3.5'."""
+    m = _SPREAD_PICK_RE.match(pick.strip())
+    return m.group("team").strip() if m else pick.strip()
+
+
+def _resolve_pick_side(
+    pick: str,
+    event: dict[str, Any],
+    *,
+    team_hint: str | None = None,
+    opponent_hint: str | None = None,
+) -> str | None:
+    pick_clean = _strip_spread_from_pick(pick)
+    pick_norm = _normalize_text(pick_clean)
     if pick_norm in {"home", "away", "draw", "tie"}:
         return "draw" if pick_norm == "tie" else pick_norm
-    if _team_matches(pick, event.get("home_team"), event.get("home_abbr")):
+    if _team_matches(pick_clean, event.get("home_team"), event.get("home_abbr")):
         return "home"
-    if _team_matches(pick, event.get("away_team"), event.get("away_abbr")):
+    if _team_matches(pick_clean, event.get("away_team"), event.get("away_abbr")):
         return "away"
+
+    for hint in (team_hint, opponent_hint):
+        if not hint or not _team_matches(pick_clean, hint, None):
+            continue
+        if _team_matches(hint, event.get("home_team"), event.get("home_abbr")):
+            return "home"
+        if _team_matches(hint, event.get("away_team"), event.get("away_abbr")):
+            return "away"
+
     return None
 
 
@@ -400,6 +432,10 @@ def _live_event_candidates(
                     "away_abbr": away.get("team_abbr"),
                     "home_score": _as_int(home.get("score")),
                     "away_score": _as_int(away.get("score")),
+                    "home_is_winner": home.get("is_winner"),
+                    "away_is_winner": away.get("is_winner"),
+                    "period": entry.get("period", 0),
+                    "scheduled_rounds": entry.get("scheduled_rounds"),
                     "provider": odds.get("provider"),
                     "game_total": _as_float(odds.get("game_total")),
                     "over_odds": _as_int(odds.get("over_odds")),
@@ -415,6 +451,380 @@ def _live_event_candidates(
                 }
             )
     return candidates
+
+
+def _fetch_mma_event_espn(
+    game_date: str | None,
+    team: str | None,
+    opponent: str | None,
+) -> "dict[str, Any] | None":
+    """
+    Query ESPN UFC scoreboard for a specific bout by date and fighter names.
+    Tries the given date and ±1 day to handle UTC/local timezone offsets.
+    Returns an event dict compatible with _evaluate_market(), or None.
+    """
+    if not game_date:
+        return None
+    import httpx as _httpx
+    from datetime import date as _dt, timedelta as _td
+
+    date_str = game_date.replace("-", "")
+    dates_to_try: list[str] = [date_str]
+    try:
+        base = _dt.fromisoformat(game_date)
+        dates_to_try += [
+            (base - _td(days=1)).strftime("%Y%m%d"),
+            (base + _td(days=1)).strftime("%Y%m%d"),
+        ]
+    except Exception:
+        pass
+
+    search_names = [_normalize_text(n) for n in (team, opponent) if n]
+
+    for espn_date in dates_to_try:
+        url = (
+            f"https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard"
+            f"?dates={espn_date}"
+        )
+        try:
+            with _httpx.Client(timeout=_ESPN_HTTP_TIMEOUT, follow_redirects=True) as client:
+                r = client.get(url)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+        except Exception:
+            continue
+
+        for event in data.get("events", []):
+            for comp in event.get("competitions", []):
+                competitors = comp.get("competitors", [])
+                espn_names = [
+                    _normalize_text(c.get("athlete", {}).get("displayName", ""))
+                    for c in competitors
+                ]
+                # Require at least one fighter name to match (partial OK)
+                matched = sum(
+                    any(sn in en or en in sn for en in espn_names if en)
+                    for sn in search_names
+                )
+                if search_names and matched < max(1, len(search_names) - 1):
+                    continue
+
+                f0 = competitors[0] if competitors else {}
+                f1 = competitors[1] if len(competitors) > 1 else {}
+
+                comp_fmt = comp.get("format", {})
+                reg = comp_fmt.get("regulation", {})
+                scheduled_rounds = reg.get("periods") or reg.get("totalPeriods") or 3
+
+                state_raw = comp.get("status", {}).get("type", {}).get("state", "post")
+                status = {"pre": "pre", "in": "in"}.get(state_raw, "post")
+                period = comp.get("status", {}).get("period", 0)
+
+                f0_name = f0.get("athlete", {}).get("displayName", "")
+                f1_name = f1.get("athlete", {}).get("displayName", "")
+
+                return {
+                    "event_id":        str(comp.get("id", "")),
+                    "date":            event.get("date", ""),
+                    "sport":           "mma",
+                    "league":          "ufc",
+                    "name":            f"{f0_name} vs {f1_name}",
+                    "short_name":      f"{f0_name} vs {f1_name}",
+                    "status":          status,
+                    "home_team":       f0_name,
+                    "home_abbr":       f0.get("athlete", {}).get("shortName", f0_name[:10]),
+                    "away_team":       f1_name,
+                    "away_abbr":       f1.get("athlete", {}).get("shortName", f1_name[:10]),
+                    "home_score":      None,
+                    "away_score":      None,
+                    "home_is_winner":  f0.get("winner"),
+                    "away_is_winner":  f1.get("winner"),
+                    "period":          period,
+                    "scheduled_rounds": scheduled_rounds,
+                    "source":          "espn_mma",
+                }
+
+    return None
+
+
+def _espn_scoreboard_dates(game_date: str | None) -> list[str]:
+    if not game_date:
+        return []
+    date_str = game_date.replace("-", "")
+    dates = [date_str]
+    try:
+        from datetime import date as _dt, timedelta as _td
+
+        base = _dt.fromisoformat(game_date)
+        dates.extend([
+            (base - _td(days=1)).strftime("%Y%m%d"),
+            (base + _td(days=1)).strftime("%Y%m%d"),
+        ])
+    except Exception:
+        pass
+    return dates
+
+
+def _fetch_basketball_event_espn(
+    game_date: str | None,
+    team: str | None,
+    opponent: str | None,
+    league: str = "nba",
+) -> dict[str, Any] | None:
+    """Resolve a basketball game from ESPN when it is missing from DuckDB."""
+    import httpx as _httpx
+
+    for espn_date in _espn_scoreboard_dates(game_date):
+        url = (
+            f"https://site.api.espn.com/apis/site/v2/sports/basketball/{league}/scoreboard"
+            f"?dates={espn_date}&limit=100"
+        )
+        try:
+            with _httpx.Client(timeout=_ESPN_HTTP_TIMEOUT, follow_redirects=True) as client:
+                r = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                continue
+            data = r.json()
+        except Exception:
+            continue
+
+        for event in data.get("events", []):
+            for comp in event.get("competitions", []):
+                competitors = comp.get("competitors", [])
+                home_c = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0] if competitors else {})
+                away_c = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1] if len(competitors) > 1 else {})
+                home_team = (home_c.get("team") or {}).get("displayName", "")
+                away_team = (away_c.get("team") or {}).get("displayName", "")
+                candidate = {
+                    "event_id": str(event.get("id") or comp.get("id") or ""),
+                    "date": event.get("date", ""),
+                    "sport": "basketball",
+                    "league": league,
+                    "name": event.get("name", ""),
+                    "short_name": event.get("shortName", ""),
+                    "status": {"pre": "pre", "in": "in"}.get(
+                        comp.get("status", {}).get("type", {}).get("state", "post"), "post"
+                    ),
+                    "home_team": home_team,
+                    "home_abbr": (home_c.get("team") or {}).get("abbreviation", ""),
+                    "away_team": away_team,
+                    "away_abbr": (away_c.get("team") or {}).get("abbreviation", ""),
+                    "home_score": _as_int(home_c.get("score")),
+                    "away_score": _as_int(away_c.get("score")),
+                    "game_total": None,
+                    "source": "espn_public",
+                }
+                if _matchup_matches(candidate, team, opponent):
+                    return candidate
+    return None
+
+
+def _parse_espn_boxscore_players(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return [{display_name, did_not_play, stats: {PTS: '10', ...}}, ...]."""
+    players: list[dict[str, Any]] = []
+    for group in summary.get("boxscore", {}).get("players", []):
+        for stat_group in group.get("statistics", []):
+            names: list[str] = stat_group.get("names") or stat_group.get("labels", [])
+            for ae in stat_group.get("athletes", []):
+                ath = ae.get("athlete", {})
+                raw_stats: list[str] = ae.get("stats", [])
+                players.append({
+                    "display_name": ath.get("displayName", ath.get("shortName", "")),
+                    "did_not_play": bool(ae.get("didNotPlay")),
+                    "dnp_reason": ae.get("reason", ""),
+                    "stats": dict(zip(names, raw_stats)),
+                })
+    return players
+
+
+def _evaluate_prop_from_stats(
+    *,
+    player_name: str,
+    market_norm: str,
+    pick_norm: str,
+    line: float,
+    raw_stats: dict[str, Any],
+    game_settled: bool,
+) -> dict[str, Any]:
+    stat_keys = PROP_STAT_MAP.get(market_norm, COMPOSITE_PROP_MAP.get(market_norm, []))
+    available_keys = sorted(raw_stats.keys())
+
+    if market_norm in COMPOSITE_PROP_MAP:
+        component_values: list[float] = []
+        missing_keys: list[str] = []
+        for key in COMPOSITE_PROP_MAP[market_norm]:
+            val = _extract_stat_value(raw_stats.get(key), key)
+            if val is None:
+                missing_keys.append(key)
+            else:
+                component_values.append(val)
+        if missing_keys:
+            return {
+                "found": True,
+                "player": player_name,
+                "outcome": "pending",
+                "settled": False,
+                "espn_limitation": True,
+                "espn_limitation_reason": (
+                    f"ESPN data for {player_name} is missing components for "
+                    f"'{market_norm}' (missing: {missing_keys})."
+                ),
+                "requested_market": market_norm,
+                "espn_available_stats": available_keys,
+            }
+        stat_value = float(sum(component_values))
+        matched_key = "+".join(COMPOSITE_PROP_MAP[market_norm])
+    else:
+        stat_value = None
+        matched_key = None
+        for key in stat_keys:
+            val = _extract_stat_value(raw_stats.get(key), key)
+            if val is not None:
+                stat_value = val
+                matched_key = key
+                break
+        if stat_value is None:
+            return {
+                "found": True,
+                "player": player_name,
+                "outcome": "pending",
+                "settled": False,
+                "espn_limitation": True,
+                "espn_limitation_reason": (
+                    f"ESPN data for {player_name} does not include stat(s) "
+                    f"{stat_keys} for '{market_norm}'."
+                ),
+                "requested_market": market_norm,
+                "espn_available_stats": available_keys,
+            }
+
+    if not game_settled:
+        return {
+            "found": True,
+            "player": player_name,
+            "outcome": "pending",
+            "settled": False,
+            "stat_key": matched_key,
+            "stat_value": stat_value,
+            "source": "espn_public",
+        }
+
+    if stat_value > line:
+        outcome = "win" if pick_norm == "over" else "loss"
+    elif stat_value < line:
+        outcome = "win" if pick_norm == "under" else "loss"
+    else:
+        outcome = "push"
+
+    return {
+        "found": True,
+        "player": player_name,
+        "outcome": outcome,
+        "settled": True,
+        "stat_key": matched_key,
+        "stat_value": stat_value,
+        "source": "espn_public",
+        "espn_limitation": False,
+    }
+
+
+def _fetch_espn_nba_summary(event_id: str, league: str = "nba") -> dict[str, Any] | None:
+    import httpx as _httpx
+
+    summary_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/{league}/summary"
+    try:
+        with _httpx.Client(timeout=_ESPN_HTTP_TIMEOUT, follow_redirects=True) as client:
+            r = client.get(
+                summary_url,
+                params={"event": event_id},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def _espn_basketball_prop_settlement(
+    *,
+    player: str,
+    market_norm: str,
+    pick_norm: str,
+    line: float,
+    game_date: str,
+    team: str | None,
+    opponent: str | None,
+    league: str = "nba",
+    event_id: str | None = None,
+    game_status: str | None = None,
+    home_score: int | None = None,
+    away_score: int | None = None,
+) -> dict[str, Any] | None:
+    """Settle a basketball player prop directly from ESPN when DuckDB has no player row."""
+    event: dict[str, Any] | None = None
+    if event_id:
+        event = {
+            "event_id": str(event_id),
+            "status": game_status or "post",
+            "home_score": home_score,
+            "away_score": away_score,
+        }
+    else:
+        event = _fetch_basketball_event_espn(game_date, team, opponent, league=league)
+    if not event or not event.get("event_id"):
+        return None
+
+    summary = _fetch_espn_nba_summary(str(event["event_id"]), league=league)
+    if not summary:
+        return None
+
+    players = _parse_espn_boxscore_players(summary)
+
+    def _names_match(q: str, cand: str) -> bool:
+        qn = _normalize_text(q)
+        cn = _normalize_text(cand)
+        return bool(qn and cn and (qn == cn or qn in cn or cn in qn))
+
+    matched = next((p for p in players if _names_match(player, p["display_name"])), None)
+    if not matched:
+        return {
+            "found": False,
+            "outcome": "pending",
+            "settled": False,
+            "note": (
+                f"Game found on ESPN but player '{player}' was not in the box score. "
+                "Run daily ingest to persist this game in sports.db."
+            ),
+            "game_id": event.get("event_id"),
+            "game_status": event.get("status"),
+        }
+
+    if matched.get("did_not_play"):
+        return {
+            "found": True,
+            "player": matched["display_name"],
+            "outcome": "pending",
+            "settled": False,
+            "espn_limitation": True,
+            "espn_limitation_reason": f"{matched['display_name']} did not play (DNP).",
+            "game_status": event.get("status"),
+        }
+
+    result = _evaluate_prop_from_stats(
+        player_name=matched["display_name"],
+        market_norm=market_norm,
+        pick_norm=pick_norm,
+        line=line,
+        raw_stats=matched.get("stats") or {},
+        game_settled=_normalize_text(str(event.get("status") or "")) == "post",
+    )
+    result["game_id"] = event.get("event_id")
+    result["game_status"] = event.get("status")
+    result["home_score"] = event.get("home_score")
+    result["away_score"] = event.get("away_score")
+    return result
 
 
 def _resolve_event(
@@ -446,6 +856,18 @@ def _resolve_event(
             event["source"] = "historical"
             return event
 
+    # MMA fallback: query ESPN scoreboard directly for past bouts not yet in DuckDB
+    if _normalize_text(sport or "") == "mma":
+        mma_event = _fetch_mma_event_espn(game_date, team, opponent)
+        if mma_event:
+            return mma_event
+
+    # NBA/basketball fallback when game is not yet in DuckDB
+    if _normalize_text(sport or "") in {"basketball", "nba"}:
+        nba_event = _fetch_basketball_event_espn(game_date, team, opponent)
+        if nba_event:
+            return nba_event
+
     return None
 
 
@@ -473,6 +895,7 @@ def _evaluate_market(
         "total_goals": "total",
         "total_runs": "total",
         "total_corners": "total",
+        "total_points": "total",
     }
     if market_norm in _MARKET_ALIASES:
         market_norm = _MARKET_ALIASES[market_norm]
@@ -500,7 +923,17 @@ def _evaluate_market(
                 detail="For moneyline, pick must be home, away, draw, or a matching team name",
             )
         resolved_pick = side
-        if home_score is not None and away_score is not None and not pregame:
+        sport_norm = _normalize_text(str(event.get("sport") or ""))
+        if sport_norm == "mma" and not pregame:
+            # MMA has no numeric score; use winner flag set by ESPN when bout finishes
+            if side == "home":
+                winner_flag = event.get("home_is_winner")
+            else:
+                winner_flag = event.get("away_is_winner")
+            if winner_flag is not None:
+                result = bool(winner_flag)
+                outcome = "win" if result else "loss"
+        elif home_score is not None and away_score is not None and not pregame:
             if side == "draw":
                 result = home_score == away_score
             elif side == "home":
@@ -558,6 +991,54 @@ def _evaluate_market(
                 result = pick_norm == "over"
                 outcome = "win" if result else "loss"
             elif total_score < resolved_line:
+                result = pick_norm == "under"
+                outcome = "win" if result else "loss"
+            else:
+                result = None
+                outcome = "push"
+
+    elif market_norm == "go_the_distance":
+        # MMA: did the fight last all scheduled rounds (go to judges' decision)?
+        # Accept yes/no and over/under as equivalent picks.
+        _YES_PICKS = {"yes", "over"}
+        _NO_PICKS  = {"no", "under"}
+        if pick_norm not in _YES_PICKS | _NO_PICKS:
+            raise HTTPException(
+                status_code=400,
+                detail="For go_the_distance, pick must be yes/over (went distance) or no/under (early finish)",
+            )
+        resolved_pick = "yes" if pick_norm in _YES_PICKS else "no"
+        period_reached = _as_int(event.get("period")) or 0
+        sched = _as_int(event.get("scheduled_rounds")) or 3
+        if settled:
+            went_distance = period_reached >= sched
+            result = went_distance if resolved_pick == "yes" else not went_distance
+            outcome = "win" if result else "loss"
+
+    elif market_norm == "total_rounds":
+        # MMA: over/under on number of rounds completed
+        if pick_norm not in {"over", "under"}:
+            raise HTTPException(
+                status_code=400,
+                detail="For total_rounds, pick must be over or under",
+            )
+        resolved_pick = pick_norm
+        if resolved_line is None:
+            raise HTTPException(
+                status_code=400,
+                detail="total_rounds requires a line (e.g. 2.5)",
+            )
+        period_reached = _as_int(event.get("period")) or 0
+        sched = _as_int(event.get("scheduled_rounds")) or 3
+        if settled:
+            # If the fight went the full distance, rounds = scheduled_rounds
+            # Otherwise rounds = period_reached (round fight ended in)
+            went_distance = period_reached >= sched
+            actual_rounds = sched if went_distance else period_reached
+            if actual_rounds > resolved_line:
+                result = pick_norm == "over"
+                outcome = "win" if result else "loss"
+            elif actual_rounds < resolved_line:
                 result = pick_norm == "under"
                 outcome = "win" if result else "loss"
             else:
@@ -1113,6 +1594,9 @@ def stats_market_check(
     opponent: Optional[str] = Query(
         None, description="The opposing team in the matchup"
     ),
+    player: Optional[str] = Query(
+        None, description="Player name for player period markets"
+    ),
     market: str = Query(..., description="moneyline, spread, or total"),
     pick: str = Query(
         ...,
@@ -1123,6 +1607,8 @@ def stats_market_check(
     ),
     _: None = Depends(_verify_token),
 ) -> JSONResponse:
+    market_norm = market.strip().lower().replace(" ", "_")
+
     if not event_id and not (date and (team or opponent)):
         raise HTTPException(
             status_code=400,
@@ -1594,6 +2080,96 @@ def stats_market_check(
     # ── Normal event resolution for non-MLB or MLB not found ─────────────────
     event = _resolve_event(event_id, _date_only(date), sport, team, opponent)
     if event is None:
+        # NBA player period points can still be settled from DataBallr
+        # using date+team(+player) even when local event resolution misses.
+        import nba_period_props as _nba_period
+
+        nba_entry = _nba_period.NBA_PROP_STAT_MAP.get(market_norm)
+        if (
+            nba_entry is not None
+            and nba_entry[1] == "player_points"
+            and _date_only(date)
+            and (team or opponent)
+        ):
+            game_date = _date_only(date)
+            team_hint = team or opponent
+            player_input = player or ""
+            if not player_input:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"player is required for market '{market_norm}'.",
+                )
+
+            result = _nba_period.prop_check(
+                player=player_input,
+                market=market_norm,
+                game_date=game_date,
+                team=team_hint,
+                game_id=None,
+            )
+
+            if not result.get("found"):
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "found": False,
+                        "outcome": "pending",
+                        "settled": False,
+                        "source": "nba_period_props",
+                        "note": result.get("note", "NBA period lookup did not find data."),
+                        "game_id": result.get("game_id"),
+                        "game_status": result.get("game_status"),
+                    },
+                )
+
+            if line is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"line is required for market '{market_norm}'.",
+                )
+            pick_norm = _normalize_text(pick)
+            if pick_norm not in {"over", "under"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pick must be over/under for market '{market_norm}'.",
+                )
+
+            settled = bool(result.get("settled"))
+            stat_value = float(result.get("stat_value") or 0.0)
+            if not settled:
+                outcome = "pending"
+                result_bool = None
+            elif stat_value > line:
+                outcome = "win" if pick_norm == "over" else "loss"
+                result_bool = outcome == "win"
+            elif stat_value < line:
+                outcome = "win" if pick_norm == "under" else "loss"
+                result_bool = outcome == "win"
+            else:
+                outcome = "push"
+                result_bool = None
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "market": market_norm,
+                    "pick": pick_norm,
+                    "line": line,
+                    "player": result.get("player"),
+                    "result": result_bool,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": "nba_period_props",
+                    "game_id": result.get("game_id"),
+                    "game_status": result.get("game_status"),
+                    "home_score": result.get("home_score"),
+                    "away_score": result.get("away_score"),
+                    "event": None,
+                },
+            )
+
         return JSONResponse(
             status_code=404,
             content={
@@ -1608,6 +2184,391 @@ def stats_market_check(
                     "market": market,
                     "pick": pick,
                     "line": line,
+                },
+            },
+        )
+
+    # ── Check if this is an MLB period market ────────────────────────────
+    pick_norm = pick.strip().lower()
+    import mlb_period_props as _mlb_period
+
+    # Backward-compatible aliases used by bet-tracking API naming.
+    mlb_aliases: dict[str, str] = {
+        "1st_5_innings_moneyline": "1st_half_moneyline",
+        "1st_5_innings_total": "1st_half_total_runs",
+        "1st_5_innings_team_total": "1st_half_team_total",
+    }
+    market_norm_mlb = mlb_aliases.get(market_norm, market_norm)
+
+    mlb_entry = _mlb_period.PERIOD_PROP_STAT_MAP.get(market_norm_mlb)
+    mlb_inning_range = mlb_entry[0] if mlb_entry else None
+    mlb_market_type = mlb_entry[1] if mlb_entry else None
+    event_sport = _normalize_text(str(event.get("sport") or ""))
+    # MLB-first routing: for baseball, always prefer mlb_period_props when market is known there.
+    # Player props are handled in /stats/prop-check and will not reach this endpoint.
+    if event_sport == "baseball" and mlb_entry is not None:
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to resolve MLB period market.",
+            )
+        result = _mlb_period.prop_check(
+            player=None,  # period markets don't have players
+            market=market_norm_mlb,
+            game_date=_date_only(date),
+            team=team,
+            pick=pick,
+            line=line,
+        )
+        if not result.get("found"):
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": False,
+                    "outcome": "pending",
+                    "settled": False,
+                    "source": "mlb_period_props",
+                    "note": result.get("note", "MLB Period Props lookup did not find data."),
+                    "game_pk": result.get("game_pk"),
+                    "game_status": result.get("game_status"),
+                },
+            )
+        stat_value = result["stat_value"]
+        settled = result["settled"]
+        # Evaluate using resolved MLB market type from mlb_period_props
+        result_bool: bool | None = None
+        if mlb_market_type == "moneyline":
+            # stat_value is 0.0 (away), 0.5 (tie), or 1.0 (home)
+            # pick is team name or "home"/"away"
+            side = _resolve_pick_side(pick, event)
+            if side == "home":
+                outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
+            elif side == "away":
+                outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
+            else:
+                outcome = "pending"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
+        elif mlb_market_type == "run_line":
+            # stat_value is run differential (home - away), compare to line
+            if line is None:
+                line = -1.5  # default run line
+            if stat_value > line:
+                outcome = "win"
+            elif stat_value < line:
+                outcome = "loss"
+            else:
+                outcome = "push"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
+        elif mlb_market_type in {"total_runs", "team_total"}:
+            # stat_value is a run count; compare to provided over/under line
+            if line is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"line is required for market '{market_norm}'",
+                )
+            if pick_norm not in {"over", "under"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pick must be over/under for market '{market_norm}'",
+                )
+            if stat_value > line:
+                outcome = "win" if pick_norm == "over" else "loss"
+            elif stat_value < line:
+                outcome = "win" if pick_norm == "under" else "loss"
+            else:
+                outcome = "push"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
+        elif mlb_market_type == "odd_even":
+            # stat_value is 1 for odd, 0 for even
+            pick_oe = pick_norm
+            if pick_oe in {"over", "under"}:
+                pick_oe = "odd" if pick_oe == "over" else "even"
+            if pick_oe not in {"odd", "even"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pick must be odd/even for market '{market_norm}'",
+                )
+            is_odd = bool(stat_value)
+            if is_odd and pick_oe == "odd":
+                outcome = "win"
+            elif (not is_odd) and pick_oe == "even":
+                outcome = "win"
+            else:
+                outcome = "loss"
+            result_bool = outcome == "win"
+        else:
+            # Unknown MLB market type in this endpoint
+            outcome = "pending"
+            settled = False
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": True,
+                "market": market_norm,
+                "pick": pick,
+                "line": line,
+                "result": result_bool,
+                "stat_value": stat_value,
+                "outcome": outcome,
+                "settled": settled,
+                "source": "mlb_period_props",
+                "game_pk": result["game_pk"],
+                "game_status": result["game_status"],
+                "home_score": result.get("home_score"),
+                "away_score": result.get("away_score"),
+            },
+        )
+
+    # ── NBA period/specialty markets from DataBallr plays + box-score ─────
+    import nba_period_props as _nba_period
+
+    nba_entry = _nba_period.NBA_PROP_STAT_MAP.get(market_norm)
+    nba_market_type = nba_entry[1] if nba_entry else None
+    if event_sport in {"basketball", "nba"} and nba_entry is not None:
+        # Prefer explicit date, else fallback to resolved event date.
+        game_date = _date_only(date) or _date_only(event.get("date"))
+        if not game_date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to resolve NBA period market.",
+            )
+
+        player_input = player or pick
+        result = _nba_period.prop_check(
+            player=player_input,
+            market=market_norm,
+            game_date=game_date,
+            team=team,
+            # Resolve DataBallr game id from date/team inside the source module.
+            # ESPN event_id values are not DataBallr IDs and can cause source 500s.
+            game_id=None,
+        )
+
+        if not result.get("found"):
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": False,
+                    "outcome": "pending",
+                    "settled": False,
+                    "source": "nba_period_props",
+                    "note": result.get("note", "NBA period lookup did not find data."),
+                    "game_id": result.get("game_id"),
+                    "game_status": result.get("game_status"),
+                },
+            )
+
+        settled = bool(result.get("settled"))
+        stat_value = result.get("stat_value")
+        resolved_pick = pick
+        resolved_line = line
+        result_bool: bool | None = None
+
+        if not settled:
+            outcome = "pending"
+        elif nba_market_type == "moneyline":
+            # stat_value: 1.0=home won, 0.0=away won, 0.5=tie
+            side = _resolve_pick_side(pick, event, team_hint=team, opponent_hint=opponent)
+            if side == "home":
+                outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
+            elif side == "away":
+                outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="For moneyline, pick must be home, away, or a matching team name.",
+                )
+            resolved_pick = side
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
+
+        elif nba_market_type == "point_spread":
+            # stat_value: period diff (home - away)
+            side = _resolve_pick_side(pick, event, team_hint=team, opponent_hint=opponent)
+            if side not in {"home", "away"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="For point spread, pick must be home, away, or a matching team name.",
+                )
+            if resolved_line is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"line is required for market '{market_norm}'.",
+                )
+            resolved_pick = side
+            diff = float(stat_value)
+            adjusted = (diff + resolved_line) if side == "home" else ((-diff) + resolved_line)
+            if adjusted > 0:
+                outcome = "win"
+                result_bool = True
+            elif adjusted < 0:
+                outcome = "loss"
+                result_bool = False
+            else:
+                outcome = "push"
+
+        elif nba_market_type in {"total_points", "team_total"}:
+            if resolved_line is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"line is required for market '{market_norm}'.",
+                )
+            pick_norm = _normalize_text(pick)
+            if pick_norm not in {"over", "under"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pick must be over/under for market '{market_norm}'.",
+                )
+            resolved_pick = pick_norm
+            val = float(stat_value)
+            if val > resolved_line:
+                outcome = "win" if pick_norm == "over" else "loss"
+            elif val < resolved_line:
+                outcome = "win" if pick_norm == "under" else "loss"
+            else:
+                outcome = "push"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
+
+        elif nba_market_type == "player_points":
+            if resolved_line is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"line is required for market '{market_norm}'.",
+                )
+            pick_norm = _normalize_text(pick)
+            if pick_norm not in {"over", "under"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pick must be over/under for market '{market_norm}'.",
+                )
+            resolved_pick = pick_norm
+            val = float(stat_value)
+            if val > resolved_line:
+                outcome = "win" if pick_norm == "over" else "loss"
+            elif val < resolved_line:
+                outcome = "win" if pick_norm == "under" else "loss"
+            else:
+                outcome = "push"
+            if outcome == "win":
+                result_bool = True
+            elif outcome == "loss":
+                result_bool = False
+
+        elif nba_market_type == "odd_even":
+            pick_oe = _normalize_text(pick)
+            if pick_oe in {"over", "under"}:
+                pick_oe = "odd" if pick_oe == "over" else "even"
+            if pick_oe not in {"odd", "even"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pick must be odd/even for market '{market_norm}'.",
+                )
+            resolved_pick = pick_oe
+            is_odd = bool(stat_value)
+            if (is_odd and pick_oe == "odd") or ((not is_odd) and pick_oe == "even"):
+                outcome = "win"
+                result_bool = True
+            else:
+                outcome = "loss"
+                result_bool = False
+
+        elif nba_market_type == "overtime_yes_no":
+            pick_yes_no = _normalize_text(pick)
+            if pick_yes_no not in {"yes", "no"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pick must be yes/no for market '{market_norm}'.",
+                )
+            resolved_pick = pick_yes_no
+            had_ot = bool(stat_value)
+            if (had_ot and pick_yes_no == "yes") or ((not had_ot) and pick_yes_no == "no"):
+                outcome = "win"
+                result_bool = True
+            else:
+                outcome = "loss"
+                result_bool = False
+
+        elif nba_market_type == "team_first_basket":
+            side = _resolve_pick_side(pick, event)
+            first_team = str(stat_value or "").upper()
+            home_abbr = str(event.get("home_abbr") or "").upper()
+            away_abbr = str(event.get("away_abbr") or "").upper()
+            if side == "home":
+                target = home_abbr
+                resolved_pick = "home"
+            elif side == "away":
+                target = away_abbr
+                resolved_pick = "away"
+            else:
+                target = _normalize_text(pick).upper()
+            if target and first_team == target:
+                outcome = "win"
+                result_bool = True
+            else:
+                outcome = "loss"
+                result_bool = False
+
+        elif nba_market_type in {"first_basket_fg", "first_basket_any"}:
+            first_player = _normalize_text(str(stat_value or ""))
+            pick_player = _normalize_text(pick)
+            if not pick_player:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"pick must be a player name for market '{market_norm}'.",
+                )
+            if first_player and (pick_player == first_player or pick_player in first_player or first_player in pick_player):
+                outcome = "win"
+                result_bool = True
+            else:
+                outcome = "loss"
+                result_bool = False
+
+        else:
+            outcome = "pending"
+            settled = False
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": True,
+                "market": market_norm,
+                "pick": resolved_pick,
+                "line": resolved_line,
+                "player": result.get("player") if nba_market_type == "player_points" else None,
+                "result": result_bool,
+                "stat_value": stat_value,
+                "outcome": outcome,
+                "settled": settled,
+                "source": "nba_period_props",
+                "game_id": result.get("game_id"),
+                "game_status": result.get("game_status"),
+                "home_score": result.get("home_score"),
+                "away_score": result.get("away_score"),
+                "event": {
+                    "event_id": str(event.get("event_id") or ""),
+                    "date": str(event.get("date")) if event.get("date") is not None else None,
+                    "sport": event.get("sport"),
+                    "league": event.get("league"),
+                    "name": event.get("name"),
+                    "short_name": event.get("short_name"),
+                    "status": event.get("status"),
+                    "home_team": event.get("home_team"),
+                    "away_team": event.get("away_team"),
                 },
             },
         )
@@ -2458,6 +3419,23 @@ PROP_STAT_MAP: dict[str, list[str]] = {
     "player_wickets_cricket": ["BWL_INN1_WICKETS", "BWL_INN2_WICKETS"],
 }
 
+# Normalized aliases accepted from upstream clients.
+PROP_MARKET_ALIASES: dict[str, str] = {
+    "player_made_threes": "player_threes",
+    "player_3pm": "player_threes",
+    "player_points_rebounds_assists": "player_points_rebounds_assists",
+    "player_rebounds_assists": "player_rebounds_assists",
+    "player_points_rebounds": "player_points_rebounds",
+}
+
+# Composite markets whose value is the sum of multiple box-score keys.
+COMPOSITE_PROP_MAP: dict[str, list[str]] = {
+    "player_rebounds_assists": ["REB", "AST"],
+    "player_points_assists": ["PTS", "AST"],
+    "player_points_rebounds": ["PTS", "REB"],
+    "player_points_rebounds_assists": ["PTS", "REB", "AST"],
+}
+
 # Stat keys where ESPN stores the value as "made-attempted" (e.g. "8-18").
 # We extract the made count (first number) for prop comparison.
 _SLASH_STAT_KEYS: frozenset[str] = frozenset({"FG", "3PT", "FT", "H-AB", "PC-ST"})
@@ -2501,17 +3479,14 @@ ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset(
 )
 
 SUPPORTED_PROP_MARKETS: list[str] = sorted(
-    set(
-        list(PROP_STAT_MAP.keys())
-        + [
-            "player_runs",
-            "player_home_runs",
-            "player_doubles",
-            "player_triples",
-            "player_hits_runs_rbis",
-            "player_outs",
-        ]
-    )
+    set(list(PROP_STAT_MAP.keys()) + list(COMPOSITE_PROP_MAP.keys()) + [
+        "player_runs",
+        "player_home_runs",
+        "player_doubles",
+        "player_triples",
+        "player_hits_runs_rbis",
+        "player_outs",
+    ])
 )
 
 
@@ -2570,7 +3545,15 @@ def stats_prop_check(
     player_strikeouts, player_earned_runs.
     """
     market_norm = market.strip().lower().replace(" ", "_")
+    market_norm = PROP_MARKET_ALIASES.get(market_norm, market_norm)
     pick_norm = pick.strip().lower()
+
+    def _player_name_match(q: str, cand: str) -> bool:
+        qn = _normalize_text(q)
+        cn = _normalize_text(cand)
+        if not qn or not cn:
+            return False
+        return qn == cn or qn in cn or cn in qn
 
     # ── 1. Reject picks that aren't over/under ──────────────────────────────
     if pick_norm not in {"over", "under"}:
@@ -2776,7 +3759,7 @@ def stats_prop_check(
         )
 
     # ── 3. Unknown market (not supported and not known-unsupported) ─────────
-    if market_norm not in PROP_STAT_MAP:
+    if market_norm not in PROP_STAT_MAP and market_norm not in COMPOSITE_PROP_MAP:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -2786,7 +3769,7 @@ def stats_prop_check(
             ),
         )
 
-    stat_keys = PROP_STAT_MAP[market_norm]
+    stat_keys = PROP_STAT_MAP.get(market_norm, COMPOSITE_PROP_MAP.get(market_norm, []))
 
     # ── 4. Require at least one game locator ────────────────────────────────
     if not event_id and not date:
@@ -2805,14 +3788,63 @@ def stats_prop_check(
         _log.warning("prop-check _resolve_event error: %s", exc)
         event = None
 
+    # Fallback: if team-filtered resolution misses, try finding a same-day event
+    # for this sport that actually contains the requested player.
+    if event is None and not event_id and date:
+        try:
+            candidate_events = _historical_event_candidates(
+                None, _date_only(date), sport
+            )
+        except Exception:
+            candidate_events = []
+
+        for cand in candidate_events:
+            cand_event_id = str(cand.get("event_id") or "")
+            if not cand_event_id:
+                continue
+            try:
+                probe_rows = _query(
+                    """
+                    SELECT p.display_name
+                    FROM game_players gp
+                    JOIN players p ON p.player_id = gp.player_id
+                                  AND p.sport     = gp.sport
+                    WHERE gp.event_id = ?
+                    LIMIT 100
+                    """,
+                    [cand_event_id],
+                )
+            except Exception:
+                probe_rows = []
+            if any(_player_name_match(player, str(r.get("display_name") or "")) for r in probe_rows):
+                event = cand
+                break
+
     if event is None:
+        sport_norm = _normalize_text(sport or "")
+        if sport_norm in {"basketball", "nba"} and date:
+            espn_result = _espn_basketball_prop_settlement(
+                player=player,
+                market_norm=market_norm,
+                pick_norm=pick_norm,
+                line=float(line),
+                game_date=_date_only(date) or str(date),
+                team=team,
+                opponent=None,
+            )
+            if espn_result is not None:
+                status_code = 200 if espn_result.get("found", True) else 404
+                return JSONResponse(status_code=status_code, content=espn_result)
         return JSONResponse(
             status_code=404,
             content={
                 "found": False,
                 "outcome": "pending",
                 "settled": False,
-                "note": "Game not found — it may be in the future or not yet tracked.",
+                "note": (
+                    "Game not found in sports.db for this date — it may not be ingested yet. "
+                    "Run daily ingest (daily_ingest.py) or wait for the next sync."
+                ),
             },
         )
 
@@ -2831,11 +3863,10 @@ def stats_prop_check(
         JOIN players p ON p.player_id = gp.player_id
                       AND p.sport     = gp.sport
         WHERE gp.event_id = ?
-          AND LOWER(p.display_name) LIKE LOWER(?)
-        LIMIT 5
+        LIMIT 100
     """
     try:
-        rows = _query(sql, [resolved_event_id, f"%{player}%"])
+        rows = _query(sql, [resolved_event_id])
     except Exception as exc:
         return JSONResponse(
             status_code=503,
@@ -2847,7 +3878,95 @@ def stats_prop_check(
             },
         )
 
-    if not rows:
+    matched_rows = [r for r in rows if _player_name_match(player, str(r.get("player_name") or ""))]
+
+    # Fast path: game is in DB but player row missing — one ESPN summary call (~2s).
+    if not matched_rows:
+        sport_norm = _normalize_text(sport or str(event.get("sport") or ""))
+        if sport_norm in {"basketball", "nba"} and resolved_event_id:
+            espn_result = _espn_basketball_prop_settlement(
+                player=player,
+                market_norm=market_norm,
+                pick_norm=pick_norm,
+                line=float(line),
+                game_date=_date_only(date) or str(date or ""),
+                team=team or event.get("home_team"),
+                opponent=event.get("away_team"),
+                event_id=resolved_event_id,
+                game_status=game_status,
+                home_score=_as_int(event.get("home_score")),
+                away_score=_as_int(event.get("away_score")),
+            )
+            if espn_result is not None:
+                return JSONResponse(status_code=200, content=espn_result)
+
+    # If caller passed a stale/wrong event_id, try re-resolving by date/sport/team
+    # and selecting the candidate event that actually contains this player.
+    if not matched_rows and date and _normalize_text(sport or "") not in {"basketball", "nba"}:
+        try:
+            candidate_events = _historical_event_candidates(None, _date_only(date), sport)
+        except Exception:
+            candidate_events = []
+
+        if team:
+            team_norm = _normalize_text(team)
+            candidate_events = [
+                c for c in candidate_events
+                if team_norm in {
+                    _normalize_text(str(c.get("home_team") or "")),
+                    _normalize_text(str(c.get("away_team") or "")),
+                }
+            ]
+
+        for cand in candidate_events:
+            cand_event_id = str(cand.get("event_id") or "")
+            if not cand_event_id or cand_event_id == resolved_event_id:
+                continue
+            try:
+                cand_rows = _query(
+                    """
+                    SELECT p.display_name
+                    FROM game_players gp
+                    JOIN players p ON p.player_id = gp.player_id
+                                  AND p.sport     = gp.sport
+                    WHERE gp.event_id = ?
+                    LIMIT 100
+                    """,
+                    [cand_event_id],
+                )
+            except Exception:
+                cand_rows = []
+
+            if any(_player_name_match(player, str(r.get("display_name") or "")) for r in cand_rows):
+                resolved_event_id = cand_event_id
+                event = cand
+                game_status = _normalize_text(str(event.get("status") or ""))
+                game_settled = game_status == "post"
+                try:
+                    rows = _query(sql, [resolved_event_id])
+                except Exception:
+                    rows = []
+                matched_rows = [
+                    r for r in rows
+                    if _player_name_match(player, str(r.get("player_name") or ""))
+                ]
+                break
+
+    if not matched_rows:
+        sport_norm = _normalize_text(sport or str(event.get("sport") or ""))
+        if sport_norm in {"basketball", "nba"} and date:
+            espn_result = _espn_basketball_prop_settlement(
+                player=player,
+                market_norm=market_norm,
+                pick_norm=pick_norm,
+                line=float(line),
+                game_date=_date_only(date) or str(date),
+                team=team or event.get("home_team"),
+                opponent=event.get("away_team"),
+            )
+            if espn_result is not None and espn_result.get("found"):
+                return JSONResponse(status_code=200, content=espn_result)
+
         return JSONResponse(
             status_code=200,
             content={
@@ -2856,10 +3975,10 @@ def stats_prop_check(
                 "settled": False,
                 "espn_limitation": True,
                 "espn_limitation_reason": (
-                    f"Player '{player}' was not found in ESPN data for this game "
+                    f"Player '{player}' was not found in sports.db for this game "
                     f"(event_id={resolved_event_id}). "
-                    "ESPN may not have tracked individual stats for this player, "
-                    "or the player did not participate."
+                    "The game may be ingested without full player box scores — "
+                    "run daily_ingest or retry after ESPN sync."
                 ),
                 "requested_market": market_norm,
                 "requested_player": player,
@@ -2869,7 +3988,7 @@ def stats_prop_check(
         )
 
     # Use the first match (closest name)
-    row = rows[0]
+    row = matched_rows[0]
     player_name = row["player_name"]
     did_not_play = bool(row.get("did_not_play"))
 
@@ -2902,15 +4021,49 @@ def stats_prop_check(
             },
         )
 
-    # ── 8. Try each candidate key until one has a value ────────────────────
+    # ── 8. Extract required stat(s) ─────────────────────────────────────────
     stat_value: float | None = None
     matched_key: str | None = None
-    for key in stat_keys:
-        val = _extract_stat_value(raw_stats.get(key), key)
-        if val is not None:
-            stat_value = val
-            matched_key = key
-            break
+
+    if market_norm in COMPOSITE_PROP_MAP:
+        component_values: list[float] = []
+        missing_keys: list[str] = []
+        for key in COMPOSITE_PROP_MAP[market_norm]:
+            val = _extract_stat_value(raw_stats.get(key), key)
+            if val is None:
+                missing_keys.append(key)
+            else:
+                component_values.append(val)
+
+        if missing_keys:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "player": player_name,
+                    "outcome": "pending",
+                    "settled": False,
+                    "espn_limitation": True,
+                    "espn_limitation_reason": (
+                        f"ESPN data for {player_name} in this game is missing one or more "
+                        f"components for '{market_norm}' (missing: {missing_keys})."
+                    ),
+                    "requested_market": market_norm,
+                    "espn_stat_keys_tried": COMPOSITE_PROP_MAP[market_norm],
+                    "espn_available_stats": available_keys,
+                    "espn_supported_markets": SUPPORTED_PROP_MARKETS,
+                },
+            )
+
+        stat_value = float(sum(component_values))
+        matched_key = "+".join(COMPOSITE_PROP_MAP[market_norm])
+    else:
+        for key in stat_keys:
+            val = _extract_stat_value(raw_stats.get(key), key)
+            if val is not None:
+                stat_value = val
+                matched_key = key
+                break
 
     if stat_value is None:
         keys_tried = stat_keys

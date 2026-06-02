@@ -59,6 +59,7 @@ EXTERNAL_REFRESH_EVERY = 2  # every 2nd poll cycle (~60s at 30s interval)
 
 LEAGUES: dict[str, tuple[str, str]] = {
     "nba":        ("basketball",  "nba"),
+    "wnba":       ("basketball",  "wnba"),
     "ncaab":      ("basketball",  "mens-college-basketball"),
     "nhl":        ("hockey",      "nhl"),
     "nfl":        ("football",    "nfl"),
@@ -72,6 +73,7 @@ LEAGUES: dict[str, tuple[str, str]] = {
     "uel":        ("soccer",      "uefa.europa"),
     "mls":        ("soccer",      "usa.1"),
     "cricket":    ("cricket",     "icc-cricket"),
+    "ufc":        ("mma",          "ufc"),
 }
 
 PREFERRED_PROVIDERS = [
@@ -97,6 +99,7 @@ INJURY_REFRESH_EVERY = 20  # every 20th poll cycle (~10 min at 30s interval)
 # Sports/leagues to fetch injuries for (team-based sports only)
 INJURY_LEAGUES: list[tuple[str, str, str]] = [
     ("basketball", "nba",             "nba"),
+    ("basketball", "wnba",            "wnba"),
     ("hockey",     "nhl",             "nhl"),
     ("baseball",   "mlb",             "mlb"),
     ("soccer",     "eng.1",           "epl"),
@@ -446,6 +449,88 @@ def build_game_state(
 
         # Internal tracking
         "_fetched_at": _now_iso(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# MMA bout state builder
+# ---------------------------------------------------------------------------
+
+def build_mma_bout_state(
+    sport: str,
+    league: str,
+    league_key: str,
+    event: dict,
+    comp: dict,
+) -> dict:
+    """Build a game state dict for a single MMA bout from an ESPN competition."""
+    event_id = event.get("id", "")
+    comp_id  = comp.get("id", "")
+    bout_id  = f"{event_id}_{comp_id}"
+
+    state, detail, period, clock = _parse_status(comp)
+
+    competitors = comp.get("competitors", [])
+    # MMA has no homeAway; treat order=0 as "home" and order=1 as "away"
+    f1_raw = next((c for c in competitors if c.get("order") == 0), competitors[0] if competitors else {})
+    f2_raw = next((c for c in competitors if c.get("order") == 1), competitors[1] if len(competitors) > 1 else {})
+
+    def fighter_info(raw: dict) -> dict:
+        ath = raw.get("athlete", {})
+        return {
+            "team_id":   ath.get("id", ""),
+            "team_name": ath.get("displayName", ath.get("fullName", "")),
+            "team_abbr": ath.get("shortName", ath.get("displayName", "")[:10]),
+            "score":     None,
+            "is_winner": raw.get("winner"),
+            "record":    ath.get("record", ""),
+        }
+
+    home = fighter_info(f1_raw)
+    away = fighter_info(f2_raw)
+
+    # Scheduled rounds from competition format
+    comp_format = comp.get("format", {})
+    reg = comp_format.get("regulation", {})
+    scheduled_rounds = reg.get("periods") or reg.get("totalPeriods") or 3
+
+    f1_name = home.get("team_name", "")
+    f2_name = away.get("team_name", "")
+    bout_name  = f"{f1_name} vs {f2_name}" if f1_name or f2_name else event.get("name", "")
+    bout_short = bout_name[:40]
+
+    venue_raw  = comp.get("venue", {})
+    broadcasts = [
+        b.get("names", [""])[0]
+        for b in comp.get("broadcasts", [])
+        if b.get("names")
+    ]
+
+    return {
+        "event_id":          bout_id,
+        "name":              bout_name,
+        "short_name":        bout_short,
+        "date":              event.get("date", ""),
+        "sport":             sport,
+        "league":            league,
+        "league_key":        league_key,
+        "status":            state,
+        "status_detail":     detail,
+        "period":            period,
+        "clock":             clock,
+        "scheduled_rounds":  scheduled_rounds,
+        "home":              home,
+        "away":              away,
+        "situation":         {},
+        "odds":              {},
+        "win_prob":          {},
+        "players":           [],
+        "formations":        {},
+        "players_fetched_at": None,
+        "venue":             venue_raw.get("fullName", ""),
+        "city":              venue_raw.get("address", {}).get("city", ""),
+        "broadcasts":        broadcasts,
+        "_fetched_at":       _now_iso(),
     }
 
 
@@ -1040,6 +1125,53 @@ def poll_once(
             eid = event.get("id", "")
             if not eid:
                 continue
+
+            # MMA: one ESPN event = entire card; flatten to individual bouts
+            if sport == "mma":
+                for comp in event.get("competitions", []):
+                    comp_id = comp.get("id", "")
+                    if not comp_id:
+                        continue
+                    bout_eid = f"{eid}_{comp_id}"
+                    old_bout = previous_states.get(bout_eid, {})
+                    new_comp_state = (
+                        comp.get("status", {}).get("type", {}).get("state", "pre")
+                    )
+                    try:
+                        gs = build_mma_bout_state(sport, league, league_key, event, comp)
+                    except Exception:
+                        gs = old_bout
+                    if not gs:
+                        continue
+                    new_states[bout_eid] = gs
+                    game_finishing = (
+                        old_bout.get("status") == "in" and new_comp_state == "post"
+                    )
+                    if old_bout:
+                        all_events.extend(detect_changes(old_bout, gs))
+                        if game_finishing or (
+                            old_bout.get("status") != "post" and gs.get("status") == "post"
+                        ):
+                            try:
+                                archive_finished_game(gs, data_dir=data_dir)
+                            except Exception as exc:
+                                print(
+                                    f"  [archive-warn] {gs.get('short_name')}: {exc}",
+                                    file=sys.stderr,
+                                )
+                    else:
+                        all_events.append({
+                            "type":         "NEW_GAME_DISCOVERED",
+                            "event_id":     gs["event_id"],
+                            "game":         gs.get("short_name", gs.get("name", "")),
+                            "sport":        gs.get("sport", ""),
+                            "league":       gs.get("league", ""),
+                            "league_key":   gs.get("league_key", ""),
+                            "status":       gs.get("status", ""),
+                            "scheduled_at": gs.get("date", ""),
+                            "timestamp":    _now_iso(),
+                        })
+                continue  # skip standard build_game_state for MMA events
 
             old_state = previous_states.get(eid, {})
 
