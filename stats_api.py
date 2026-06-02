@@ -1178,9 +1178,17 @@ def stats_market_check(
                 # pick is team name or "home"/"away"
                 side = _resolve_pick_side(pick, event or {})
                 if side == "home":
-                    outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
+                    outcome = (
+                        "win"
+                        if stat_value == 1.0
+                        else ("push" if stat_value == 0.5 else "loss")
+                    )
                 elif side == "away":
-                    outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
+                    outcome = (
+                        "win"
+                        if stat_value == 0.0
+                        else ("push" if stat_value == 0.5 else "loss")
+                    )
                 else:
                     outcome = "pending"
                 if outcome == "win":
@@ -1245,7 +1253,7 @@ def stats_market_check(
                 # Unknown MLB market type in this endpoint
                 outcome = "pending"
                 settled = False
-            
+
             return JSONResponse(
                 status_code=200,
                 content={
@@ -1282,7 +1290,7 @@ def stats_market_check(
             game_date=_date_only(date),
             team=team,
             opponent=opponent,
-            selection=pick,   # used for scorer/card markets
+            selection=pick,  # used for scorer/card markets
             pick=pick_norm,
             line=line,
         )
@@ -1333,25 +1341,25 @@ def stats_market_check(
                     # pick: "draw"/"yes" → bet on draw; any team name → bet on that side
                     p = pick_norm
                     if p in ("draw", "yes", "over"):
-                        result_bool = (stat_value == 0.5)
+                        result_bool = stat_value == 0.5
                     elif p in ("no", "under"):
-                        result_bool = (stat_value != 0.5)
+                        result_bool = stat_value != 0.5
                     else:
                         side = _resolve_pick_side(pick, mini_event)
                         if side == "home":
-                            result_bool = (stat_value == 1.0)
+                            result_bool = stat_value == 1.0
                         elif side == "away":
-                            result_bool = (stat_value == 0.0)
+                            result_bool = stat_value == 0.0
                         else:
                             result_bool = None
                 else:
                     side = _resolve_pick_side(pick, mini_event)
                     if side == "home":
-                        result_bool = (stat_value == 1.0)
+                        result_bool = stat_value == 1.0
                     elif side == "away":
-                        result_bool = (stat_value == 0.0)
+                        result_bool = stat_value == 0.0
                     elif side == "draw":
-                        result_bool = (stat_value == 0.5)
+                        result_bool = stat_value == 0.5
                     else:
                         result_bool = None
                 if result_bool is True:
@@ -1370,7 +1378,12 @@ def stats_market_check(
                 if result_bool is not None:
                     outcome = "win" if result_bool else "loss"
 
-            elif sofa_market_type in ("total_goals", "total_corners", "team_total_goals", "team_total_corners"):
+            elif sofa_market_type in (
+                "total_goals",
+                "total_corners",
+                "team_total_goals",
+                "team_total_corners",
+            ):
                 if line is None:
                     raise HTTPException(
                         status_code=400,
@@ -1430,8 +1443,10 @@ def stats_market_check(
                     outcome = "win" if result_bool else "loss"
 
             elif sofa_market_type in (
-                "anytime_goal_scorer", "first_goal_scorer",
-                "last_goal_scorer", "anytime_card_receiver",
+                "anytime_goal_scorer",
+                "first_goal_scorer",
+                "last_goal_scorer",
+                "anytime_card_receiver",
             ):
                 result_bool = bool(stat_value)
                 outcome = "win" if result_bool else "loss"
@@ -1454,7 +1469,127 @@ def stats_market_check(
                     "away_score": sofa_result.get("away_score"),
                 },
             )
-        # SofaScore match not found — fall through to Fotmob / DuckDB resolution
+        # SofaScore match not found — fall through to Tennis / DuckDB resolution
+
+    # ── Tennis market check via SofaScore ────────────────────────────────────
+    import tennis_sofascore_props as _tsofa
+
+    tennis_entry = _tsofa.TENNIS_PROP_STAT_MAP.get(market_norm)
+    if sport_norm in ("tennis", "atp", "wta", "itf") and tennis_entry is not None:
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to settle tennis market via SofaScore.",
+            )
+
+        # For tennis `team` holds player 1's name; `opponent` holds player 2's name.
+        tennis_result = _tsofa.prop_check(
+            market=market_norm,
+            game_date=_date_only(date),
+            player=team,
+            opponent=opponent,
+            pick=pick_norm,
+            line=line,
+        )
+
+        if tennis_result.get("found"):
+            stat_value = tennis_result["stat_value"]
+            settled = tennis_result.get("settled", False)
+            _, tennis_market_type = tennis_entry
+            outcome = "pending"
+            result_bool: bool | None = None
+
+            mini_event = {
+                "home_team": tennis_result.get("home_team", ""),
+                "away_team": tennis_result.get("away_team", ""),
+            }
+
+            if tennis_market_type == "moneyline":
+                side = _resolve_pick_side(pick, mini_event)
+                if side == "home":
+                    result_bool = stat_value == 1.0
+                elif side == "away":
+                    result_bool = stat_value == 0.0
+                if result_bool is not None:
+                    outcome = "win" if result_bool else "loss"
+
+            elif tennis_market_type in ("game_spread", "set_handicap"):
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                side = _resolve_pick_side(pick, mini_event)
+                if side not in ("home", "away"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="pick must be home, away, or a matching player name for spread/handicap markets",
+                    )
+                # stat_value = h_total - a_total; flip sign for away picks
+                effective = stat_value if side == "home" else -stat_value
+                adjusted = effective + line
+                if adjusted > 0:
+                    outcome, result_bool = "win", True
+                elif adjusted < 0:
+                    outcome, result_bool = "loss", False
+                else:
+                    outcome, result_bool = "push", None
+
+            elif tennis_market_type in (
+                "total_games",
+                "total_sets",
+                "player_games_won",
+                "player_sets_won",
+            ):
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            elif tennis_market_type == "tiebreak":
+                p = pick_norm
+                if p in ("yes", "over"):
+                    result_bool = bool(stat_value)
+                elif p in ("no", "under"):
+                    result_bool = not bool(stat_value)
+                if result_bool is not None:
+                    outcome = "win" if result_bool else "loss"
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "market": market_norm,
+                    "pick": pick,
+                    "line": line,
+                    "result": result_bool,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": "sofascore_tennis",
+                    "match_id": tennis_result.get("match_id"),
+                    "game_status": tennis_result.get("game_status"),
+                    "home_sets": tennis_result.get("home_sets"),
+                    "away_sets": tennis_result.get("away_sets"),
+                    # home_score/away_score = sets won, consumed by _build_settlement
+                    "home_score": tennis_result.get("home_sets"),
+                    "away_score": tennis_result.get("away_sets"),
+                },
+            )
+        # SofaScore tennis match not found — fall through to DuckDB resolution
 
     # ── Normal event resolution for non-MLB or MLB not found ─────────────────
     event = _resolve_event(event_id, _date_only(date), sport, team, opponent)
@@ -1476,7 +1611,6 @@ def stats_market_check(
                 },
             },
         )
-
 
     return JSONResponse(_evaluate_market(event, market, pick, line))
 
@@ -2362,18 +2496,22 @@ ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset(
         "player_aces",
         "player_double_faults",
         "player_sets_won",
+        "player_games_won",
     }
 )
 
 SUPPORTED_PROP_MARKETS: list[str] = sorted(
-    set(list(PROP_STAT_MAP.keys()) + [
-        "player_runs",
-        "player_home_runs",
-        "player_doubles",
-        "player_triples",
-        "player_hits_runs_rbis",
-        "player_outs",
-    ])
+    set(
+        list(PROP_STAT_MAP.keys())
+        + [
+            "player_runs",
+            "player_home_runs",
+            "player_doubles",
+            "player_triples",
+            "player_hits_runs_rbis",
+            "player_outs",
+        ]
+    )
 )
 
 
@@ -2440,6 +2578,60 @@ def stats_prop_check(
             status_code=400,
             detail="pick must be 'over' or 'under' for player prop bets.",
         )
+
+    # ── 1b. Tennis player markets via SofaScore ────────────────────────────
+    # player_games_won / player_sets_won are not in ESPN — route directly to
+    # tennis_sofascore_props before the ESPN unsupported-market gate.
+    _TENNIS_PLAYER_PROP_MARKETS = {"player_games_won", "player_sets_won"}
+    if market_norm in _TENNIS_PLAYER_PROP_MARKETS:
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to settle tennis player market via SofaScore.",
+            )
+        import tennis_sofascore_props as _tsofa
+
+        # `player` = player being tracked; `team` = opponent name hint for match lookup
+        tresult = _tsofa.prop_check(
+            market=market_norm,
+            game_date=_date_only(date),
+            player=player,
+            opponent=team,
+            pick=pick_norm,
+            line=line,
+        )
+        if tresult.get("found"):
+            stat_value = tresult["stat_value"]
+            settled = tresult.get("settled", False)
+            outcome = "pending"
+            if settled and stat_value is not None:
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "player": player,
+                    "market": market_norm,
+                    "pick": pick_norm,
+                    "line": line,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": "sofascore_tennis",
+                    "match_id": tresult.get("match_id"),
+                    "game_status": tresult.get("game_status"),
+                    # home_score/away_score = sets won, consumed by _build_settlement
+                    "home_score": tresult.get("home_sets"),
+                    "away_score": tresult.get("away_sets"),
+                    "espn_limitation": False,
+                },
+            )
+        # Match not found — fall through to ESPN unsupported gate for clear error
 
     # ── 2. Definitively unsupported by ESPN ────────────────────────────────
     if market_norm in ESPN_UNSUPPORTED_PROPS:
