@@ -487,7 +487,9 @@ def _fetch_mma_event_espn(
             f"?dates={espn_date}"
         )
         try:
-            with _httpx.Client(timeout=_ESPN_HTTP_TIMEOUT, follow_redirects=True) as client:
+            with _httpx.Client(
+                timeout=_ESPN_HTTP_TIMEOUT, follow_redirects=True
+            ) as client:
                 r = client.get(url)
             if r.status_code != 200:
                 continue
@@ -525,24 +527,24 @@ def _fetch_mma_event_espn(
                 f1_name = f1.get("athlete", {}).get("displayName", "")
 
                 return {
-                    "event_id":        str(comp.get("id", "")),
-                    "date":            event.get("date", ""),
-                    "sport":           "mma",
-                    "league":          "ufc",
-                    "name":            f"{f0_name} vs {f1_name}",
-                    "short_name":      f"{f0_name} vs {f1_name}",
-                    "status":          status,
-                    "home_team":       f0_name,
-                    "home_abbr":       f0.get("athlete", {}).get("shortName", f0_name[:10]),
-                    "away_team":       f1_name,
-                    "away_abbr":       f1.get("athlete", {}).get("shortName", f1_name[:10]),
-                    "home_score":      None,
-                    "away_score":      None,
-                    "home_is_winner":  f0.get("winner"),
-                    "away_is_winner":  f1.get("winner"),
-                    "period":          period,
+                    "event_id": str(comp.get("id", "")),
+                    "date": event.get("date", ""),
+                    "sport": "mma",
+                    "league": "ufc",
+                    "name": f"{f0_name} vs {f1_name}",
+                    "short_name": f"{f0_name} vs {f1_name}",
+                    "status": status,
+                    "home_team": f0_name,
+                    "home_abbr": f0.get("athlete", {}).get("shortName", f0_name[:10]),
+                    "away_team": f1_name,
+                    "away_abbr": f1.get("athlete", {}).get("shortName", f1_name[:10]),
+                    "home_score": None,
+                    "away_score": None,
+                    "home_is_winner": f0.get("winner"),
+                    "away_is_winner": f1.get("winner"),
+                    "period": period,
                     "scheduled_rounds": scheduled_rounds,
-                    "source":          "espn_mma",
+                    "source": "espn_mma",
                 }
 
     return None
@@ -557,10 +559,12 @@ def _espn_scoreboard_dates(game_date: str | None) -> list[str]:
         from datetime import date as _dt, timedelta as _td
 
         base = _dt.fromisoformat(game_date)
-        dates.extend([
-            (base - _td(days=1)).strftime("%Y%m%d"),
-            (base + _td(days=1)).strftime("%Y%m%d"),
-        ])
+        dates.extend(
+            [
+                (base - _td(days=1)).strftime("%Y%m%d"),
+                (base + _td(days=1)).strftime("%Y%m%d"),
+            ]
+        )
     except Exception:
         pass
     return dates
@@ -581,7 +585,9 @@ def _fetch_basketball_event_espn(
             f"?dates={espn_date}&limit=100"
         )
         try:
-            with _httpx.Client(timeout=_ESPN_HTTP_TIMEOUT, follow_redirects=True) as client:
+            with _httpx.Client(
+                timeout=_ESPN_HTTP_TIMEOUT, follow_redirects=True
+            ) as client:
                 r = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code != 200:
                 continue
@@ -592,8 +598,14 @@ def _fetch_basketball_event_espn(
         for event in data.get("events", []):
             for comp in event.get("competitions", []):
                 competitors = comp.get("competitors", [])
-                home_c = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0] if competitors else {})
-                away_c = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1] if len(competitors) > 1 else {})
+                home_c = next(
+                    (c for c in competitors if c.get("homeAway") == "home"),
+                    competitors[0] if competitors else {},
+                )
+                away_c = next(
+                    (c for c in competitors if c.get("homeAway") == "away"),
+                    competitors[1] if len(competitors) > 1 else {},
+                )
                 home_team = (home_c.get("team") or {}).get("displayName", "")
                 away_team = (away_c.get("team") or {}).get("displayName", "")
                 candidate = {
@@ -604,7 +616,8 @@ def _fetch_basketball_event_espn(
                     "name": event.get("name", ""),
                     "short_name": event.get("shortName", ""),
                     "status": {"pre": "pre", "in": "in"}.get(
-                        comp.get("status", {}).get("type", {}).get("state", "post"), "post"
+                        comp.get("status", {}).get("type", {}).get("state", "post"),
+                        "post",
                     ),
                     "home_team": home_team,
                     "home_abbr": (home_c.get("team") or {}).get("abbreviation", ""),
@@ -629,12 +642,16 @@ def _parse_espn_boxscore_players(summary: dict[str, Any]) -> list[dict[str, Any]
             for ae in stat_group.get("athletes", []):
                 ath = ae.get("athlete", {})
                 raw_stats: list[str] = ae.get("stats", [])
-                players.append({
-                    "display_name": ath.get("displayName", ath.get("shortName", "")),
-                    "did_not_play": bool(ae.get("didNotPlay")),
-                    "dnp_reason": ae.get("reason", ""),
-                    "stats": dict(zip(names, raw_stats)),
-                })
+                players.append(
+                    {
+                        "display_name": ath.get(
+                            "displayName", ath.get("shortName", "")
+                        ),
+                        "did_not_play": bool(ae.get("didNotPlay")),
+                        "dnp_reason": ae.get("reason", ""),
+                        "stats": dict(zip(names, raw_stats)),
+                    }
+                )
     return players
 
 
@@ -729,10 +746,14 @@ def _evaluate_prop_from_stats(
     }
 
 
-def _fetch_espn_nba_summary(event_id: str, league: str = "nba") -> dict[str, Any] | None:
+def _fetch_espn_nba_summary(
+    event_id: str, league: str = "nba"
+) -> dict[str, Any] | None:
     import httpx as _httpx
 
-    summary_url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/{league}/summary"
+    summary_url = (
+        f"https://site.api.espn.com/apis/site/v2/sports/basketball/{league}/summary"
+    )
     try:
         with _httpx.Client(timeout=_ESPN_HTTP_TIMEOUT, follow_redirects=True) as client:
             r = client.get(
@@ -787,7 +808,9 @@ def _espn_basketball_prop_settlement(
         cn = _normalize_text(cand)
         return bool(qn and cn and (qn == cn or qn in cn or cn in qn))
 
-    matched = next((p for p in players if _names_match(player, p["display_name"])), None)
+    matched = next(
+        (p for p in players if _names_match(player, p["display_name"])), None
+    )
     if not matched:
         return {
             "found": False,
@@ -1001,7 +1024,7 @@ def _evaluate_market(
         # MMA: did the fight last all scheduled rounds (go to judges' decision)?
         # Accept yes/no and over/under as equivalent picks.
         _YES_PICKS = {"yes", "over"}
-        _NO_PICKS  = {"no", "under"}
+        _NO_PICKS = {"no", "under"}
         if pick_norm not in _YES_PICKS | _NO_PICKS:
             raise HTTPException(
                 status_code=400,
@@ -1472,7 +1495,7 @@ def stats_team(
         ]
     else:
         # Fallback to archive
-        # Find team_id from name
+        # Find team_id from name.
         team_sql = """
             SELECT team_id FROM teams
             WHERE LOWER(team_name) LIKE LOWER(?)
@@ -2116,7 +2139,9 @@ def stats_market_check(
                         "outcome": "pending",
                         "settled": False,
                         "source": "nba_period_props",
-                        "note": result.get("note", "NBA period lookup did not find data."),
+                        "note": result.get(
+                            "note", "NBA period lookup did not find data."
+                        ),
                         "game_id": result.get("game_id"),
                         "game_status": result.get("game_status"),
                     },
@@ -2228,7 +2253,9 @@ def stats_market_check(
                     "outcome": "pending",
                     "settled": False,
                     "source": "mlb_period_props",
-                    "note": result.get("note", "MLB Period Props lookup did not find data."),
+                    "note": result.get(
+                        "note", "MLB Period Props lookup did not find data."
+                    ),
                     "game_pk": result.get("game_pk"),
                     "game_status": result.get("game_status"),
                 },
@@ -2242,9 +2269,17 @@ def stats_market_check(
             # pick is team name or "home"/"away"
             side = _resolve_pick_side(pick, event)
             if side == "home":
-                outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
+                outcome = (
+                    "win"
+                    if stat_value == 1.0
+                    else ("push" if stat_value == 0.5 else "loss")
+                )
             elif side == "away":
-                outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
+                outcome = (
+                    "win"
+                    if stat_value == 0.0
+                    else ("push" if stat_value == 0.5 else "loss")
+                )
             else:
                 outcome = "pending"
             if outcome == "win":
@@ -2309,7 +2344,7 @@ def stats_market_check(
             # Unknown MLB market type in this endpoint
             outcome = "pending"
             settled = False
-        
+
         return JSONResponse(
             status_code=200,
             content={
@@ -2378,11 +2413,21 @@ def stats_market_check(
             outcome = "pending"
         elif nba_market_type == "moneyline":
             # stat_value: 1.0=home won, 0.0=away won, 0.5=tie
-            side = _resolve_pick_side(pick, event, team_hint=team, opponent_hint=opponent)
+            side = _resolve_pick_side(
+                pick, event, team_hint=team, opponent_hint=opponent
+            )
             if side == "home":
-                outcome = "win" if stat_value == 1.0 else ("push" if stat_value == 0.5 else "loss")
+                outcome = (
+                    "win"
+                    if stat_value == 1.0
+                    else ("push" if stat_value == 0.5 else "loss")
+                )
             elif side == "away":
-                outcome = "win" if stat_value == 0.0 else ("push" if stat_value == 0.5 else "loss")
+                outcome = (
+                    "win"
+                    if stat_value == 0.0
+                    else ("push" if stat_value == 0.5 else "loss")
+                )
             else:
                 raise HTTPException(
                     status_code=400,
@@ -2396,7 +2441,9 @@ def stats_market_check(
 
         elif nba_market_type == "point_spread":
             # stat_value: period diff (home - away)
-            side = _resolve_pick_side(pick, event, team_hint=team, opponent_hint=opponent)
+            side = _resolve_pick_side(
+                pick, event, team_hint=team, opponent_hint=opponent
+            )
             if side not in {"home", "away"}:
                 raise HTTPException(
                     status_code=400,
@@ -2409,7 +2456,9 @@ def stats_market_check(
                 )
             resolved_pick = side
             diff = float(stat_value)
-            adjusted = (diff + resolved_line) if side == "home" else ((-diff) + resolved_line)
+            adjusted = (
+                (diff + resolved_line) if side == "home" else ((-diff) + resolved_line)
+            )
             if adjusted > 0:
                 outcome = "win"
                 result_bool = True
@@ -2496,7 +2545,9 @@ def stats_market_check(
                 )
             resolved_pick = pick_yes_no
             had_ot = bool(stat_value)
-            if (had_ot and pick_yes_no == "yes") or ((not had_ot) and pick_yes_no == "no"):
+            if (had_ot and pick_yes_no == "yes") or (
+                (not had_ot) and pick_yes_no == "no"
+            ):
                 outcome = "win"
                 result_bool = True
             else:
@@ -2531,7 +2582,11 @@ def stats_market_check(
                     status_code=400,
                     detail=f"pick must be a player name for market '{market_norm}'.",
                 )
-            if first_player and (pick_player == first_player or pick_player in first_player or first_player in pick_player):
+            if first_player and (
+                pick_player == first_player
+                or pick_player in first_player
+                or first_player in pick_player
+            ):
                 outcome = "win"
                 result_bool = True
             else:
@@ -2549,7 +2604,9 @@ def stats_market_check(
                 "market": market_norm,
                 "pick": resolved_pick,
                 "line": resolved_line,
-                "player": result.get("player") if nba_market_type == "player_points" else None,
+                "player": (
+                    result.get("player") if nba_market_type == "player_points" else None
+                ),
                 "result": result_bool,
                 "stat_value": stat_value,
                 "outcome": outcome,
@@ -2561,7 +2618,11 @@ def stats_market_check(
                 "away_score": result.get("away_score"),
                 "event": {
                     "event_id": str(event.get("event_id") or ""),
-                    "date": str(event.get("date")) if event.get("date") is not None else None,
+                    "date": (
+                        str(event.get("date"))
+                        if event.get("date") is not None
+                        else None
+                    ),
                     "sport": event.get("sport"),
                     "league": event.get("league"),
                     "name": event.get("name"),
@@ -3479,14 +3540,18 @@ ESPN_UNSUPPORTED_PROPS: frozenset[str] = frozenset(
 )
 
 SUPPORTED_PROP_MARKETS: list[str] = sorted(
-    set(list(PROP_STAT_MAP.keys()) + list(COMPOSITE_PROP_MAP.keys()) + [
-        "player_runs",
-        "player_home_runs",
-        "player_doubles",
-        "player_triples",
-        "player_hits_runs_rbis",
-        "player_outs",
-    ])
+    set(
+        list(PROP_STAT_MAP.keys())
+        + list(COMPOSITE_PROP_MAP.keys())
+        + [
+            "player_runs",
+            "player_home_runs",
+            "player_doubles",
+            "player_triples",
+            "player_hits_runs_rbis",
+            "player_outs",
+        ]
+    )
 )
 
 
@@ -3816,7 +3881,10 @@ def stats_prop_check(
                 )
             except Exception:
                 probe_rows = []
-            if any(_player_name_match(player, str(r.get("display_name") or "")) for r in probe_rows):
+            if any(
+                _player_name_match(player, str(r.get("display_name") or ""))
+                for r in probe_rows
+            ):
                 event = cand
                 break
 
@@ -3878,7 +3946,9 @@ def stats_prop_check(
             },
         )
 
-    matched_rows = [r for r in rows if _player_name_match(player, str(r.get("player_name") or ""))]
+    matched_rows = [
+        r for r in rows if _player_name_match(player, str(r.get("player_name") or ""))
+    ]
 
     # Fast path: game is in DB but player row missing — one ESPN summary call (~2s).
     if not matched_rows:
@@ -3902,17 +3972,25 @@ def stats_prop_check(
 
     # If caller passed a stale/wrong event_id, try re-resolving by date/sport/team
     # and selecting the candidate event that actually contains this player.
-    if not matched_rows and date and _normalize_text(sport or "") not in {"basketball", "nba"}:
+    if (
+        not matched_rows
+        and date
+        and _normalize_text(sport or "") not in {"basketball", "nba"}
+    ):
         try:
-            candidate_events = _historical_event_candidates(None, _date_only(date), sport)
+            candidate_events = _historical_event_candidates(
+                None, _date_only(date), sport
+            )
         except Exception:
             candidate_events = []
 
         if team:
             team_norm = _normalize_text(team)
             candidate_events = [
-                c for c in candidate_events
-                if team_norm in {
+                c
+                for c in candidate_events
+                if team_norm
+                in {
                     _normalize_text(str(c.get("home_team") or "")),
                     _normalize_text(str(c.get("away_team") or "")),
                 }
@@ -3937,7 +4015,10 @@ def stats_prop_check(
             except Exception:
                 cand_rows = []
 
-            if any(_player_name_match(player, str(r.get("display_name") or "")) for r in cand_rows):
+            if any(
+                _player_name_match(player, str(r.get("display_name") or ""))
+                for r in cand_rows
+            ):
                 resolved_event_id = cand_event_id
                 event = cand
                 game_status = _normalize_text(str(event.get("status") or ""))
@@ -3947,7 +4028,8 @@ def stats_prop_check(
                 except Exception:
                     rows = []
                 matched_rows = [
-                    r for r in rows
+                    r
+                    for r in rows
                     if _player_name_match(player, str(r.get("player_name") or ""))
                 ]
                 break
