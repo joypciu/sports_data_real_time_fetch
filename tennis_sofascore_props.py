@@ -90,16 +90,27 @@ TENNIS_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
 
 
 def _get(path: str) -> dict[str, Any]:
-    """Best-effort GET with Cloudflare bypass; returns {} on any failure."""
+    """Best-effort GET with Cloudflare bypass; returns {} on any failure.
+
+    If the environment variable SOFASCORE_PROXY is set, all requests are
+    routed through that proxy (e.g. socks5://user:pass@host:port or
+    http://user:pass@host:port). This is required on VPS/datacenter
+    deployments where SofaScore blocks the IP via Cloudflare.
+    """
+    import os
     url = f"{_BASE}{path}" if path.startswith("/") else path
+    _proxy = os.environ.get("SOFASCORE_PROXY") or None
+    _proxies = {"http": _proxy, "https": _proxy} if _proxy else None
     if _CURL_AVAILABLE:
         try:
-            resp = _cffi_requests.get(
-                url,
-                headers=_HEADERS,
-                timeout=_TIMEOUT,
-                impersonate=random.choice(_IMPERSONATE_PROFILES),
-            )
+            kwargs: dict[str, Any] = {
+                "headers": _HEADERS,
+                "timeout": _TIMEOUT,
+                "impersonate": random.choice(_IMPERSONATE_PROFILES),
+            }
+            if _proxy:
+                kwargs["proxies"] = _proxies
+            resp = _cffi_requests.get(url, **kwargs)
             if resp.status_code == 429:
                 time.sleep(5)
                 return {}
@@ -110,11 +121,13 @@ def _get(path: str) -> dict[str, Any]:
             return {}
     else:
         try:
+            proxy_map = {"http://": _proxy, "https://": _proxy} if _proxy else None
             resp = _httpx.get(
                 url,
                 headers={**_HEADERS, "User-Agent": "Mozilla/5.0"},
                 timeout=float(_TIMEOUT),
                 follow_redirects=True,
+                proxies=proxy_map,
             )
             if resp.status_code != 200:
                 return {}
