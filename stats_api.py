@@ -2100,6 +2100,210 @@ def stats_market_check(
             )
         # SofaScore tennis match not found — fall through to DuckDB resolution
 
+    # ── Hockey market check via SofaScore ────────────────────────────────────
+    import hockey_sofascore_props as _hsofa
+
+    hockey_entry = _hsofa.HOCKEY_PROP_STAT_MAP.get(market_norm)
+    if (
+        sport_norm in ("hockey", "ice_hockey", "ice hockey", "nhl", "ahl")
+        and hockey_entry is not None
+    ):
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to settle hockey market via SofaScore.",
+            )
+
+        hockey_result = _hsofa.prop_check(
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team,
+            opponent=opponent,
+            selection=pick,  # used for scorer/player markets
+            pick=pick_norm,
+            line=line,
+        )
+
+        if hockey_result.get("found"):
+            stat_value = hockey_result["stat_value"]
+            settled = hockey_result.get("settled", False)
+            _, hockey_market_type = hockey_entry
+            outcome = "pending"
+            result_bool: bool | None = None
+
+            mini_event = {
+                "home_team": hockey_result.get("home_team", ""),
+                "away_team": hockey_result.get("away_team", ""),
+            }
+
+            if hockey_market_type == "moneyline":
+                # stat_value = h_score - a_score (goal diff); positive = home winning
+                side = _resolve_pick_side(pick, mini_event)
+                if side == "home":
+                    result_bool = stat_value > 0
+                elif side == "away":
+                    result_bool = stat_value < 0
+                elif side == "draw":
+                    result_bool = stat_value == 0
+                else:
+                    result_bool = None
+                if result_bool is True:
+                    outcome = "win"
+                elif result_bool is False:
+                    outcome = "loss"
+
+            elif hockey_market_type == "puck_line":
+                # stat_value = h_score - a_score; apply line from pick side
+                side = _resolve_pick_side(pick, mini_event)
+                if side not in {"home", "away"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="For puck_line, pick must be home, away, or a matching team name",
+                    )
+                if line is None:
+                    raise HTTPException(
+                        status_code=400, detail="line is required for puck_line market"
+                    )
+                # stat_value = h - a; for home: adjusted = stat_value + line
+                # for away: diff from away perspective = -stat_value, adjusted = -stat_value + line
+                effective = stat_value if side == "home" else -stat_value
+                adjusted = effective + line
+                if adjusted > 0:
+                    outcome, result_bool = "win", True
+                elif adjusted < 0:
+                    outcome, result_bool = "loss", False
+                else:
+                    outcome, result_bool = "push", None
+
+            elif hockey_market_type == "total_goals":
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            elif hockey_market_type == "team_total_goals":
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            elif hockey_market_type == "odd_even_goals":
+                p = pick_norm
+                if p in ("odd", "over"):
+                    p = "odd"
+                elif p in ("even", "under"):
+                    p = "even"
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be odd/even for market '{market_norm}'",
+                    )
+                is_odd = bool(stat_value)
+                result_bool = (p == "odd") == is_odd
+                outcome = "win" if result_bool else "loss"
+
+            elif hockey_market_type == "btts":
+                p = pick_norm
+                if p in ("yes", "over"):
+                    result_bool = bool(stat_value)
+                elif p in ("no", "under"):
+                    result_bool = not bool(stat_value)
+                else:
+                    result_bool = None
+                if result_bool is not None:
+                    outcome = "win" if result_bool else "loss"
+
+            elif hockey_market_type == "overtime":
+                p = pick_norm
+                if p in ("yes", "over"):
+                    result_bool = bool(stat_value)
+                elif p in ("no", "under"):
+                    result_bool = not bool(stat_value)
+                else:
+                    result_bool = None
+                if result_bool is not None:
+                    outcome = "win" if result_bool else "loss"
+
+            elif hockey_market_type in (
+                "anytime_goal_scorer",
+                "first_goal_scorer",
+                "last_goal_scorer",
+            ):
+                result_bool = bool(stat_value)
+                outcome = "win" if result_bool else "loss"
+
+            elif hockey_market_type in (
+                "player_goals",
+                "player_assists",
+                "player_points",
+                "player_saves",
+                "player_shots_on_goal",
+            ):
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "market": market_norm,
+                    "pick": pick,
+                    "line": line,
+                    "result": result_bool,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": "sofascore_hockey",
+                    "match_id": hockey_result.get("match_id"),
+                    "game_status": hockey_result.get("game_status"),
+                    "home_score": hockey_result.get("home_score"),
+                    "away_score": hockey_result.get("away_score"),
+                    "had_ot": hockey_result.get("had_ot"),
+                },
+            )
+        # SofaScore hockey match not found — fall through to DuckDB resolution
+
     # ── Normal event resolution for non-MLB or MLB not found ─────────────────
     event = _resolve_event(event_id, _date_only(date), sport, team, opponent)
     if event is None:
@@ -3680,6 +3884,71 @@ def stats_prop_check(
                 },
             )
         # Match not found — fall through to ESPN unsupported gate for clear error
+
+    # ── 1c. Hockey player props via SofaScore ─────────────────────────────
+    _HOCKEY_PLAYER_PROP_MARKETS = {
+        "player_goals",
+        "player_assists",
+        "player_points",
+        "player_saves",
+        "player_shots_on_goal",
+    }
+    _sport_for_hockey = _normalize_text(sport or "")
+    if market_norm in _HOCKEY_PLAYER_PROP_MARKETS and _sport_for_hockey in (
+        "hockey",
+        "ice_hockey",
+        "ice hockey",
+        "nhl",
+        "ahl",
+    ):
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to settle hockey player prop via SofaScore.",
+            )
+        import hockey_sofascore_props as _hsofa_prop
+
+        hpresult = _hsofa_prop.prop_check(
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team,
+            opponent=None,
+            selection=player,  # player name used as selection for lookup
+            pick=pick_norm,
+            line=line,
+        )
+        if hpresult.get("found"):
+            stat_value = hpresult["stat_value"]
+            settled = hpresult.get("settled", False)
+            outcome = "pending"
+            if settled and stat_value is not None:
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "player": player,
+                    "market": market_norm,
+                    "pick": pick_norm,
+                    "line": line,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": "sofascore_hockey",
+                    "match_id": hpresult.get("match_id"),
+                    "game_status": hpresult.get("game_status"),
+                    "home_score": hpresult.get("home_score"),
+                    "away_score": hpresult.get("away_score"),
+                    "had_ot": hpresult.get("had_ot"),
+                    "espn_limitation": False,
+                },
+            )
+        # Match or player not found — fall through to ESPN
 
     # ── 2. Definitively unsupported by ESPN ────────────────────────────────
     if market_norm in ESPN_UNSUPPORTED_PROPS:
