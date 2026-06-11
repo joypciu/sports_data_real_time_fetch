@@ -3906,6 +3906,7 @@ def stats_prop_check(
         "player_points",
         "player_saves",
         "player_shots_on_goal",
+        "player_power_play_points",
     }
     _sport_for_hockey = _normalize_text(sport or "")
     if market_norm in _HOCKEY_PLAYER_PROP_MARKETS and _sport_for_hockey in (

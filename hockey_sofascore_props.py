@@ -75,6 +75,7 @@ HOCKEY_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
     "player_points": ("full", "player_points"),
     "player_saves": ("full", "player_saves"),
     "player_shots_on_goal": ("full", "player_shots_on_goal"),
+    "player_power_play_points": ("full", "player_power_play_points"),
     # ── 1st Period ──────────────────────────────────────────────────────────
     "1st_period_moneyline": ("p1", "moneyline"),
     "1st_period_puck_line": ("p1", "puck_line"),
@@ -440,6 +441,7 @@ def prop_check(
     player_goals/assists/ : integer count for identified player
     player_points/saves/  :
     player_shots_on_goal  :
+    player_power_play_points :
     """
     market_norm = market.strip().lower().replace(" ", "_")
     entry = HOCKEY_PROP_STAT_MAP.get(market_norm)
@@ -596,6 +598,7 @@ def prop_check(
         "player_points",
         "player_saves",
         "player_shots_on_goal",
+        "player_power_play_points",
     ):
         target = selection or team or ""
         if not target:
@@ -634,6 +637,8 @@ def prop_check(
             stat_value = _player_stat_value(
                 pstats, "shotsOnGoal", "shotsOnTarget", "shots", "SOG", "S"
             )
+        elif market_type == "player_power_play_points":
+            stat_value = _player_stat_value(pstats, "powerPlayPoints")
 
         if stat_value is None:
             return {
