@@ -5,8 +5,12 @@ from datetime import datetime, timedelta, timezone
 import sofascore_client
 import sofascore_db
 
+import os
 from dotenv import load_dotenv
-load_dotenv()
+
+# Use absolute path to guarantee the cron job finds the .env file
+script_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(dotenv_path=os.path.join(script_dir, '.env'))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
