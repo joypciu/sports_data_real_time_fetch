@@ -246,7 +246,8 @@ def get_ingest_logs(limit: int = 5) -> list[dict[str, Any]]:
     """Return the most recent ingest logs."""
     with get_connection() as conn:
         rows = conn.execute("""
-            SELECT run_id, started_at, finished_at, status, events_seen, events_upserted, details_fetched, duration_sec, error_message
+            SELECT run_id, started_at, finished_at, status, events_seen, events_upserted,
+                   details_fetched, duration_sec, error_message, proxy_used
             FROM sofascore_ingest_log
             ORDER BY started_at DESC
             LIMIT ?
