@@ -1175,6 +1175,20 @@ def _evaluate_market(
 # ---------------------------------------------------------------------------
 
 
+@app.get("/stats/ingest-logs")
+def ingest_logs(
+    limit: int = Query(5, description="Number of recent logs to fetch"),
+    _: None = Depends(_verify_token)
+) -> JSONResponse:
+    """Return the recent background ingest logs from the local Sofascore DB."""
+    try:
+        import sofascore_db
+        logs = sofascore_db.get_ingest_logs(limit=limit)
+        return JSONResponse(content={"status": "ok", "logs": logs})
+    except Exception as e:
+        return JSONResponse(content={"status": "error", "error": str(e)}, status_code=500)
+
+
 @app.get("/health")
 def health(_: None = Depends(_verify_token)) -> JSONResponse:
     """Liveness probe — verifies DB is accessible and live dir exists."""
