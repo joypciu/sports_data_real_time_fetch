@@ -60,9 +60,13 @@ def get(path: str, for_scraper: bool = False, retries: int = 3) -> dict[str, Any
                     kwargs["proxies"] = _proxies
                 resp = _cffi_requests.get(url, **kwargs)
                 if resp.status_code == 429:
+                    import logging
+                    logging.getLogger(__name__).warning("curl_cffi get 429 rate limit (attempt %d/%d) for %s", attempt + 1, retries, url)
                     time.sleep(5)
                     continue
                 if resp.status_code != 200:
+                    import logging
+                    logging.getLogger(__name__).warning("curl_cffi get failed with %d (attempt %d/%d) for %s: %s", resp.status_code, attempt + 1, retries, url, resp.text[:200] if hasattr(resp, 'text') else str(resp.content)[:200])
                     continue
                 return resp.json()
             except Exception as exc:
@@ -81,9 +85,13 @@ def get(path: str, for_scraper: bool = False, retries: int = 3) -> dict[str, Any
                     proxy=_proxy,
                 )
                 if resp.status_code == 429:
+                    import logging
+                    logging.getLogger(__name__).warning("httpx get 429 rate limit (attempt %d/%d) for %s", attempt + 1, retries, url)
                     time.sleep(5)
                     continue
                 if resp.status_code != 200:
+                    import logging
+                    logging.getLogger(__name__).warning("httpx get failed with %d (attempt %d/%d) for %s: %s", resp.status_code, attempt + 1, retries, url, resp.text[:200])
                     continue
                 return resp.json()
             except Exception as exc:
