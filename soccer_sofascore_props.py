@@ -34,30 +34,8 @@ import re
 import time
 from typing import Any, Optional
 
-# curl_cffi gives us a Chrome-impersonation session that bypasses Cloudflare.
-try:
-    from curl_cffi import requests as _cffi_requests  # type: ignore[import]
-    _CURL_AVAILABLE = True
-except ImportError:
-    import httpx as _httpx  # type: ignore[import]
-    _CURL_AVAILABLE = False
-
-_BASE = "https://www.sofascore.com/api/v1"
-_TIMEOUT = 10
-
-_IMPERSONATE_PROFILES = [
-    "chrome",
-    "chrome110",
-    "chrome120",
-    "chrome124",
-    "edge101",
-]
-
-_HEADERS = {
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.sofascore.com/",
-}
+import sofascore_client
+import sofascore_db
 
 # ---------------------------------------------------------------------------
 # Market map  (scope: full | 1h | 2h,  market_type: internal key)
@@ -101,55 +79,7 @@ SOCCER_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
     "2nd_half_team_total_corners":       ("2h", "team_total_corners"),
 }
 
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
-def _get(path: str) -> dict[str, Any]:
-    """Best-effort GET with Cloudflare bypass; returns {} on any failure.
-
-    If the environment variable SOFASCORE_PROXY is set, all requests are
-    routed through that proxy (e.g. socks5://user:pass@host:port or
-    http://user:pass@host:port). This is required on VPS/datacenter
-    deployments where SofaScore blocks the IP via Cloudflare.
-    """
-    import os
-    url = f"{_BASE}{path}" if path.startswith("/") else path
-    _proxy = os.environ.get("SOFASCORE_PROXY") or None
-    _proxies = {"http": _proxy, "https": _proxy} if _proxy else None
-    if _CURL_AVAILABLE:
-        try:
-            kwargs: dict[str, Any] = {
-                "headers": _HEADERS,
-                "timeout": _TIMEOUT,
-                "impersonate": random.choice(_IMPERSONATE_PROFILES),
-            }
-            if _proxy:
-                kwargs["proxies"] = _proxies
-            resp = _cffi_requests.get(url, **kwargs)
-            if resp.status_code == 429:
-                time.sleep(5)
-                return {}
-            if resp.status_code != 200:
-                return {}
-            return resp.json()
-        except Exception:
-            return {}
-    else:
-        try:
-            proxy_map = {"http://": _proxy, "https://": _proxy} if _proxy else None
-            resp = _httpx.get(
-                url,
-                headers={**_HEADERS, "User-Agent": "Mozilla/5.0"},
-                timeout=float(_TIMEOUT),
-                follow_redirects=True,
-                proxies=proxy_map,
-            )
-            if resp.status_code != 200:
-                return {}
-            return resp.json()
-        except Exception:
-            return {}
+# HTTP helpers handled by sofascore_client
 
 
 # ---------------------------------------------------------------------------
@@ -191,43 +121,48 @@ def find_match(
     game_date: str,
     team: str | None,
     opponent: str | None,
-) -> Optional[dict[str, Any]]:
+) -> tuple[Optional[dict[str, Any]], str]:
     """
     Search SofaScore scheduled-events for a football match on *game_date*.
 
-    Returns a dict with keys: match_id, home_team, away_team, home_score_raw,
-    away_score_raw, status_type (finished/inprogress/notstarted), finished.
+    Returns (dict, source).
     """
-    payload = _get(f"/sport/football/scheduled-events/{game_date}")
-    events: list[dict] = payload.get("events") or []
+    db_event = sofascore_db.lookup_event("football", game_date, team, opponent)
+    if db_event:
+        best = db_event
+        source = "sofascore_db"
+    else:
+        payload = sofascore_client.get(f"/sport/football/scheduled-events/{game_date}")
+        events: list[dict] = payload.get("events") or []
 
-    if not events:
-        return None
+        if not events:
+            return None, "sofascore"
 
-    best: dict[str, Any] | None = None
-    best_score = -1.0
+        best = None
+        best_score = -1.0
 
-    for ev in events:
-        home_name = (ev.get("homeTeam") or {}).get("name")
-        away_name = (ev.get("awayTeam") or {}).get("name")
+        for ev in events:
+            home_name = (ev.get("homeTeam") or {}).get("name")
+            away_name = (ev.get("awayTeam") or {}).get("name")
 
-        score = 0.0
-        if team and opponent:
-            score = max(
-                _name_score(team, home_name) + _name_score(opponent, away_name),
-                _name_score(team, away_name) + _name_score(opponent, home_name),
-            )
-        elif team:
-            score = max(_name_score(team, home_name), _name_score(team, away_name))
-        elif opponent:
-            score = max(_name_score(opponent, home_name), _name_score(opponent, away_name))
+            score = 0.0
+            if team and opponent:
+                score = max(
+                    _name_score(team, home_name) + _name_score(opponent, away_name),
+                    _name_score(team, away_name) + _name_score(opponent, home_name),
+                )
+            elif team:
+                score = max(_name_score(team, home_name), _name_score(team, away_name))
+            elif opponent:
+                score = max(_name_score(opponent, home_name), _name_score(opponent, away_name))
 
-        if score > best_score:
-            best_score = score
-            best = ev
+            if score > best_score:
+                best_score = score
+                best = ev
 
-    if not best or best_score < 0.55:
-        return None
+        if not best or best_score < 0.55:
+            return None, "sofascore"
+        source = "sofascore"
 
     status_obj = best.get("status") or {}
     status_type = str(status_obj.get("type") or "").lower()
@@ -241,7 +176,7 @@ def find_match(
         "away_score_raw": best.get("awayScore") or {},
         "status_type": status_type,
         "finished": finished,
-    }
+    }, source
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +224,12 @@ def _extract_corners_from_stats(
 
 
 def _get_corners(match_id: int) -> dict[str, tuple[int, int]]:
-    payload = _get(f"/event/{match_id}/statistics")
+    payload = sofascore_db.lookup_details(str(match_id), "statistics")
+    if not payload:
+        payload = sofascore_client.get(f"/event/{match_id}/statistics")
+        if payload:
+            sofascore_db.upsert_details(str(match_id), "statistics", payload)
+
     stats: list[dict] = payload.get("statistics") or []
     return _extract_corners_from_stats(stats)
 
@@ -326,7 +266,11 @@ def _period_scores(
 # ---------------------------------------------------------------------------
 
 def _get_incidents(match_id: int) -> list[dict[str, Any]]:
-    payload = _get(f"/event/{match_id}/incidents")
+    payload = sofascore_db.lookup_details(str(match_id), "incidents")
+    if not payload:
+        payload = sofascore_client.get(f"/event/{match_id}/incidents")
+        if payload:
+            sofascore_db.upsert_details(str(match_id), "incidents", payload)
     return payload.get("incidents") or []
 
 
@@ -458,7 +402,7 @@ def prop_check(
     scope, market_type = entry
 
     # --- locate the match --------------------------------------------------
-    match_info = find_match(game_date, team, opponent)
+    match_info, source = find_match(game_date, team, opponent)
     if not match_info:
         return {
             "found": False,
@@ -466,7 +410,7 @@ def prop_check(
                 f"No SofaScore match found for date={game_date}, "
                 f"team={team!r}, opponent={opponent!r}."
             ),
-            "source": "sofascore",
+            "source": source,
         }
 
     match_id = match_info["match_id"]
@@ -631,5 +575,5 @@ def prop_check(
         "away_team": away_name,
         "home_score": h_full,
         "away_score": a_full,
-        "source": "sofascore",
+        "source": source,
     }

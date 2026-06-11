@@ -32,31 +32,8 @@ import re
 import time
 from typing import Any, Optional
 
-try:
-    from curl_cffi import requests as _cffi_requests  # type: ignore[import]
-
-    _CURL_AVAILABLE = True
-except ImportError:
-    import httpx as _httpx  # type: ignore[import]
-
-    _CURL_AVAILABLE = False
-
-_BASE = "https://www.sofascore.com/api/v1"
-_TIMEOUT = 10
-
-_IMPERSONATE_PROFILES = [
-    "chrome",
-    "chrome110",
-    "chrome120",
-    "chrome124",
-    "edge101",
-]
-
-_HEADERS = {
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.sofascore.com/",
-}
+import sofascore_client
+import sofascore_db
 
 # ---------------------------------------------------------------------------
 # Market map  (scope: full | s1 | s2,  market_type: internal key)
@@ -89,51 +66,7 @@ TENNIS_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
 # ---------------------------------------------------------------------------
 
 
-def _get(path: str) -> dict[str, Any]:
-    """Best-effort GET with Cloudflare bypass; returns {} on any failure.
-
-    If the environment variable SOFASCORE_PROXY is set, all requests are
-    routed through that proxy (e.g. socks5://user:pass@host:port or
-    http://user:pass@host:port). This is required on VPS/datacenter
-    deployments where SofaScore blocks the IP via Cloudflare.
-    """
-    import os
-    url = f"{_BASE}{path}" if path.startswith("/") else path
-    _proxy = os.environ.get("SOFASCORE_PROXY") or None
-    _proxies = {"http": _proxy, "https": _proxy} if _proxy else None
-    if _CURL_AVAILABLE:
-        try:
-            kwargs: dict[str, Any] = {
-                "headers": _HEADERS,
-                "timeout": _TIMEOUT,
-                "impersonate": random.choice(_IMPERSONATE_PROFILES),
-            }
-            if _proxy:
-                kwargs["proxies"] = _proxies
-            resp = _cffi_requests.get(url, **kwargs)
-            if resp.status_code == 429:
-                time.sleep(5)
-                return {}
-            if resp.status_code != 200:
-                return {}
-            return resp.json()
-        except Exception:
-            return {}
-    else:
-        try:
-            proxy_map = {"http://": _proxy, "https://": _proxy} if _proxy else None
-            resp = _httpx.get(
-                url,
-                headers={**_HEADERS, "User-Agent": "Mozilla/5.0"},
-                timeout=float(_TIMEOUT),
-                follow_redirects=True,
-                proxies=proxy_map,
-            )
-            if resp.status_code != 200:
-                return {}
-            return resp.json()
-        except Exception:
-            return {}
+# HTTP helpers handled by sofascore_client
 
 
 # ---------------------------------------------------------------------------
@@ -177,46 +110,50 @@ def find_match(
     game_date: str,
     player: str | None,
     opponent: str | None,
-) -> Optional[dict[str, Any]]:
+) -> tuple[Optional[dict[str, Any]], str]:
     """
     Search SofaScore scheduled-events for a tennis match on *game_date*.
 
-    Returns a dict with keys: match_id, home_team (player 1 name),
-    away_team (player 2 name), home_score_raw, away_score_raw,
-    status_type, finished.
+    Returns (dict, source).
     """
-    payload = _get(f"/sport/tennis/scheduled-events/{game_date}")
-    events: list[dict] = payload.get("events") or []
+    db_event = sofascore_db.lookup_event("tennis", game_date, player, opponent)
+    if db_event:
+        best = db_event
+        source = "sofascore_db"
+    else:
+        payload = sofascore_client.get(f"/sport/tennis/scheduled-events/{game_date}")
+        events: list[dict] = payload.get("events") or []
 
-    if not events:
-        return None
+        if not events:
+            return None, "sofascore_tennis"
 
-    best: dict[str, Any] | None = None
-    best_score = -1.0
+        best = None
+        best_score = -1.0
 
-    for ev in events:
-        home_name = (ev.get("homeTeam") or {}).get("name")
-        away_name = (ev.get("awayTeam") or {}).get("name")
+        for ev in events:
+            home_name = (ev.get("homeTeam") or {}).get("name")
+            away_name = (ev.get("awayTeam") or {}).get("name")
 
-        score = 0.0
-        if player and opponent:
-            score = max(
-                _name_score(player, home_name) + _name_score(opponent, away_name),
-                _name_score(player, away_name) + _name_score(opponent, home_name),
-            )
-        elif player:
-            score = max(_name_score(player, home_name), _name_score(player, away_name))
-        elif opponent:
-            score = max(
-                _name_score(opponent, home_name), _name_score(opponent, away_name)
-            )
+            score = 0.0
+            if player and opponent:
+                score = max(
+                    _name_score(player, home_name) + _name_score(opponent, away_name),
+                    _name_score(player, away_name) + _name_score(opponent, home_name),
+                )
+            elif player:
+                score = max(_name_score(player, home_name), _name_score(player, away_name))
+            elif opponent:
+                score = max(
+                    _name_score(opponent, home_name), _name_score(opponent, away_name)
+                )
 
-        if score > best_score:
-            best_score = score
-            best = ev
+            if score > best_score:
+                best_score = score
+                best = ev
 
-    if not best or best_score < 0.55:
-        return None
+        if not best or best_score < 0.55:
+            return None, "sofascore_tennis"
+        source = "sofascore_tennis"
 
     status_obj = best.get("status") or {}
     status_type = str(status_obj.get("type") or "").lower()
@@ -231,7 +168,7 @@ def find_match(
         "away_score_raw": best.get("awayScore") or {},
         "status_type": status_type,
         "finished": finished,
-    }
+    }, source
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +304,7 @@ def prop_check(
     scope, market_type = entry
 
     # --- locate the match --------------------------------------------------
-    match_info = find_match(game_date, player, opponent)
+    match_info, source = find_match(game_date, player, opponent)
     if not match_info:
         return {
             "found": False,
@@ -375,7 +312,7 @@ def prop_check(
                 f"No SofaScore tennis match found for "
                 f"date={game_date}, player={player!r}, opponent={opponent!r}."
             ),
-            "source": "sofascore_tennis",
+            "source": source,
         }
 
     match_id = match_info["match_id"]
@@ -500,7 +437,7 @@ def prop_check(
             "match_id": match_id,
             "settled": finished,
             "note": f"Unhandled market_type '{market_type}'.",
-            "source": "sofascore_tennis",
+            "source": source,
         }
 
     return {
@@ -517,5 +454,5 @@ def prop_check(
         "away_team": away_name,
         "home_sets": h_sets,
         "away_sets": a_sets,
-        "source": "sofascore_tennis",
+        "source": source,
     }
