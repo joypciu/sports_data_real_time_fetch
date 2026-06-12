@@ -3306,8 +3306,14 @@ def stats_game_odds_history(
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
     resolved_event = _resolve_event(event_id, date, sport, team, opponent)
-    resolved_event_id = event_id or (
-        str(resolved_event.get("event_id") or "") if resolved_event else ""
+    if resolved_event is None and event_id and date and (team or opponent):
+        # Provider IDs are not interchangeable. If a caller supplies an ID from
+        # another feed, resolve the same matchup in our unified store.
+        resolved_event = _resolve_event(None, date, sport, team, opponent)
+    resolved_event_id = (
+        str(resolved_event.get("event_id") or "")
+        if resolved_event
+        else str(event_id or "")
     )
 
     odds_types = {"LINE_MOVE", "TOTAL_MOVE", "ODDS_MOVE"}
@@ -3403,6 +3409,8 @@ def stats_game_odds_history(
             "game": game_meta.get("game"),
             "sport": game_meta.get("sport"),
             "league": game_meta.get("league"),
+            "provider": resolved_event.get("provider") if resolved_event else None,
+            "source": resolved_event.get("source") if resolved_event else None,
             "home_team": game_meta.get("home_team"),
             "home_abbr": game_meta.get("home_abbr"),
             "away_team": game_meta.get("away_team"),

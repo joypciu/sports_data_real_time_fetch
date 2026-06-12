@@ -2794,6 +2794,8 @@ class TestStatsApiMarketCheck(unittest.TestCase):
             "game_total": 220.5,
             "over_odds": -110,
             "under_odds": -110,
+            "provider": "provider-x",
+            "source": "historical",
         }
         events = [
             {
@@ -2851,6 +2853,7 @@ class TestStatsApiMarketCheck(unittest.TestCase):
         self.assertEqual(payload["event_id"], "GAME1")
         self.assertEqual(payload["home_abbr"], "HOM")
         self.assertEqual(payload["away_abbr"], "AWY")
+        self.assertEqual(payload["provider"], "provider-x")
         self.assertEqual(payload["opening"]["home_ml"], -120)
         self.assertEqual(payload["opening"]["game_total"], 219.5)
         self.assertEqual(payload["closing"]["home_ml"], -125)
@@ -2858,6 +2861,51 @@ class TestStatsApiMarketCheck(unittest.TestCase):
         self.assertEqual(payload["closing"]["home_spread_odds"], -108)
         self.assertEqual(payload["closing"]["over_odds"], -110)
         self.assertEqual(payload["closing"]["game_total"], 220.5)
+
+    def test_odds_history_retries_matchup_for_foreign_provider_id(self):
+        resolved_event = {
+            "event_id": "1xb_987",
+            "date": "2026-03-12",
+            "sport": "soccer",
+            "league": "eng.1",
+            "short_name": "Away FC @ Home FC",
+            "home_team": "Home FC",
+            "home_abbr": "HOM",
+            "away_team": "Away FC",
+            "away_abbr": "AWY",
+            "home_ml": 120,
+            "away_ml": 220,
+            "draw_odds": 230,
+            "provider": "1xbet",
+            "source": "historical",
+        }
+
+        with (
+            patch.object(
+                self.stats_api,
+                "_resolve_event",
+                side_effect=[None, resolved_event],
+            ) as resolve,
+            patch.object(self.stats_api, "_iter_event_files", return_value=[]),
+        ):
+            response = self.client.get(
+                "/stats/game/odds-history",
+                params={
+                    "event_id": "sofascore_123",
+                    "date": "2026-03-12",
+                    "sport": "soccer",
+                    "team": "Home FC",
+                    "opponent": "Away FC",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(resolve.call_count, 2)
+        payload = response.json()
+        self.assertEqual(payload["event_id"], "1xb_987")
+        self.assertEqual(payload["provider"], "1xbet")
+        self.assertEqual(payload["closing"]["home_ml"], 120)
+        self.assertEqual(payload["closing"]["draw_odds"], 230)
 
     def test_historical_total_over_returns_true(self):
         historical_row = {
