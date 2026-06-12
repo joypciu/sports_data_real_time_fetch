@@ -2773,6 +2773,92 @@ class TestStatsApiMarketCheck(unittest.TestCase):
         cls.stats_api = stats_api
         cls.client = TestClient(stats_api.app)
 
+    def test_odds_history_resolves_matchup_and_fills_unchanged_prices(self):
+        resolved_event = {
+            "event_id": "GAME1",
+            "date": "2026-03-12",
+            "sport": "basketball",
+            "league": "nba",
+            "name": "Away Team at Home Team",
+            "short_name": "AWY @ HOM",
+            "home_team": "Home Team",
+            "home_abbr": "HOM",
+            "away_team": "Away Team",
+            "away_abbr": "AWY",
+            "home_ml": -125,
+            "away_ml": 105,
+            "home_spread": -2.5,
+            "away_spread": 2.5,
+            "home_spread_odds": -108,
+            "away_spread_odds": -112,
+            "game_total": 220.5,
+            "over_odds": -110,
+            "under_odds": -110,
+        }
+        events = [
+            {
+                "type": "LINE_MOVE",
+                "event_id": "GAME1",
+                "game": "AWY @ HOM",
+                "sport": "basketball",
+                "league": "nba",
+                "timestamp": "2026-03-12T10:00:00+00:00",
+                "field": "home_ml",
+                "old_value": -120,
+                "new_value": -125,
+            },
+            {
+                "type": "TOTAL_MOVE",
+                "event_id": "GAME1",
+                "game": "AWY @ HOM",
+                "sport": "basketball",
+                "league": "nba",
+                "timestamp": "2026-03-12T11:00:00+00:00",
+                "old_total": 219.5,
+                "new_total": 220.5,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            event_path = os.path.join(tmp, "events_20260312.jsonl")
+            with open(event_path, "w", encoding="utf-8") as fh:
+                for event in events:
+                    fh.write(json.dumps(event) + "\n")
+
+            with (
+                patch.object(
+                    self.stats_api, "_resolve_event", return_value=resolved_event
+                ),
+                patch.object(
+                    self.stats_api,
+                    "_iter_event_files",
+                    return_value=[("20260312", event_path)],
+                ),
+            ):
+                response = self.client.get(
+                    "/stats/game/odds-history",
+                    params={
+                        "date": "2026-03-12",
+                        "sport": "basketball",
+                        "team": "Home Team",
+                        "opponent": "Away Team",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["found"])
+        self.assertEqual(payload["event_id"], "GAME1")
+        self.assertEqual(payload["home_abbr"], "HOM")
+        self.assertEqual(payload["away_abbr"], "AWY")
+        self.assertEqual(payload["opening"]["home_ml"], -120)
+        self.assertEqual(payload["opening"]["game_total"], 219.5)
+        self.assertEqual(payload["closing"]["home_ml"], -125)
+        self.assertEqual(payload["closing"]["away_ml"], 105)
+        self.assertEqual(payload["closing"]["home_spread_odds"], -108)
+        self.assertEqual(payload["closing"]["over_odds"], -110)
+        self.assertEqual(payload["closing"]["game_total"], 220.5)
+
     def test_historical_total_over_returns_true(self):
         historical_row = {
             "event_id": "SOC1",

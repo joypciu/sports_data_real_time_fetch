@@ -3283,7 +3283,13 @@ def stats_matchups(
 
 @app.get("/stats/game/odds-history")
 def stats_game_odds_history(
-    event_id: str = Query(..., description="ESPN event ID"),
+    event_id: Optional[str] = Query(None, description="Event ID"),
+    date: Optional[str] = Query(None, description="Game date (YYYY-MM-DD)"),
+    sport: Optional[str] = Query(None, description="Sport name"),
+    team: Optional[str] = Query(None, description="One team name or abbreviation"),
+    opponent: Optional[str] = Query(
+        None, description="Opposing team name or abbreviation"
+    ),
     _: None = Depends(_verify_token),
 ) -> JSONResponse:
     """
@@ -3291,10 +3297,23 @@ def stats_game_odds_history(
     moneyline shifts, total line changes, spread updates —
     from opening line to close, in chronological order.
     """
+    if not event_id and not (date and (team or opponent)):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide event_id or date plus team/opponent.",
+        )
+    if date and _date_only(date) is None:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+    resolved_event = _resolve_event(event_id, date, sport, team, opponent)
+    resolved_event_id = event_id or (
+        str(resolved_event.get("event_id") or "") if resolved_event else ""
+    )
+
     odds_types = {"LINE_MOVE", "TOTAL_MOVE", "ODDS_MOVE"}
     matched: list[dict[str, Any]] = []
 
-    for _date_str, path in _iter_event_files(None, None):
+    for _date_str, path in _iter_event_files(date, date):
         try:
             with open(path, encoding="utf-8") as fh:
                 for raw in fh:
@@ -3305,7 +3324,10 @@ def stats_game_odds_history(
                         ev = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    if str(ev.get("event_id", "")) == event_id:
+                    if (
+                        resolved_event_id
+                        and str(ev.get("event_id", "")) == resolved_event_id
+                    ):
                         etype = ev.get("type", ev.get("event_type", ""))
                         if etype in odds_types:
                             matched.append(ev)
@@ -3327,6 +3349,11 @@ def stats_game_odds_history(
     opening: dict[str, Any] = {}
     closing: dict[str, Any] = {}
     for ev in matched:
+        if ev.get("type", ev.get("event_type", "")) == "TOTAL_MOVE":
+            if "game_total" not in opening and ev.get("old_total") is not None:
+                opening["game_total"] = ev["old_total"]
+            if ev.get("new_total") is not None:
+                closing["game_total"] = ev["new_total"]
         field = ev.get("field")
         if not field:
             continue
@@ -3335,13 +3362,51 @@ def stats_game_odds_history(
             opening[field] = ev["old_value"]
         closing[field] = val
 
+    # The event log only contains fields that changed. Fill unchanged closing
+    # prices from the final stored game snapshot.
+    if resolved_event:
+        for field in (
+            "home_ml",
+            "away_ml",
+            "home_spread",
+            "away_spread",
+            "home_spread_odds",
+            "away_spread_odds",
+            "game_total",
+            "over_odds",
+            "under_odds",
+            "draw_odds",
+        ):
+            value = resolved_event.get(field)
+            if value is not None:
+                closing.setdefault(field, value)
+        if not game_meta:
+            game_meta = {
+                "game": resolved_event.get("short_name")
+                or resolved_event.get("name"),
+                "sport": resolved_event.get("sport"),
+                "league": resolved_event.get("league"),
+            }
+        game_meta.update(
+            {
+                "home_team": resolved_event.get("home_team"),
+                "home_abbr": resolved_event.get("home_abbr"),
+                "away_team": resolved_event.get("away_team"),
+                "away_abbr": resolved_event.get("away_abbr"),
+            }
+        )
+
     return JSONResponse(
         {
-            "found": bool(matched),
-            "event_id": event_id,
+            "found": bool(matched or closing),
+            "event_id": resolved_event_id or None,
             "game": game_meta.get("game"),
             "sport": game_meta.get("sport"),
             "league": game_meta.get("league"),
+            "home_team": game_meta.get("home_team"),
+            "home_abbr": game_meta.get("home_abbr"),
+            "away_team": game_meta.get("away_team"),
+            "away_abbr": game_meta.get("away_abbr"),
             "move_count": len(matched),
             "opening": opening,
             "closing": closing,
