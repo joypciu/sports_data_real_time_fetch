@@ -291,6 +291,13 @@ The `games` table also holds Flashscore-enriched fields when available:
 
 Soccer player records also carry Transfermarkt fields: `tm_id`, `tm_position`, `market_value_eur`, `nationality`, `tm_age`.
 
+### KeepBetting market historics
+
+`GET /stats/market/historics?context=...` validates and proxies the signed
+KeepBetting market context. It returns per-book American-odds timelines and
+the no-vig timeline used by the bet-tracking service for closing-line value.
+The endpoint uses the normal optional `STATS_API_TOKEN` bearer authentication.
+
 ## Historical Data
 
 `historical_data/` holds one JSON file per sport. Each file is an array of game objects, each containing:

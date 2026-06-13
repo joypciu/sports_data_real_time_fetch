@@ -2773,6 +2773,60 @@ class TestStatsApiMarketCheck(unittest.TestCase):
         cls.stats_api = stats_api
         cls.client = TestClient(stats_api.app)
 
+    def test_market_historics_returns_validated_book_data(self):
+        upstream = {
+            "title": "Away vs Home - Home Moneyline",
+            "books": {
+                "DraftKings": [
+                    {
+                        "datetime": "2026-06-13T09:55:00+00:00",
+                        "american_odds": -125,
+                    }
+                ]
+            },
+            "nvig": [
+                {
+                    "datetime": "2026-06-13T09:55:00+00:00",
+                    "american_odds": -118,
+                }
+            ],
+            "limit": [],
+        }
+        with patch.object(
+            self.stats_api,
+            "_fetch_keepbetting_historics",
+            return_value=upstream,
+        ) as fetch:
+            response = self.client.get(
+                "/stats/market/historics",
+                params={"context": "signed-context-value-12345"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["found"])
+        self.assertEqual(
+            payload["books"]["DraftKings"][-1]["american_odds"],
+            -125,
+        )
+        self.assertEqual(payload["nvig"][-1]["american_odds"], -118)
+        self.assertNotIn("limit", payload)
+        fetch.assert_called_once_with("signed-context-value-12345")
+
+    def test_market_historics_normalizes_missing_series(self):
+        with patch.object(
+            self.stats_api,
+            "_fetch_keepbetting_historics",
+            return_value={"title": "No history", "books": {}, "nvig": []},
+        ):
+            response = self.client.get(
+                "/stats/market/historics",
+                params={"context": "signed-context-value-12345"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["found"])
+
     def test_odds_history_resolves_matchup_and_fills_unchanged_prices(self):
         resolved_event = {
             "event_id": "GAME1",

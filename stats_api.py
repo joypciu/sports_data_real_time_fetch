@@ -53,6 +53,11 @@ ARCHIVE_DIR = str(_THIS_DIR / "archive")
 _TOKEN = os.getenv("STATS_API_TOKEN", "").strip()
 _PORT = int(os.getenv("STATS_API_PORT", "8001"))
 _ESPN_HTTP_TIMEOUT = 2.5  # must stay under bet-tracking STATS_API_TIMEOUT (default 8s)
+_HISTORICS_URL = os.getenv(
+    "KEEPBETTING_HISTORICS_URL",
+    "https://app.keepbetting.co/api/historics",
+).strip()
+_HISTORICS_HTTP_TIMEOUT = float(os.getenv("KEEPBETTING_HISTORICS_TIMEOUT", "6.0"))
 
 # ---------------------------------------------------------------------------
 # App
@@ -3279,6 +3284,80 @@ def stats_matchups(
 # ---------------------------------------------------------------------------
 # Odds History endpoint
 # ---------------------------------------------------------------------------
+
+
+def _fetch_keepbetting_historics(context: str) -> dict[str, Any]:
+    import httpx as _httpx
+
+    try:
+        with _httpx.Client(
+            timeout=_HISTORICS_HTTP_TIMEOUT,
+            follow_redirects=True,
+        ) as client:
+            response = client.get(
+                _HISTORICS_URL,
+                params={"context": context},
+                headers={"User-Agent": "sports-stats-api/1.0"},
+            )
+    except _httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="KeepBetting historics request timed out",
+        ) from exc
+    except _httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="KeepBetting historics service is unavailable",
+        ) from exc
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code
+            if response.status_code in {400, 401, 403, 404, 422}
+            else 502,
+            detail="KeepBetting historics request failed",
+        )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="KeepBetting historics returned invalid JSON",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="KeepBetting historics returned an invalid payload",
+        )
+    if not isinstance(payload.get("books"), dict):
+        payload["books"] = {}
+    if not isinstance(payload.get("nvig"), list):
+        payload["nvig"] = []
+    return payload
+
+
+@app.get("/stats/market/historics")
+def stats_market_historics(
+    context: str = Query(
+        ...,
+        min_length=20,
+        max_length=8192,
+        description="Signed KeepBetting market historics context",
+    ),
+    _: None = Depends(_verify_token),
+) -> JSONResponse:
+    """Return validated per-book and no-vig history for one market selection."""
+    payload = _fetch_keepbetting_historics(context)
+    return JSONResponse(
+        {
+            "found": bool(payload.get("books") or payload.get("nvig")),
+            "title": payload.get("title"),
+            "books": payload["books"],
+            "nvig": payload["nvig"],
+        }
+    )
 
 
 @app.get("/stats/game/odds-history")
