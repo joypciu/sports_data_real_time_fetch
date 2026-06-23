@@ -283,22 +283,6 @@ def upsert_details(event_id: str, detail_type: str, payload: dict[str, Any]) -> 
                 scraped_at = excluded.scraped_at
         """, (str(event_id), detail_type, payload_json, now))
 
-def prune_old_events(days: int = 30) -> None:
-    """Delete events and details older than `days` days from the database."""
-    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    with get_connection() as conn:
-        # Delete details for old events first
-        conn.execute("""
-            DELETE FROM sofascore_event_details
-            WHERE event_id IN (
-                SELECT event_id FROM sofascore_events WHERE game_date < ?
-            )
-        """, (cutoff_date,))
-        # Delete old events
-        conn.execute("DELETE FROM sofascore_events WHERE game_date < ?", (cutoff_date,))
-        # Optionally, delete old ingest logs
-        conn.execute("DELETE FROM sofascore_ingest_log WHERE started_at < ?", (cutoff_date,))
-
 def reindex_utc_game_dates() -> int:
     """Backfill game_date from startTimestamp (UTC) for rows ingested under local SofaScore dates."""
     updated = 0

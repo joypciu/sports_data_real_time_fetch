@@ -204,12 +204,6 @@ def run_ingest(days_back: int = 1) -> None:
     )
 
     try:
-        sofascore_db.prune_old_events(days=30)
-        logger.info("Pruned events older than 30 days.")
-    except Exception as exc:
-        logger.error("Failed to prune old events: %s", exc)
-
-    try:
         reindexed = sofascore_db.reindex_utc_game_dates()
         if reindexed:
             logger.info("Reindexed %d event game_date values to UTC.", reindexed)
