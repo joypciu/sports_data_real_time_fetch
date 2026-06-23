@@ -106,38 +106,92 @@ def _name_score(a: str | None, b: str | None) -> float:
     return difflib.SequenceMatcher(None, an, bn).ratio()
 
 
+def utc_game_date_from_event(event: dict[str, Any], fallback: str) -> str:
+    """Derive canonical game_date from startTimestamp in UTC (matches bet datetime)."""
+    ts = event.get("startTimestamp")
+    if ts is None:
+        return fallback
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return fallback
+
+
+def date_candidates(game_date: str) -> list[str]:
+    """Return game_date plus ±1 day to absorb SofaScore local-calendar vs UTC offsets."""
+    dates = [game_date]
+    try:
+        base = datetime.strptime(game_date, "%Y-%m-%d").date()
+        dates.extend(
+            [
+                (base - timedelta(days=1)).isoformat(),
+                (base + timedelta(days=1)).isoformat(),
+            ]
+        )
+    except ValueError:
+        pass
+    seen: set[str] = set()
+    return [d for d in dates if not (d in seen or seen.add(d))]
+
+
+def event_match_score(
+    team_hint: str | None,
+    opponent_hint: str | None,
+    home_name: str,
+    away_name: str,
+) -> float:
+    """Score how well an event matches team/opponent hints (higher = better)."""
+    if not team_hint:
+        return 0.0
+
+    if team_hint and opponent_hint:
+        forward = _name_score(team_hint, home_name) + _name_score(opponent_hint, away_name)
+        reverse = _name_score(team_hint, away_name) + _name_score(opponent_hint, home_name)
+        if forward >= reverse:
+            pair_min = min(
+                _name_score(team_hint, home_name),
+                _name_score(opponent_hint, away_name),
+            )
+            total = forward
+        else:
+            pair_min = min(
+                _name_score(team_hint, away_name),
+                _name_score(opponent_hint, home_name),
+            )
+            total = reverse
+        # Both sides must match — prevents Haiti→Náutico false positives.
+        if pair_min < 0.55:
+            return 0.0
+        return total
+
+    return max(_name_score(team_hint, home_name), _name_score(team_hint, away_name))
+
+
 def lookup_event(sport: str, game_date: str, team_hint: str | None = None, opponent_hint: str | None = None) -> dict[str, Any] | None:
     """Find the best matching event from the local cache."""
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT * FROM sofascore_events WHERE sport = ? AND game_date = ?",
-            (sport, game_date)
-        ).fetchall()
-
-    if not rows:
-        return None
-
     best_match = None
     best_score = 0.0
 
-    for row in rows:
-        event = json.loads(row["event_payload"])
+    for candidate_date in date_candidates(game_date):
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sofascore_events WHERE sport = ? AND game_date = ?",
+                (sport, candidate_date),
+            ).fetchall()
+
+        if not rows:
+            continue
+
         if not team_hint:
-            # If no team hint is provided, we can't fuzzy match. Just return the first one (rare).
-            return event
+            return json.loads(rows[0]["event_payload"])
 
-        score_h = _name_score(team_hint, row["home_name"])
-        score_a = _name_score(team_hint, row["away_name"])
-        candidate_score = max(score_h, score_a)
-
-        if opponent_hint:
-            opp_h = _name_score(opponent_hint, row["home_name"])
-            opp_a = _name_score(opponent_hint, row["away_name"])
-            candidate_score += max(opp_h, opp_a)
-
-        if candidate_score > best_score and candidate_score > 0.6:
-            best_score = candidate_score
-            best_match = event
+        for row in rows:
+            candidate_score = event_match_score(
+                team_hint, opponent_hint, row["home_name"], row["away_name"]
+            )
+            if candidate_score > best_score and candidate_score > 0.6:
+                best_score = candidate_score
+                best_match = json.loads(row["event_payload"])
 
     return best_match
 
@@ -180,6 +234,7 @@ def upsert_event(sport: str, game_date: str, event: dict[str, Any]) -> None:
     tournament_slug = tournament.get("slug", "")
 
     start_timestamp = event.get("startTimestamp")
+    stored_game_date = utc_game_date_from_event(event, game_date)
     now = datetime.now(timezone.utc).isoformat()
     
     payload_json = json.dumps(event)
@@ -196,6 +251,7 @@ def upsert_event(sport: str, game_date: str, event: dict[str, Any]) -> None:
                 scraped_at, updated_at, event_payload
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
+                game_date = excluded.game_date,
                 status_type = excluded.status_type,
                 status_desc = excluded.status_desc,
                 is_finished = excluded.is_finished,
@@ -203,10 +259,11 @@ def upsert_event(sport: str, game_date: str, event: dict[str, Any]) -> None:
                 away_score_current = excluded.away_score_current,
                 home_score_raw = excluded.home_score_raw,
                 away_score_raw = excluded.away_score_raw,
+                start_timestamp = excluded.start_timestamp,
                 updated_at = excluded.updated_at,
                 event_payload = excluded.event_payload
         """, (
-            event_id, sport, game_date, home_name, away_name,
+            event_id, sport, stored_game_date, home_name, away_name,
             _norm(home_name), _norm(away_name), status_type, status_desc, is_finished,
             home_score_current, away_score_current, home_raw_json, away_raw_json,
             tournament_name, tournament_slug, start_timestamp,
@@ -241,6 +298,25 @@ def prune_old_events(days: int = 30) -> None:
         conn.execute("DELETE FROM sofascore_events WHERE game_date < ?", (cutoff_date,))
         # Optionally, delete old ingest logs
         conn.execute("DELETE FROM sofascore_ingest_log WHERE started_at < ?", (cutoff_date,))
+
+def reindex_utc_game_dates() -> int:
+    """Backfill game_date from startTimestamp (UTC) for rows ingested under local SofaScore dates."""
+    updated = 0
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT event_id, game_date, event_payload FROM sofascore_events"
+        ).fetchall()
+        for row in rows:
+            event = json.loads(row["event_payload"])
+            utc_date = utc_game_date_from_event(event, row["game_date"])
+            if utc_date != row["game_date"]:
+                conn.execute(
+                    "UPDATE sofascore_events SET game_date = ? WHERE event_id = ?",
+                    (utc_date, row["event_id"]),
+                )
+                updated += 1
+    return updated
+
 
 def get_ingest_logs(limit: int = 5) -> list[dict[str, Any]]:
     """Return the most recent ingest logs."""

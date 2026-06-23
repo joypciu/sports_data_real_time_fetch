@@ -121,35 +121,20 @@ def find_match(
         best = db_event
         source = "sofascore_db"
     else:
-        payload = sofascore_client.get(f"/sport/tennis/scheduled-events/{game_date}")
-        events: list[dict] = payload.get("events") or []
-
-        if not events:
-            return None, "sofascore_tennis"
-
         best = None
         best_score = -1.0
 
-        for ev in events:
-            home_name = (ev.get("homeTeam") or {}).get("name")
-            away_name = (ev.get("awayTeam") or {}).get("name")
+        for candidate_date in sofascore_db.date_candidates(game_date):
+            payload = sofascore_client.get(f"/sport/tennis/scheduled-events/{candidate_date}")
+            events: list[dict] = payload.get("events") or []
 
-            score = 0.0
-            if player and opponent:
-                score = max(
-                    _name_score(player, home_name) + _name_score(opponent, away_name),
-                    _name_score(player, away_name) + _name_score(opponent, home_name),
-                )
-            elif player:
-                score = max(_name_score(player, home_name), _name_score(player, away_name))
-            elif opponent:
-                score = max(
-                    _name_score(opponent, home_name), _name_score(opponent, away_name)
-                )
-
-            if score > best_score:
-                best_score = score
-                best = ev
+            for ev in events:
+                home_name = (ev.get("homeTeam") or {}).get("name", "")
+                away_name = (ev.get("awayTeam") or {}).get("name", "")
+                score = sofascore_db.event_match_score(player, opponent, home_name, away_name)
+                if score > best_score:
+                    best_score = score
+                    best = ev
 
         if not best or best_score < 0.55:
             return None, "sofascore_tennis"

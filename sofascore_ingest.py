@@ -209,6 +209,13 @@ def run_ingest(days_back: int = 1) -> None:
     except Exception as exc:
         logger.error("Failed to prune old events: %s", exc)
 
+    try:
+        reindexed = sofascore_db.reindex_utc_game_dates()
+        if reindexed:
+            logger.info("Reindexed %d event game_date values to UTC.", reindexed)
+    except Exception as exc:
+        logger.error("Failed to reindex UTC game dates: %s", exc)
+
 
 if __name__ == "__main__":
     import argparse
