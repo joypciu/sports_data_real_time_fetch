@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "description": "SofaScore unique-tournament IDs for background ingest. Sport-level scheduled-events is blocked; ingest uses /unique-tournament/{id}/scheduled-events/{date}.",
+  "geo_defaults": {
+    "football": ["US", "EN"],
+    "tennis": ["US", "EN"],
+    "ice-hockey": ["US", "CA"]
+  },
+  "category_scheduled_events": {
+    "tennis": [
+      {"id": 3, "name": "ATP"},
+      {"id": 6, "name": "WTA"},
+      {"id": 72, "name": "Challenger"},
+      {"id": 785, "name": "ITF Men"},
+      {"id": 213, "name": "ITF Women"}
+    ]
+  },
+  "tournaments": {
+    "football": [
+      {"id": 16, "name": "World Championship"},
+      {"id": 17, "name": "Premier League"},
+      {"id": 18, "name": "Championship"},
+      {"id": 8, "name": "LaLiga"},
+      {"id": 54, "name": "LaLiga 2"},
+      {"id": 35, "name": "Bundesliga"},
+      {"id": 44, "name": "2. Bundesliga"},
+      {"id": 23, "name": "Serie A"},
+      {"id": 53, "name": "Serie B"},
+      {"id": 34, "name": "Ligue 1"},
+      {"id": 182, "name": "Ligue 2"},
+      {"id": 7, "name": "UEFA Champions League"},
+      {"id": 679, "name": "UEFA Europa League"},
+      {"id": 17015, "name": "UEFA Conference League"},
+      {"id": 242, "name": "MLS"},
+      {"id": 13363, "name": "USL Championship"},
+      {"id": 238, "name": "Liga Portugal"},
+      {"id": 325, "name": "Brasileirão Série A"},
+      {"id": 390, "name": "Brasileirão Série B"},
+      {"id": 955, "name": "Saudi Pro League"},
+      {"id": 19, "name": "FA Cup"},
+      {"id": 21, "name": "EFL Cup"},
+      {"id": 329, "name": "Copa del Rey"},
+      {"id": 217, "name": "DFB Pokal"},
+      {"id": 328, "name": "Coppa Italia"},
+      {"id": 335, "name": "Coupe de France"},
+      {"id": 851, "name": "International Friendly Games"}
+    ],
+    "tennis": [
+      {"id": 2363, "name": "Australian Open"},
+      {"id": 2571, "name": "Australian Open (WTA)"},
+      {"id": 2480, "name": "Roland Garros"},
+      {"id": 2579, "name": "Roland Garros (WTA)"},
+      {"id": 2361, "name": "Wimbledon"},
+      {"id": 2600, "name": "Wimbledon (WTA)"},
+      {"id": 2449, "name": "US Open"},
+      {"id": 2601, "name": "US Open (WTA)"}
+    ],
+    "ice-hockey": [
+      {"id": 234, "name": "NHL"},
+      {"id": 844, "name": "AHL"},
+      {"id": 17188, "name": "ECHL"},
+      {"id": 97, "name": "SHL"},
+      {"id": 135, "name": "Liiga"},
+      {"id": 132, "name": "Czech Extraliga"},
+      {"id": 134, "name": "DEL"},
+      {"id": 141, "name": "National League (Switzerland)"},
+      {"id": 268, "name": "KHL"},
+      {"id": 85, "name": "IIHF World Championship"}
+    ]
+  }
+}

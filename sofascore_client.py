@@ -324,7 +324,7 @@ def begin_scraper_session(*, probe: bool = True) -> SofaScoreSession:
     if probe and proxy:
         today = time.strftime("%Y-%m-%d", time.gmtime())
         probe_result = _scraper_session.get(
-            f"{_BASE}/sport/tennis/scheduled-events/{today}",
+            f"{_BASE}/unique-tournament/17/scheduled-events/{today}",
             retries=1,
         )
         if not probe_result.ok and probe_result.error == "cloudflare_403":
