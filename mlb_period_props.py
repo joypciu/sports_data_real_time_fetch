@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import difflib
 import logging
+import os
+import time
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -31,7 +33,8 @@ _log = logging.getLogger(__name__)
 
 _SCHEDULE_BASE = "https://statsapi.mlb.com/api/v1"
 _SAVANT_BASE = "https://baseballsavant.mlb.com"
-_TIMEOUT = 2.5
+_TIMEOUT = float(os.environ.get("MLB_SAVANT_TIMEOUT", "8.0"))
+_GF_RETRIES = int(os.environ.get("MLB_SAVANT_GF_RETRIES", "2"))
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Market name → (inning_range, market_type)
@@ -73,6 +76,8 @@ PERIOD_PROP_STAT_MAP: dict[str, tuple] = {
     "team_total": ("game", "team_total"),
     # Player-level extensions
     "player_runs": (None, "player_runs"),
+    "player_hits": (None, "player_hits"),
+    "player_rbis": (None, "player_rbis"),
     "player_home_runs": (None, "player_home_runs"),
     "player_doubles": (None, "player_doubles"),
     "player_triples": (None, "player_triples"),
@@ -213,7 +218,21 @@ def _get_gf(game_pk: int) -> dict:
       gf["boxscore"]["teams"]                  — player stats (same structure as MLB Stats API boxscore)
       gf["game_status_code"]                   — "F" for Final, "L" for Live, etc.
     """
-    return _get(f"{_SAVANT_BASE}/gf", params={"game_pk": game_pk})
+    last_exc: Exception | None = None
+    for attempt in range(_GF_RETRIES):
+        try:
+            return _get(f"{_SAVANT_BASE}/gf", params={"game_pk": game_pk})
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < _GF_RETRIES:
+                _log.warning(
+                    "savant gf retry game_pk=%s attempt=%d: %s",
+                    game_pk,
+                    attempt + 1,
+                    exc,
+                )
+                time.sleep(0.5)
+    raise last_exc or RuntimeError(f"savant gf failed for game_pk={game_pk}")
 
 
 def _extract_inning_runs(
@@ -300,6 +319,8 @@ def _match_player(player_name: str, candidates: dict[str, Any]) -> Optional[str]
 
 _PLAYER_PROP_FIELDS: dict[str, str] = {
     "player_runs": "runs",
+    "player_hits": "hits",
+    "player_rbis": "rbis",
     "player_home_runs": "home_runs",
     "player_doubles": "doubles",
     "player_triples": "triples",

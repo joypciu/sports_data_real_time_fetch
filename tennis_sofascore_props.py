@@ -32,8 +32,8 @@ import re
 import time
 from typing import Any, Optional
 
-import sofascore_client
 import sofascore_db
+import sofascore_live_lookup
 
 # ---------------------------------------------------------------------------
 # Market map  (scope: full | s1 | s2,  market_type: internal key)
@@ -110,40 +110,39 @@ def find_match(
     game_date: str,
     player: str | None,
     opponent: str | None,
+    *,
+    allow_live: bool = True,
+    skip_db: bool = False,
 ) -> tuple[Optional[dict[str, Any]], str]:
     """
     Search SofaScore scheduled-events for a tennis match on *game_date*.
 
     Returns (dict, source).
     """
-    db_event = sofascore_db.lookup_event("tennis", game_date, player, opponent)
-    if db_event:
-        best = db_event
-        source = "sofascore_db"
-    else:
-        best = None
-        best_score = -1.0
+    best: dict[str, Any] | None = None
+    source = "sofascore_tennis"
 
-        for candidate_date in sofascore_db.date_candidates(game_date):
-            payload = sofascore_client.get(f"/sport/tennis/scheduled-events/{candidate_date}")
-            events: list[dict] = payload.get("events") or []
+    if not skip_db:
+        db_event = sofascore_db.lookup_event("tennis", game_date, player, opponent)
+        if db_event:
+            best, source, _ = sofascore_live_lookup.refresh_db_event_if_stale(
+                "tennis", game_date, db_event, allow_live=allow_live
+            )
 
-            for ev in events:
-                home_name = (ev.get("homeTeam") or {}).get("name", "")
-                away_name = (ev.get("awayTeam") or {}).get("name", "")
-                score = sofascore_db.event_match_score(player, opponent, home_name, away_name)
-                if score > best_score:
-                    best_score = score
-                    best = ev
+    if best is None and allow_live:
+        live_event = sofascore_live_lookup.find_live_event(
+            "tennis", game_date, player, opponent
+        )
+        if live_event is not None:
+            best = live_event
+            source = "sofascore_tennis"
+            stored_date = sofascore_db.utc_game_date_from_event(live_event, game_date)
+            sofascore_db.upsert_event("tennis", stored_date, live_event)
 
-        if not best or best_score < 0.55:
-            return None, "sofascore_tennis"
-        source = "sofascore_tennis"
+    if best is None:
+        return None, source
 
-    status_obj = best.get("status") or {}
-    status_type = str(status_obj.get("type") or "").lower()
-    status_desc = str(status_obj.get("description") or "").lower()
-    finished = status_type == "finished" or status_desc in ("ended", "finished")
+    finished = sofascore_live_lookup.event_is_finished(best)
 
     return {
         "match_id": best.get("id"),
@@ -151,7 +150,7 @@ def find_match(
         "away_team": (best.get("awayTeam") or {}).get("name", ""),
         "home_score_raw": best.get("homeScore") or {},
         "away_score_raw": best.get("awayScore") or {},
-        "status_type": status_type,
+        "status_type": str((best.get("status") or {}).get("type") or "").lower(),
         "finished": finished,
     }, source
 
@@ -243,6 +242,9 @@ def prop_check(
     selection: Optional[str] = None,
     pick: Optional[str] = None,
     line: Optional[float] = None,
+    *,
+    allow_live: bool = True,
+    skip_db: bool = False,
 ) -> dict[str, Any]:
     """
     Settle a tennis bet using SofaScore data.
@@ -289,7 +291,13 @@ def prop_check(
     scope, market_type = entry
 
     # --- locate the match --------------------------------------------------
-    match_info, source = find_match(game_date, player, opponent)
+    match_info, source = find_match(
+        game_date,
+        player,
+        opponent,
+        allow_live=allow_live,
+        skip_db=skip_db,
+    )
     if not match_info:
         return {
             "found": False,

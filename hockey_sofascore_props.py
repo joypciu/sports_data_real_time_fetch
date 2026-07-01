@@ -47,8 +47,8 @@ import re
 import time
 from typing import Any, Optional
 
-import sofascore_client
 import sofascore_db
+import sofascore_live_lookup
 
 # ---------------------------------------------------------------------------
 # Market map  (scope: full | reg | p1 | p2 | p3,  market_type: internal key)
@@ -145,41 +145,39 @@ def find_match(
     game_date: str,
     team: str | None,
     opponent: str | None,
+    *,
+    allow_live: bool = True,
+    skip_db: bool = False,
 ) -> tuple[Optional[dict[str, Any]], str]:
     """
     Search SofaScore scheduled-events for an ice-hockey match on *game_date*.
 
     Returns (dict, source).
     """
-    db_event = sofascore_db.lookup_event("ice-hockey", game_date, team, opponent)
-    if db_event:
-        best = db_event
-        source = "sofascore_db"
-    else:
-        best = None
-        best_score = -1.0
+    best: dict[str, Any] | None = None
+    source = "sofascore_hockey"
 
-        for candidate_date in sofascore_db.date_candidates(game_date):
-            payload = sofascore_client.get(f"/sport/ice-hockey/scheduled-events/{candidate_date}")
-            events: list[dict] = payload.get("events") or []
+    if not skip_db:
+        db_event = sofascore_db.lookup_event("ice-hockey", game_date, team, opponent)
+        if db_event:
+            best, source, _ = sofascore_live_lookup.refresh_db_event_if_stale(
+                "ice-hockey", game_date, db_event, allow_live=allow_live
+            )
 
-            for ev in events:
-                home_name = (ev.get("homeTeam") or {}).get("name", "")
-                away_name = (ev.get("awayTeam") or {}).get("name", "")
-                score = sofascore_db.event_match_score(team, opponent, home_name, away_name)
-                if score > best_score:
-                    best_score = score
-                    best = ev
+    if best is None and allow_live:
+        live_event = sofascore_live_lookup.find_live_event(
+            "ice-hockey", game_date, team, opponent
+        )
+        if live_event is not None:
+            best = live_event
+            source = "sofascore_hockey"
+            stored_date = sofascore_db.utc_game_date_from_event(live_event, game_date)
+            sofascore_db.upsert_event("ice-hockey", stored_date, live_event)
 
-        if not best or best_score < 0.55:
-            return None, "sofascore_hockey"
-        source = "sofascore_hockey"
+    if best is None:
+        return None, source
 
-    status_obj = best.get("status") or {}
-    status_type = str(status_obj.get("type") or "").lower()
-    finished = status_type == "finished" or str(
-        status_obj.get("description") or ""
-    ).lower() in ("ended", "aot", "ap", "finished")
+    finished = sofascore_live_lookup.event_is_finished(best)
 
     return {
         "match_id": best.get("id"),
@@ -187,7 +185,7 @@ def find_match(
         "away_team": (best.get("awayTeam") or {}).get("name", ""),
         "home_score_raw": best.get("homeScore") or {},
         "away_score_raw": best.get("awayScore") or {},
-        "status_type": status_type,
+        "status_type": str((best.get("status") or {}).get("type") or "").lower(),
         "finished": finished,
     }, source
 
@@ -275,12 +273,10 @@ def _hockey_scores(
 # ---------------------------------------------------------------------------
 
 
-def _get_incidents(match_id: int) -> list[dict[str, Any]]:
-    payload = sofascore_db.lookup_details(str(match_id), "incidents")
-    if not payload:
-        payload = sofascore_client.get(f"/event/{match_id}/incidents")
-        if payload:
-            sofascore_db.upsert_details(str(match_id), "incidents", payload)
+def _get_incidents(match_id: int, *, allow_live: bool = True) -> list[dict[str, Any]]:
+    payload = sofascore_live_lookup.fetch_event_detail(
+        str(match_id), "incidents", allow_live=allow_live
+    ) or {}
     return payload.get("incidents") or []
 
 
@@ -313,18 +309,16 @@ def _goal_scorer_names(incidents: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _get_player_stats(match_id: int) -> list[dict[str, Any]]:
+def _get_player_stats(match_id: int, *, allow_live: bool = True) -> list[dict[str, Any]]:
     """
     Fetch both teams' player stats from /event/{id}/lineups.
 
     Returns a flat list of dicts:
       {"name": str, "statistics": {goals, assists, shotsOnGoal, saves, ...}}
     """
-    payload = sofascore_db.lookup_details(str(match_id), "lineups")
-    if not payload:
-        payload = sofascore_client.get(f"/event/{match_id}/lineups")
-        if payload:
-            sofascore_db.upsert_details(str(match_id), "lineups", payload)
+    payload = sofascore_live_lookup.fetch_event_detail(
+        str(match_id), "lineups", allow_live=allow_live
+    ) or {}
     players: list[dict[str, Any]] = []
 
     for side in ("home", "away"):
@@ -389,6 +383,9 @@ def prop_check(
     selection: Optional[str] = None,
     pick: Optional[str] = None,
     line: Optional[float] = None,
+    *,
+    allow_live: bool = True,
+    skip_db: bool = False,
 ) -> dict[str, Any]:
     """
     Settle an ice-hockey bet using SofaScore data.
@@ -440,7 +437,13 @@ def prop_check(
     scope, market_type = entry
 
     # ── locate the match ────────────────────────────────────────────────────
-    match_info, source = find_match(game_date, team, opponent)
+    match_info, source = find_match(
+        game_date,
+        team,
+        opponent,
+        allow_live=allow_live,
+        skip_db=skip_db,
+    )
     if not match_info:
         return {
             "found": False,
@@ -482,13 +485,13 @@ def prop_check(
     def _get_incidents_cached() -> list[dict]:
         nonlocal _incidents
         if _incidents is None:
-            _incidents = _get_incidents(match_id)
+            _incidents = _get_incidents(match_id, allow_live=allow_live)
         return _incidents
 
     def _get_players_cached() -> list[dict]:
         nonlocal _players
         if _players is None:
-            _players = _get_player_stats(match_id)
+            _players = _get_player_stats(match_id, allow_live=allow_live)
         return _players
 
     # ── compute stat_value ───────────────────────────────────────────────────

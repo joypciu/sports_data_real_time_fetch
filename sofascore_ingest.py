@@ -19,7 +19,27 @@ SPORTS = {
     "football": {"statistics": True, "incidents": True, "lineups": False},
     "ice-hockey": {"statistics": False, "incidents": True, "lineups": True},
     "tennis": {"statistics": False, "incidents": False, "lineups": False},
+    "baseball": {"statistics": False, "incidents": False, "lineups": True},
 }
+
+_SPORT_ALIASES: dict[str, str] = {
+    "mlb": "baseball",
+    "soccer": "football",
+    "hockey": "ice-hockey",
+}
+
+
+def _resolve_sports_filter(sports: list[str] | None) -> dict[str, dict[str, bool]]:
+    if not sports:
+        return SPORTS
+    selected: dict[str, dict[str, bool]] = {}
+    for raw in sports:
+        key = _SPORT_ALIASES.get(raw.strip().lower(), raw.strip().lower())
+        if key not in SPORTS:
+            valid = ", ".join(sorted(SPORTS))
+            raise ValueError(f"Unknown sport '{raw}'. Valid: {valid} (aliases: mlb, soccer, hockey)")
+        selected[key] = SPORTS[key]
+    return selected
 
 
 def _fetch_detail(event_id: str, detail_key: str, path_suffix: str) -> bool:
@@ -95,8 +115,9 @@ def _process_events(
                 time.sleep(sofascore_client.detail_delay())
 
 
-def run_ingest(days_back: int = 1) -> None:
+def run_ingest(days_back: int = 1, sports: list[str] | None = None) -> None:
     """Fetch and cache SofaScore data for today and up to days_back days."""
+    sports_to_run = _resolve_sports_filter(sports)
     run_id = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc)
     proxy_used = 1 if sofascore_client.get_proxy(for_scraper=True) else 0
@@ -131,7 +152,7 @@ def run_ingest(days_back: int = 1) -> None:
     try:
         category_plan: dict[str, list[dict]] = {}
         tournament_plan: dict[str, list[dict]] = {}
-        for sport in SPORTS:
+        for sport in sports_to_run:
             category_plan[sport] = sofascore_tournaments.resolve_category_scheduled_sources(
                 sport
             )
@@ -143,7 +164,7 @@ def run_ingest(days_back: int = 1) -> None:
                 logger.error("No tournaments configured for sport=%s", sport)
 
         for date_str in dates_to_fetch:
-            for sport, config in SPORTS.items():
+            for sport, config in sports_to_run.items():
                 tournaments = tournament_plan.get(sport) or []
                 categories = category_plan.get(sport) or []
                 if not tournaments and not categories:
@@ -363,5 +384,16 @@ if __name__ == "__main__":
         default=1,
         help="Days back from today (0=today only, 1=today+yesterday)",
     )
+    parser.add_argument(
+        "--sport",
+        action="append",
+        dest="sports",
+        metavar="SPORT",
+        help=(
+            "Ingest only this sport (repeatable). "
+            "Values: football, tennis, ice-hockey, baseball. "
+            "Aliases: soccer, hockey, mlb."
+        ),
+    )
     args = parser.parse_args()
-    run_ingest(days_back=args.days)
+    run_ingest(days_back=args.days, sports=args.sports)

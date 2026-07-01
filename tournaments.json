@@ -4,7 +4,8 @@
   "geo_defaults": {
     "football": ["US", "EN"],
     "tennis": ["US", "EN"],
-    "ice-hockey": ["US", "CA"]
+    "ice-hockey": ["US", "CA"],
+    "baseball": ["US"]
   },
   "category_scheduled_events": {
     "tennis": [
@@ -66,6 +67,9 @@
       {"id": 141, "name": "National League (Switzerland)"},
       {"id": 268, "name": "KHL"},
       {"id": 85, "name": "IIHF World Championship"}
+    ],
+    "baseball": [
+      {"id": 11205, "name": "MLB"}
     ]
   }
 }

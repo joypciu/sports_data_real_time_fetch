@@ -20,9 +20,9 @@ try:
 
     _CURL_AVAILABLE = True
 except ImportError:
-    import httpx as _httpx  # type: ignore[import]
-
     _CURL_AVAILABLE = False
+
+import httpx as _httpx  # type: ignore[import]
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ _BASE = "https://www.sofascore.com/api/v1"
 _SITE = "https://www.sofascore.com/"
 _CONNECT_TIMEOUT = float(os.environ.get("SOFASCORE_CONNECT_TIMEOUT", "5.0"))
 _READ_TIMEOUT = float(os.environ.get("SOFASCORE_READ_TIMEOUT", "20.0"))
+_SETTLEMENT_READ_TIMEOUT = float(os.environ.get("SOFASCORE_SETTLEMENT_READ_TIMEOUT", "4.0"))
 _INGEST_BATCH_DELAY = float(os.environ.get("SOFASCORE_INGEST_BATCH_DELAY", "2.0"))
 _DETAIL_DELAY = float(os.environ.get("SOFASCORE_DETAIL_DELAY", "0.8"))
 
@@ -196,13 +197,20 @@ class SofaScoreSession:
             logger.warning("SofaScore warmup failed: %s", exc)
             return False
 
-    def get(self, url: str, *, retries: int = 3) -> FetchResult:
+    def get(
+        self,
+        url: str,
+        *,
+        retries: int = 3,
+        read_timeout: float | None = None,
+    ) -> FetchResult:
         if not _CURL_AVAILABLE:
             return FetchResult(False, None, 0.0, {}, "curl_cffi_not_installed")
 
         if not self._warmed:
             self.warmup()
 
+        timeout = read_timeout if read_timeout is not None else _READ_TIMEOUT
         started = time.monotonic()
         last_error: str | None = None
         last_status: int | None = None
@@ -211,7 +219,7 @@ class SofaScoreSession:
             self._ensure_session()
             try:
                 resp = self._session.get(
-                    url, headers=_api_headers(), timeout=_READ_TIMEOUT
+                    url, headers=_api_headers(), timeout=timeout
                 )
                 elapsed = time.monotonic() - started
                 last_status = resp.status_code
@@ -361,31 +369,47 @@ def get_with_meta(
     path: str,
     *,
     for_scraper: bool = False,
-    retries: int = 3,
+    for_settlement: bool = False,
+    retries: int | None = None,
     session: SofaScoreSession | None = None,
 ) -> FetchResult:
     url = f"{_BASE}{path}" if path.startswith("/") else path
+    attempt_count = retries if retries is not None else (1 if for_settlement else 3)
 
     if for_scraper and session is None:
         session = _scraper_session
 
-    if _CURL_AVAILABLE and (for_scraper or session is not None):
-        active = session or SofaScoreSession(get_proxy(for_scraper))
+    if _CURL_AVAILABLE and (for_scraper or session is not None or for_settlement):
+        use_proxy = for_scraper or for_settlement
+        active = session or SofaScoreSession(get_proxy(use_proxy))
         own_session = session is None
+        read_timeout = _SETTLEMENT_READ_TIMEOUT if for_settlement else _READ_TIMEOUT
         try:
             if own_session:
                 active.warmup()
-            return active.get(url, retries=retries)
+            return active.get(url, retries=attempt_count, read_timeout=read_timeout)
         finally:
             if own_session:
                 active.close()
 
-    return _httpx_get_with_meta(url, for_scraper=for_scraper, retries=retries)
+    return _httpx_get_with_meta(
+        url,
+        for_scraper=for_scraper,
+        retries=attempt_count,
+        for_settlement=for_settlement,
+    )
 
 
-def _httpx_get_with_meta(url: str, *, for_scraper: bool, retries: int) -> FetchResult:
+def _httpx_get_with_meta(
+    url: str,
+    *,
+    for_scraper: bool,
+    retries: int,
+    for_settlement: bool = False,
+) -> FetchResult:
     proxy = get_proxy(for_scraper)
-    timeout = (_CONNECT_TIMEOUT, _READ_TIMEOUT)
+    read_timeout = _SETTLEMENT_READ_TIMEOUT if for_settlement else _READ_TIMEOUT
+    timeout = (_CONNECT_TIMEOUT, read_timeout)
     started = time.monotonic()
     last_error: str | None = None
     last_status: int | None = None
