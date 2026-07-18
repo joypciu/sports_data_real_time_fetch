@@ -26,11 +26,13 @@ Usage
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
 import threading
 import time
+import unicodedata
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -232,6 +234,66 @@ def _normalize_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "").strip()).lower()
 
 
+# Fuzzy name matching used for settlement pick→side resolution across sports.
+# Handles accents (Džumhur), initials (D. Dzumhur), and last-name-only picks.
+_NAME_MATCH_THRESHOLD = 0.80
+
+
+def _ascii_fold(value: str | None) -> str:
+    if not value:
+        return ""
+    text = str(value).lower()
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^\w\s-]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _name_score(a: str | None, b: str | None) -> float:
+    """Score how well two team/player names match (0.0–1.0)."""
+    if not a or not b:
+        return 0.0
+    an, bn = _ascii_fold(a), _ascii_fold(b)
+    if not an or not bn:
+        return 0.0
+    if an == bn:
+        return 1.0
+
+    an_parts = an.split()
+    bn_parts = bn.split()
+    an_set, bn_set = set(an_parts), set(bn_parts)
+    if an_set and an_set.issubset(bn_set):
+        return 0.95
+    if bn_set and bn_set.issubset(an_set):
+        return 0.95
+    if an in bn or bn in an:
+        return 0.93
+    # Last-name match (e.g. "Djokovic" vs "Novak Djokovic", "Dzumhur" vs "Damir Dzumhur")
+    if an_parts and bn_parts and an_parts[-1] == bn_parts[-1] and len(an_parts[-1]) >= 3:
+        return 0.90
+    return difflib.SequenceMatcher(None, an, bn).ratio()
+
+
+def _side_name_score(
+    query: str | None, team_name: str | None, team_abbr: str | None
+) -> float:
+    if not query:
+        return 0.0
+    query_norm = _normalize_text(query)
+    if not query_norm:
+        return 0.0
+    name_norm = _normalize_text(team_name)
+    abbr_norm = _normalize_text(team_abbr)
+    if (
+        query_norm == name_norm
+        or query_norm == abbr_norm
+        or (name_norm and (query_norm in name_norm or name_norm in query_norm))
+        or (abbr_norm and query_norm in abbr_norm)
+        or (name_norm and query_norm == _team_name_initials(team_name))
+    ):
+        return 1.0
+    return max(_name_score(query, team_name), _name_score(query, team_abbr))
+
+
 def _date_only(value: Any) -> str | None:
     if value in (None, ""):
         return None
@@ -255,21 +317,7 @@ def _team_name_initials(team_name: str | None) -> str:
 def _team_matches(
     query: str | None, team_name: str | None, team_abbr: str | None
 ) -> bool:
-    if not query:
-        return False
-    query_norm = _normalize_text(query)
-    if not query_norm:
-        return False
-    name_norm = _normalize_text(team_name)
-    abbr_norm = _normalize_text(team_abbr)
-    return (
-        query_norm == name_norm
-        or query_norm == abbr_norm
-        or query_norm in name_norm
-        or name_norm in query_norm
-        or query_norm in abbr_norm
-        or (name_norm and query_norm == _team_name_initials(team_name))
-    )
+    return _side_name_score(query, team_name, team_abbr) >= _NAME_MATCH_THRESHOLD
 
 
 def _matchup_matches(
@@ -310,22 +358,41 @@ def _resolve_pick_side(
     team_hint: str | None = None,
     opponent_hint: str | None = None,
 ) -> str | None:
+    """Map a pick (team/player name, home/away/draw) to a match side.
+
+    Uses fuzzy name matching so settlement works across sports when the book
+    name differs slightly from SofaScore/ESPN (accents, initials, last name).
+    """
     pick_clean = _strip_spread_from_pick(pick)
     pick_norm = _normalize_text(pick_clean)
     if pick_norm in {"home", "away", "draw", "tie"}:
         return "draw" if pick_norm == "tie" else pick_norm
-    if _team_matches(pick_clean, event.get("home_team"), event.get("home_abbr")):
-        return "home"
-    if _team_matches(pick_clean, event.get("away_team"), event.get("away_abbr")):
-        return "away"
+
+    home_score = _side_name_score(
+        pick_clean, event.get("home_team"), event.get("home_abbr")
+    )
+    away_score = _side_name_score(
+        pick_clean, event.get("away_team"), event.get("away_abbr")
+    )
+
+    if (
+        home_score >= _NAME_MATCH_THRESHOLD or away_score >= _NAME_MATCH_THRESHOLD
+    ) and home_score != away_score:
+        return "home" if home_score > away_score else "away"
 
     for hint in (team_hint, opponent_hint):
-        if not hint or not _team_matches(pick_clean, hint, None):
+        if not hint or _side_name_score(pick_clean, hint, None) < _NAME_MATCH_THRESHOLD:
             continue
-        if _team_matches(hint, event.get("home_team"), event.get("home_abbr")):
-            return "home"
-        if _team_matches(hint, event.get("away_team"), event.get("away_abbr")):
-            return "away"
+        hint_home = _side_name_score(
+            hint, event.get("home_team"), event.get("home_abbr")
+        )
+        hint_away = _side_name_score(
+            hint, event.get("away_team"), event.get("away_abbr")
+        )
+        if (
+            hint_home >= _NAME_MATCH_THRESHOLD or hint_away >= _NAME_MATCH_THRESHOLD
+        ) and hint_home != hint_away:
+            return "home" if hint_home > hint_away else "away"
 
     return None
 

@@ -11,6 +11,7 @@
     "tennis": [
       {"id": 3, "name": "ATP"},
       {"id": 6, "name": "WTA"},
+      {"id": 871, "name": "WTA 125"},
       {"id": 72, "name": "Challenger"},
       {"id": 785, "name": "ITF Men"},
       {"id": 213, "name": "ITF Women"}
