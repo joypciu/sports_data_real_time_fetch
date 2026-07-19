@@ -1193,9 +1193,11 @@ def _evaluate_market(
             result = both_scored if pick_norm == "yes" else not both_scored
             outcome = "win" if result else "loss"
 
-    elif market_norm == "team_total":
-        # Full-game team points over/under. Target team from team_hint (preferred)
-        # or embedded in pick; direction must be over/under.
+    elif market_norm == "team_total" and _normalize_text(
+        str(event.get("sport") or "")
+    ) in {"basketball", "nba", "wnba"}:
+        # Basketball-only full-game team points over/under. Other sports keep
+        # their existing period/specialty settlement paths.
         ou = pick_norm
         hint = team_hint
         if ou not in {"over", "under"}:
