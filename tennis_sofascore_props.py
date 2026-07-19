@@ -36,7 +36,7 @@ import sofascore_db
 import sofascore_live_lookup
 
 # ---------------------------------------------------------------------------
-# Market map  (scope: full | s1 | s2,  market_type: internal key)
+# Market map  (scope: full | s1 | s2 | s3,  market_type: internal key)
 # ---------------------------------------------------------------------------
 
 TENNIS_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
@@ -59,6 +59,8 @@ TENNIS_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
     # 2nd set
     "2nd_set_moneyline": ("s2", "moneyline"),
     "2nd_set_total_games": ("s2", "total_games"),
+    # 3rd set
+    "3rd_set_total_games": ("s3", "total_games"),
 }
 
 # ---------------------------------------------------------------------------
@@ -351,12 +353,33 @@ def prop_check(
     a_games_total = scores["away_games_total"]
 
     # Per-set scores for scoped markets
-    _scope_period = {"s1": 1, "s2": 2}
+    _scope_period = {"s1": 1, "s2": 2, "s3": 3}
     period_num = _scope_period.get(scope)
     if period_num is not None:
         h_set_g, a_set_g = periods.get(period_num, (0, 0))
     else:
         h_set_g, a_set_g = 0, 0
+
+    # A third-set market has no action when a completed match ended in two sets.
+    if scope == "s3" and finished and period_num not in periods:
+        return {
+            "found": True,
+            "market": market_norm,
+            "market_type": market_type,
+            "scope": scope,
+            "stat_value": None,
+            "match_id": match_id,
+            "game_status": "Final",
+            "settled": True,
+            "finished": True,
+            "void": True,
+            "home_team": home_name,
+            "away_team": away_name,
+            "home_sets": h_sets,
+            "away_sets": a_sets,
+            "source": source,
+            "note": "Third set was not played — bet voided.",
+        }
 
     # --- compute stat_value -----------------------------------------------
     stat_value: float | int | None = None
