@@ -22,6 +22,7 @@ _LOOKUP_BUDGET_SEC = float(os.environ.get("SOFASCORE_SETTLEMENT_LOOKUP_BUDGET", 
 _BASEBALL_TOURNAMENT_ID = 11205
 
 _FINISHED_DESCRIPTIONS = frozenset({"ended", "finished", "aet", "aot", "ap"})
+_CANCELED_STATUSES = frozenset({"canceled", "cancelled"})
 
 
 def event_is_finished(event: dict[str, Any]) -> bool:
@@ -31,9 +32,17 @@ def event_is_finished(event: dict[str, Any]) -> bool:
     return status_type == "finished" or description in _FINISHED_DESCRIPTIONS
 
 
+def event_is_canceled(event: dict[str, Any]) -> bool:
+    """True when the event was canceled before play (no contest → void)."""
+    status_obj = event.get("status") or {}
+    status_type = str(status_obj.get("type") or "").lower()
+    description = str(status_obj.get("description") or "").lower()
+    return status_type in _CANCELED_STATUSES or description in _CANCELED_STATUSES
+
+
 def needs_status_refresh(event: dict[str, Any]) -> bool:
     """True when cached event status/scores may be stale and /event/{id} should be rechecked."""
-    if event_is_finished(event):
+    if event_is_finished(event) or event_is_canceled(event):
         return False
 
     status_type = str((event.get("status") or {}).get("type") or "").lower()

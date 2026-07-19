@@ -351,6 +351,42 @@ def _strip_spread_from_pick(pick: str) -> str:
     return m.group("team").strip() if m else pick.strip()
 
 
+def _result_is_void(result: dict[str, Any]) -> bool:
+    """True when a prop_check result signals a no-contest (canceled) event."""
+    return bool(result.get("void")) or str(
+        result.get("game_status") or ""
+    ).lower() in {"canceled", "cancelled"}
+
+
+def _canceled_void_response(
+    market_norm: str,
+    pick: str,
+    line: Any,
+    result: dict[str, Any],
+    default_source: str,
+) -> JSONResponse:
+    """Standard settlement response for a canceled event: outcome=void, settled."""
+    return JSONResponse(
+        status_code=200,
+        content={
+            "found": True,
+            "market": market_norm,
+            "pick": pick,
+            "line": line,
+            "result": None,
+            "stat_value": None,
+            "outcome": "void",
+            "settled": True,
+            "source": result.get("source", default_source),
+            "match_id": result.get("match_id"),
+            "game_status": result.get("game_status", "Canceled"),
+            "home_score": result.get("home_score", result.get("home_sets")),
+            "away_score": result.get("away_score", result.get("away_sets")),
+            "note": result.get("note") or "Match canceled — bet voided.",
+        },
+    )
+
+
 def _resolve_pick_side(
     pick: str,
     event: dict[str, Any],
@@ -1978,6 +2014,10 @@ def stats_market_check(
             line=line,
         )
         if result.get("found"):
+            if _result_is_void(result):
+                return _canceled_void_response(
+                    market_norm, pick, line, result, "sofascore_baseball"
+                )
             stat_value = result["stat_value"]
             settled = result["settled"]
             event: dict[str, Any] = {}
@@ -2036,6 +2076,10 @@ def stats_market_check(
         )
 
         if sofa_result.get("found"):
+            if _result_is_void(sofa_result):
+                return _canceled_void_response(
+                    market_norm, pick, line, sofa_result, "sofascore"
+                )
             stat_value = sofa_result["stat_value"]
             settled = sofa_result.get("settled", False)
             _, sofa_market_type = sofa_entry
@@ -2238,6 +2282,11 @@ def stats_market_check(
         )
 
         if tennis_result.get("found"):
+            if _result_is_void(tennis_result):
+                return _canceled_void_response(
+                    market_norm, pick, line, tennis_result, "sofascore_tennis"
+                )
+
             stat_value = tennis_result["stat_value"]
             settled = tennis_result.get("settled", False)
             _, tennis_market_type = tennis_entry
@@ -2365,6 +2414,10 @@ def stats_market_check(
         )
 
         if hockey_result.get("found"):
+            if _result_is_void(hockey_result):
+                return _canceled_void_response(
+                    market_norm, pick, line, hockey_result, "sofascore_hockey"
+                )
             stat_value = hockey_result["stat_value"]
             settled = hockey_result.get("settled", False)
             _, hockey_market_type = hockey_entry
@@ -4165,6 +4218,28 @@ def stats_prop_check(
             line=line,
         )
         if tresult.get("found"):
+            if _result_is_void(tresult):
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "found": True,
+                        "player": player,
+                        "market": market_norm,
+                        "pick": pick_norm,
+                        "line": line,
+                        "stat_value": None,
+                        "outcome": "void",
+                        "settled": True,
+                        "source": tresult.get("source", "sofascore_tennis"),
+                        "match_id": tresult.get("match_id"),
+                        "game_status": tresult.get("game_status", "Canceled"),
+                        "home_score": tresult.get("home_sets"),
+                        "away_score": tresult.get("away_sets"),
+                        "note": tresult.get("note")
+                        or "Match canceled — bet voided.",
+                        "espn_limitation": False,
+                    },
+                )
             stat_value = tresult["stat_value"]
             settled = tresult.get("settled", False)
             outcome = "pending"
@@ -4231,6 +4306,28 @@ def stats_prop_check(
             line=line,
         )
         if hpresult.get("found"):
+            if _result_is_void(hpresult):
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "found": True,
+                        "player": player,
+                        "market": market_norm,
+                        "pick": pick_norm,
+                        "line": line,
+                        "stat_value": None,
+                        "outcome": "void",
+                        "settled": True,
+                        "source": hpresult.get("source", "sofascore_hockey"),
+                        "match_id": hpresult.get("match_id"),
+                        "game_status": hpresult.get("game_status", "Canceled"),
+                        "home_score": hpresult.get("home_score"),
+                        "away_score": hpresult.get("away_score"),
+                        "note": hpresult.get("note")
+                        or "Match canceled — bet voided.",
+                        "espn_limitation": False,
+                    },
+                )
             stat_value = hpresult["stat_value"]
             settled = hpresult.get("settled", False)
             outcome = "pending"

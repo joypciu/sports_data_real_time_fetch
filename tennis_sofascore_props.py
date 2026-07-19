@@ -143,6 +143,7 @@ def find_match(
         return None, source
 
     finished = sofascore_live_lookup.event_is_finished(best)
+    canceled = sofascore_live_lookup.event_is_canceled(best)
 
     return {
         "match_id": best.get("id"),
@@ -152,6 +153,7 @@ def find_match(
         "away_score_raw": best.get("awayScore") or {},
         "status_type": str((best.get("status") or {}).get("type") or "").lower(),
         "finished": finished,
+        "canceled": canceled,
     }, source
 
 
@@ -312,6 +314,28 @@ def prop_check(
     home_name = match_info["home_team"]
     away_name = match_info["away_team"]
     finished = match_info["finished"]
+    canceled = bool(match_info.get("canceled"))
+
+    # Canceled before play: no contest. Settlement treats this as void.
+    if canceled:
+        return {
+            "found": True,
+            "market": market_norm,
+            "market_type": market_type,
+            "scope": scope,
+            "stat_value": None,
+            "match_id": match_id,
+            "game_status": "Canceled",
+            "settled": True,
+            "finished": False,
+            "void": True,
+            "home_team": home_name,
+            "away_team": away_name,
+            "home_sets": None,
+            "away_sets": None,
+            "source": source,
+            "note": "Match canceled — bet voided.",
+        }
 
     # --- parse scores ------------------------------------------------------
     scores = _tennis_scores(
