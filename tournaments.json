@@ -5,7 +5,8 @@
     "football": ["US", "EN"],
     "tennis": ["US", "EN"],
     "ice-hockey": ["US", "CA"],
-    "baseball": ["US"]
+    "baseball": ["US"],
+    "basketball": ["US"]
   },
   "category_scheduled_events": {
     "tennis": [
@@ -63,7 +64,7 @@
       {"id": 17188, "name": "ECHL"},
       {"id": 97, "name": "SHL"},
       {"id": 135, "name": "Liiga"},
-      {"id": 132, "name": "Czech Extraliga"},
+      {"id": 237, "name": "Czech Extraliga"},
       {"id": 134, "name": "DEL"},
       {"id": 141, "name": "National League (Switzerland)"},
       {"id": 268, "name": "KHL"},
@@ -71,6 +72,10 @@
     ],
     "baseball": [
       {"id": 11205, "name": "MLB"}
+    ],
+    "basketball": [
+      {"id": 132, "name": "NBA"},
+      {"id": 486, "name": "WNBA"}
     ]
   }
 }

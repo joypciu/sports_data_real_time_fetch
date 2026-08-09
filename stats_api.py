@@ -2473,6 +2473,233 @@ def stats_market_check(
             )
         # SofaScore tennis match not found — fall through to DuckDB resolution
 
+    # ── Basketball (NBA/WNBA) market check via SofaScore ─────────────────────
+    import basketball_sofascore_props as _bbsofa
+
+    basketball_entry = _bbsofa.BASKETBALL_PROP_STAT_MAP.get(market_norm)
+    if (
+        sport_norm in ("basketball", "nba", "wnba")
+        and basketball_entry is not None
+    ):
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to settle basketball market via SofaScore.",
+            )
+
+        basketball_result = _bbsofa.prop_check(
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team,
+            opponent=opponent,
+            selection=player or pick,
+            pick=pick_norm,
+            line=line,
+        )
+
+        if basketball_result.get("found"):
+            if _result_is_void(basketball_result):
+                return _canceled_void_response(
+                    market_norm, pick, line, basketball_result, "sofascore_basketball"
+                )
+            stat_value = basketball_result["stat_value"]
+            settled = basketball_result.get("settled", False)
+            _, basketball_market_type = basketball_entry
+            outcome = "pending"
+            result_bool: bool | None = None
+
+            mini_event = {
+                "home_team": basketball_result.get("home_team", ""),
+                "away_team": basketball_result.get("away_team", ""),
+            }
+
+            if basketball_market_type == "moneyline":
+                side = _resolve_pick_side(pick, mini_event)
+                if side == "home":
+                    result_bool = stat_value > 0
+                elif side == "away":
+                    result_bool = stat_value < 0
+                elif side == "draw":
+                    result_bool = stat_value == 0
+                else:
+                    result_bool = None
+                if result_bool is True:
+                    outcome = "win"
+                elif result_bool is False:
+                    outcome = "loss"
+
+            elif basketball_market_type == "point_spread":
+                side = _resolve_pick_side(pick, mini_event)
+                if side not in {"home", "away"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="For point spread, pick must be home, away, or a matching team name",
+                    )
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="line is required for point spread market",
+                    )
+                effective = stat_value if side == "home" else -stat_value
+                adjusted = effective + line
+                if adjusted > 0:
+                    outcome, result_bool = "win", True
+                elif adjusted < 0:
+                    outcome, result_bool = "loss", False
+                else:
+                    outcome, result_bool = "push", None
+
+            elif basketball_market_type in ("total_points", "team_total"):
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            elif basketball_market_type == "odd_even":
+                p = pick_norm
+                if p in ("odd", "over"):
+                    p = "odd"
+                elif p in ("even", "under"):
+                    p = "even"
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be odd/even for market '{market_norm}'",
+                    )
+                is_odd = bool(stat_value)
+                result_bool = (p == "odd") == is_odd
+                outcome = "win" if result_bool else "loss"
+
+            elif basketball_market_type == "overtime":
+                p = pick_norm
+                if p in ("yes", "over"):
+                    result_bool = bool(stat_value)
+                elif p in ("no", "under"):
+                    result_bool = not bool(stat_value)
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be yes/no for market '{market_norm}'",
+                    )
+                outcome = "win" if result_bool else "loss"
+
+            elif basketball_market_type == "team_first_basket":
+                side = _resolve_pick_side(pick, mini_event)
+                first_side = str(stat_value or "").lower()
+                if side in {"home", "away"}:
+                    result_bool = side == first_side
+                else:
+                    result_bool = False
+                outcome = "win" if result_bool else "loss"
+
+            elif basketball_market_type in ("first_basket_fg", "first_basket_any"):
+                result_bool = bool(stat_value)
+                outcome = "win" if result_bool else "loss"
+
+            elif basketball_market_type == "player_points":
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            elif basketball_market_type in (
+                "player_box_points",
+                "player_rebounds",
+                "player_assists",
+                "player_threes",
+                "player_steals",
+                "player_blocks",
+                "player_turnovers",
+                "player_minutes",
+                "player_fg_made",
+                "player_ft_made",
+                "player_pra",
+                "player_pr",
+                "player_pa",
+                "player_ra",
+            ):
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+                result_bool = (outcome == "win") if outcome != "push" else None
+
+            elif basketball_market_type in (
+                "player_double_double",
+                "player_triple_double",
+            ):
+                p = pick_norm
+                if p in ("yes", "over"):
+                    result_bool = bool(stat_value)
+                elif p in ("no", "under"):
+                    result_bool = not bool(stat_value)
+                else:
+                    result_bool = bool(stat_value)
+                outcome = "win" if result_bool else "loss"
+
+            outcome, result_bool = _finalize_settlement_outcome(
+                outcome, result_bool, settled
+            )
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "market": market_norm,
+                    "pick": pick,
+                    "line": line,
+                    "result": result_bool,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": basketball_result.get("source", "sofascore_basketball"),
+                    "match_id": basketball_result.get("match_id"),
+                    "game_status": basketball_result.get("game_status"),
+                    "home_score": basketball_result.get("home_score"),
+                    "away_score": basketball_result.get("away_score"),
+                    "had_ot": basketball_result.get("had_ot"),
+                },
+            )
+        # SofaScore basketball match not found — fall through to DataBallr / ESPN
+
     # ── Hockey market check via SofaScore ────────────────────────────────────
     import hockey_sofascore_props as _hsofa
 
@@ -4444,6 +4671,122 @@ def stats_prop_check(
                     "home_score": hpresult.get("home_score"),
                     "away_score": hpresult.get("away_score"),
                     "had_ot": hpresult.get("had_ot"),
+                    "espn_limitation": False,
+                },
+            )
+        # Match or player not found — fall through to ESPN
+
+    # ── 1d. Basketball player props via SofaScore (NBA/WNBA) ───────────────
+    _BASKETBALL_PLAYER_PROP_MARKETS = {
+        "player_points",
+        "player_rebounds",
+        "player_assists",
+        "player_threes",
+        "player_made_threes",
+        "player_3pm",
+        "player_steals",
+        "player_blocks",
+        "player_turnovers",
+        "player_minutes",
+        "player_fg_made",
+        "player_ft_made",
+        "player_points_rebounds_assists",
+        "player_points_rebounds",
+        "player_points_assists",
+        "player_rebounds_assists",
+        "player_double_double",
+        "player_triple_double",
+    }
+    _sport_for_bball = _normalize_text(sport or "")
+    if market_norm in _BASKETBALL_PLAYER_PROP_MARKETS and _sport_for_bball in (
+        "basketball",
+        "nba",
+        "wnba",
+    ):
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to settle basketball player prop via SofaScore.",
+            )
+        import basketball_sofascore_props as _bbsofa_prop
+
+        bpresult = _bbsofa_prop.prop_check(
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team,
+            opponent=opponent,
+            selection=player,
+            pick=pick_norm,
+            line=line,
+        )
+        if bpresult.get("found"):
+            if _result_is_void(bpresult):
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "found": True,
+                        "player": player,
+                        "market": market_norm,
+                        "pick": pick_norm,
+                        "line": line,
+                        "stat_value": None,
+                        "outcome": "void",
+                        "settled": True,
+                        "source": bpresult.get("source", "sofascore_basketball"),
+                        "match_id": bpresult.get("match_id"),
+                        "game_status": bpresult.get("game_status", "Canceled"),
+                        "home_score": bpresult.get("home_score"),
+                        "away_score": bpresult.get("away_score"),
+                        "note": bpresult.get("note")
+                        or "Match canceled — bet voided.",
+                        "espn_limitation": False,
+                    },
+                )
+            stat_value = bpresult["stat_value"]
+            settled = bpresult.get("settled", False)
+            outcome = "pending"
+            bb_type = bpresult.get("market_type") or ""
+            if settled and stat_value is not None:
+                if bb_type in ("player_double_double", "player_triple_double"):
+                    if pick_norm in ("yes", "over"):
+                        outcome = "win" if bool(stat_value) else "loss"
+                    elif pick_norm in ("no", "under"):
+                        outcome = "win" if not bool(stat_value) else "loss"
+                    else:
+                        outcome = "win" if bool(stat_value) else "loss"
+                elif line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'.",
+                    )
+                elif pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'.",
+                    )
+                elif stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                else:
+                    outcome = "push"
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "player": player,
+                    "market": market_norm,
+                    "pick": pick_norm,
+                    "line": line,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": bpresult.get("source", "sofascore_basketball"),
+                    "match_id": bpresult.get("match_id"),
+                    "game_status": bpresult.get("game_status"),
+                    "home_score": bpresult.get("home_score"),
+                    "away_score": bpresult.get("away_score"),
+                    "had_ot": bpresult.get("had_ot"),
                     "espn_limitation": False,
                 },
             )

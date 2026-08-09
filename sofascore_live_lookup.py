@@ -20,6 +20,7 @@ import sofascore_tournaments
 _LOOKUP_BUDGET_SEC = float(os.environ.get("SOFASCORE_SETTLEMENT_LOOKUP_BUDGET", "10.0"))
 
 _BASEBALL_TOURNAMENT_ID = 11205
+_BASKETBALL_TOURNAMENT_IDS = (132, 486)  # NBA, WNBA
 
 _FINISHED_DESCRIPTIONS = frozenset({"ended", "finished", "aet", "aot", "ap"})
 _CANCELED_STATUSES = frozenset({"canceled", "cancelled"})
@@ -178,6 +179,11 @@ def _category_sources(sport: str) -> list[tuple[str, int]]:
 def _iter_lookup_sources(sport: str) -> list[tuple[str, int]]:
     if sport == "baseball":
         return [("tournament", _BASEBALL_TOURNAMENT_ID)]
+    if sport == "basketball":
+        static = _static_tournament_sources(sport)
+        if static:
+            return static
+        return [("tournament", tid) for tid in _BASKETBALL_TOURNAMENT_IDS]
     if sport == "tennis":
         return _category_sources(sport)
     return _static_tournament_sources(sport)

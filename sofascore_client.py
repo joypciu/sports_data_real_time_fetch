@@ -123,6 +123,11 @@ _SPORT_PATHS = {
     "football": "football",
     "hockey": "ice-hockey",
     "ice-hockey": "ice-hockey",
+    "basketball": "basketball",
+    "nba": "basketball",
+    "wnba": "basketball",
+    "baseball": "baseball",
+    "mlb": "baseball",
 }
 
 # One scraper session per ingest run (set by sofascore_ingest).

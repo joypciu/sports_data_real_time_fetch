@@ -20,12 +20,15 @@ SPORTS = {
     "ice-hockey": {"statistics": False, "incidents": True, "lineups": True},
     "tennis": {"statistics": False, "incidents": False, "lineups": False},
     "baseball": {"statistics": False, "incidents": False, "lineups": True},
+    "basketball": {"statistics": False, "incidents": True, "lineups": True},
 }
 
 _SPORT_ALIASES: dict[str, str] = {
     "mlb": "baseball",
     "soccer": "football",
     "hockey": "ice-hockey",
+    "nba": "basketball",
+    "wnba": "basketball",
 }
 
 
@@ -37,7 +40,10 @@ def _resolve_sports_filter(sports: list[str] | None) -> dict[str, dict[str, bool
         key = _SPORT_ALIASES.get(raw.strip().lower(), raw.strip().lower())
         if key not in SPORTS:
             valid = ", ".join(sorted(SPORTS))
-            raise ValueError(f"Unknown sport '{raw}'. Valid: {valid} (aliases: mlb, soccer, hockey)")
+            raise ValueError(
+                f"Unknown sport '{raw}'. Valid: {valid} "
+                "(aliases: mlb, soccer, hockey, nba, wnba)"
+            )
         selected[key] = SPORTS[key]
     return selected
 
@@ -391,8 +397,8 @@ if __name__ == "__main__":
         metavar="SPORT",
         help=(
             "Ingest only this sport (repeatable). "
-            "Values: football, tennis, ice-hockey, baseball. "
-            "Aliases: soccer, hockey, mlb."
+            "Values: football, tennis, ice-hockey, baseball, basketball. "
+            "Aliases: soccer, hockey, mlb, nba, wnba."
         ),
     )
     args = parser.parse_args()
