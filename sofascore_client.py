@@ -34,11 +34,13 @@ _SETTLEMENT_READ_TIMEOUT = float(os.environ.get("SOFASCORE_SETTLEMENT_READ_TIMEO
 _INGEST_BATCH_DELAY = float(os.environ.get("SOFASCORE_INGEST_BATCH_DELAY", "2.0"))
 _DETAIL_DELAY = float(os.environ.get("SOFASCORE_DETAIL_DELAY", "0.8"))
 
+# Safari fingerprints currently clear SofaScore's Cloudflare challenge from
+# this network; Chrome profiles return {"error":{"code":403,"reason":"challenge"}}.
 _IMPERSONATE_PROFILES = [
     p.strip()
     for p in os.environ.get(
         "SOFASCORE_IMPERSONATE_LIST",
-        "chrome131,chrome124,chrome120,chrome110",
+        "safari180,safari184,chrome136,chrome131,chrome124",
     ).split(",")
     if p.strip()
 ]
