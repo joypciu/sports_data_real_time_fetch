@@ -82,6 +82,7 @@ BASEBALL_PROP_STAT_MAP: dict[str, tuple[Any, str]] = {
     "player_strikeouts": (None, "player_strikeouts"),
     "player_earned_runs": (None, "player_earned_runs"),
     "player_outs": (None, "player_outs"),
+    "first_team_to_score": ("game", "first_team_to_score"),
 }
 
 _PLAYER_BATTING_FIELDS: dict[str, str] = {
@@ -351,6 +352,8 @@ def prop_check(
         "game_status": game_status,
         "home_score": home_total,
         "away_score": away_total,
+        "home_team": match_info["home_team"],
+        "away_team": match_info["away_team"],
         "settled": settled,
         "source": source,
     }
@@ -481,6 +484,34 @@ def prop_check(
             "player": matched,
             "stat_value": float(stat_value),
             "stat_key": _PLAYER_PITCHING_FIELDS[market_type],
+            **base,
+        }
+
+    if market_type == "first_team_to_score":
+        first_side: str | None = None
+        for inning_idx in range(12):
+            h_inn, a_inn = _inning_runs(home_score, away_score, inning_idx)
+            if a_inn > 0:
+                first_side = "away"
+                break
+            if h_inn > 0:
+                first_side = "home"
+                break
+        if first_side is None:
+            if settled:
+                return {
+                    "found": True,
+                    "stat_value": None,
+                    "void": True,
+                    "note": "No team scored — bet voided.",
+                    **base,
+                }
+            return {"found": True, "stat_value": None, **base}
+        return {
+            "found": True,
+            "stat_value": 1.0 if first_side == "home" else 0.0,
+            "home_team": match_info["home_team"],
+            "away_team": match_info["away_team"],
             **base,
         }
 

@@ -60,8 +60,29 @@ TENNIS_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
     "2nd_set_moneyline": ("s2", "moneyline"),
     "2nd_set_total_games": ("s2", "total_games"),
     # 3rd set
+    "3rd_set_moneyline": ("s3", "moneyline"),
     "3rd_set_total_games": ("s3", "total_games"),
 }
+
+_SET_ORDINAL = {"1st": 1, "2nd": 2, "3rd": 3, "4th": 4, "5th": 5}
+_GAME_MONEYLINE_RE = re.compile(
+    r"^(?P<set>1st|2nd|3rd|4th|5th)_set_game_(?P<game>\d+)_moneyline$"
+)
+
+
+def resolve_tennis_market(market_norm: str) -> tuple[str, str, int | None] | None:
+    """Return (scope, market_type, game_number) or None. Game number only for per-game ML."""
+    entry = TENNIS_PROP_STAT_MAP.get(market_norm)
+    if entry:
+        return entry[0], entry[1], None
+    m = _GAME_MONEYLINE_RE.match(market_norm)
+    if not m:
+        return None
+    set_n = _SET_ORDINAL[m.group("set")]
+    game_n = int(m.group("game"))
+    if game_n < 1 or game_n > 20:
+        return None
+    return f"s{set_n}", "game_moneyline", game_n
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -233,6 +254,76 @@ def _set_had_tiebreak(h_games: int, a_games: int) -> bool:
     return (h_games == 7 and a_games == 6) or (h_games == 6 and a_games == 7)
 
 
+def _game_winner_from_pbp(
+    payload: dict[str, Any],
+    set_n: int,
+    game_n: int,
+) -> int | None:
+    """
+    Return 1 if home won the game, 2 if away won, None if unknown/not played.
+    Parses SofaScore /event/{id}/point-by-point payloads.
+    """
+    blocks = (
+        payload.get("pointByPoint")
+        or payload.get("sets")
+        or payload.get("pointByPointSets")
+        or []
+    )
+    if not isinstance(blocks, list):
+        return None
+    games: list[Any] | None = None
+    for idx, block in enumerate(blocks, start=1):
+        if not isinstance(block, dict):
+            continue
+        raw_set = block.get("set") or block.get("setNumber") or block.get("ordinal") or idx
+        try:
+            this_set = int(raw_set)
+        except (TypeError, ValueError):
+            this_set = idx
+        if this_set != set_n:
+            continue
+        games = block.get("games") or block.get("game") or []
+        break
+    if not isinstance(games, list) or game_n < 1 or game_n > len(games):
+        return None
+    game = games[game_n - 1]
+    if not isinstance(game, dict):
+        return None
+    winner = game.get("winner") or game.get("winnerCode") or game.get("scoringPlayer")
+    try:
+        if winner is not None and int(winner) in (1, 2):
+            return int(winner)
+    except (TypeError, ValueError):
+        pass
+    score = str(game.get("score") or game.get("result") or "")
+    if ":" in score:
+        left, right = score.split(":", 1)
+        try:
+            hv, av = int(left.strip()), int(right.strip())
+            if hv > av:
+                return 1
+            if av > hv:
+                return 2
+        except ValueError:
+            pass
+    h_g = game.get("homeScore") or game.get("home")
+    a_g = game.get("awayScore") or game.get("away")
+    if isinstance(h_g, dict):
+        h_g = h_g.get("current") or h_g.get("score")
+    if isinstance(a_g, dict):
+        a_g = a_g.get("current") or a_g.get("score")
+    try:
+        if h_g is not None and a_g is not None:
+            hv, av = int(h_g), int(a_g)
+            if hv > av:
+                return 1
+            if av > hv:
+                return 2
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -284,15 +375,15 @@ def prop_check(
     tiebreak      : 1 = tiebreak occurred, 0 = no tiebreak
     """
     market_norm = market.strip().lower().replace(" ", "_")
-    entry = TENNIS_PROP_STAT_MAP.get(market_norm)
-    if not entry:
+    resolved = resolve_tennis_market(market_norm)
+    if not resolved:
         return {
             "found": False,
             "note": f"Market '{market_norm}' not in TENNIS_PROP_STAT_MAP.",
             "source": "sofascore_tennis",
         }
 
-    scope, market_type = entry
+    scope, market_type, game_number = resolved
 
     # --- locate the match --------------------------------------------------
     match_info, source = find_match(
@@ -470,6 +561,70 @@ def prop_check(
         else:
             h_g, a_g = periods[period_num]
             stat_value = 1 if _set_had_tiebreak(h_g, a_g) else 0
+
+    elif market_type == "game_moneyline":
+        if period_num is None or game_number is None:
+            return {
+                "found": False,
+                "match_id": match_id,
+                "settled": finished,
+                "note": "game moneyline requires a set scope and game number.",
+                "source": "sofascore_tennis",
+            }
+        if finished and period_num not in periods:
+            return {
+                "found": True,
+                "market": market_norm,
+                "market_type": market_type,
+                "scope": scope,
+                "stat_value": None,
+                "match_id": match_id,
+                "game_status": "Final",
+                "settled": True,
+                "finished": True,
+                "void": True,
+                "home_team": home_name,
+                "away_team": away_name,
+                "home_sets": h_sets,
+                "away_sets": a_sets,
+                "source": source,
+                "note": f"Set {period_num} was not played — bet voided.",
+            }
+        pbp = sofascore_live_lookup.fetch_event_detail(
+            str(match_id), "point-by-point", allow_live=allow_live
+        ) or {}
+        winner = _game_winner_from_pbp(pbp, period_num, game_number)
+        if winner == 1:
+            stat_value = 1.0
+        elif winner == 2:
+            stat_value = 0.0
+        else:
+            games_in_set = (h_set_g + a_set_g) if period_num in periods else 0
+            # Only void when this set clearly never reached that game.
+            if finished and games_in_set < game_number:
+                return {
+                    "found": True,
+                    "market": market_norm,
+                    "market_type": market_type,
+                    "scope": scope,
+                    "stat_value": None,
+                    "match_id": match_id,
+                    "game_status": "Final",
+                    "settled": True,
+                    "finished": True,
+                    "void": True,
+                    "home_team": home_name,
+                    "away_team": away_name,
+                    "home_sets": h_sets,
+                    "away_sets": a_sets,
+                    "source": source,
+                    "note": (
+                        f"Game {game_number} of set {period_num} was not played "
+                        f"(set score {h_set_g}-{a_set_g}) — bet voided."
+                    ),
+                }
+            # Set was long enough that the game existed; PBP missing/unparsed.
+            stat_value = None
 
     else:
         return {

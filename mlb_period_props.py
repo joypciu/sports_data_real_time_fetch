@@ -84,6 +84,7 @@ PERIOD_PROP_STAT_MAP: dict[str, tuple] = {
     "player_bases": (None, "player_bases"),  # total bases
     "player_singles": (None, "player_singles"),
     "player_hits_runs_rbis": (None, "player_hits_runs_rbis"),
+    "first_team_to_score": ("game", "first_team_to_score"),
 }
 
 

@@ -1815,7 +1815,7 @@ def stats_live(
 
 
 _MLB_PERIOD_MARKET_TYPES = frozenset(
-    {"total_runs", "moneyline", "run_line", "team_total", "odd_even"}
+    {"total_runs", "moneyline", "run_line", "team_total", "odd_even", "first_team_to_score"}
 )
 
 
@@ -2027,6 +2027,20 @@ def _evaluate_mlb_period_market(
         else:
             outcome = "loss"
         result_bool = outcome == "win"
+    elif mlb_market_type == "first_team_to_score":
+        side = _resolve_pick_side(pick, event)
+        if side == "home":
+            result_bool = stat_value == 1.0
+        elif side == "away":
+            result_bool = stat_value == 0.0
+        else:
+            result_bool = None
+        if result_bool is True:
+            outcome = "win"
+        elif result_bool is False:
+            outcome = "loss"
+        else:
+            outcome = "pending"
     else:
         outcome = "pending"
     return outcome, result_bool
@@ -2104,7 +2118,10 @@ def stats_market_check(
                 )
             stat_value = result["stat_value"]
             settled = result["settled"]
-            event: dict[str, Any] = {}
+            event: dict[str, Any] = {
+                "home_team": result.get("home_team") or "",
+                "away_team": result.get("away_team") or "",
+            }
             outcome, result_bool = _evaluate_mlb_period_market(
                 mlb_market_type=mlb_market_type,
                 stat_value=stat_value,
@@ -2251,6 +2268,9 @@ def stats_market_check(
                 "total_corners",
                 "team_total_goals",
                 "team_total_corners",
+                "team_total_cards",
+                "total_card_points",
+                "team_total_shots",
             ):
                 if line is None:
                     raise HTTPException(
@@ -2319,6 +2339,27 @@ def stats_market_check(
                 result_bool = bool(stat_value)
                 outcome = "win" if result_bool else "loss"
 
+            elif sofa_market_type == "to_advance":
+                if stat_value is None:
+                    result_bool = None
+                    outcome = "pending"
+                else:
+                    mini_event = {
+                        "home_team": sofa_result.get("home_team", ""),
+                        "away_team": sofa_result.get("away_team", ""),
+                    }
+                    side = _resolve_pick_side(pick, mini_event)
+                    if side == "home":
+                        result_bool = stat_value == 1.0
+                    elif side == "away":
+                        result_bool = stat_value == 0.0
+                    else:
+                        result_bool = None
+                    if result_bool is True:
+                        outcome = "win"
+                    elif result_bool is False:
+                        outcome = "loss"
+
             if not settled:
                 outcome, result_bool = _finalize_settlement_outcome(
                     outcome, result_bool, settled
@@ -2347,7 +2388,10 @@ def stats_market_check(
     # ── Tennis market check via SofaScore ────────────────────────────────────
     import tennis_sofascore_props as _tsofa
 
-    tennis_entry = _tsofa.TENNIS_PROP_STAT_MAP.get(market_norm)
+    tennis_resolved = _tsofa.resolve_tennis_market(market_norm)
+    tennis_entry = None
+    if tennis_resolved:
+        tennis_entry = (tennis_resolved[0], tennis_resolved[1])
     if sport_norm in ("tennis", "atp", "wta", "itf") and tennis_entry is not None:
         if not date:
             raise HTTPException(
@@ -2445,6 +2489,19 @@ def stats_market_check(
                     result_bool = not bool(stat_value)
                 if result_bool is not None:
                     outcome = "win" if result_bool else "loss"
+
+            elif tennis_market_type == "game_moneyline":
+                if stat_value is None:
+                    result_bool = None
+                    outcome = "pending"
+                else:
+                    side = _resolve_pick_side(pick, mini_event)
+                    if side == "home":
+                        result_bool = stat_value == 1.0
+                    elif side == "away":
+                        result_bool = stat_value == 0.0
+                    if result_bool is not None:
+                        outcome = "win" if result_bool else "loss"
 
             outcome, result_bool = _finalize_settlement_outcome(
                 outcome, result_bool, settled
@@ -2911,6 +2968,99 @@ def stats_market_check(
                 },
             )
         # SofaScore hockey match not found — fall through to DuckDB resolution
+
+    # ── American football specialty markets (ESPN scoring plays only) ───────
+    import football_espn_props as _fbespn
+
+    football_type = _fbespn.FOOTBALL_PROP_STAT_MAP.get(market_norm)
+    if sport_norm in _fbespn.FOOTBALL_SPORTS and football_type is not None:
+        if not date:
+            raise HTTPException(
+                status_code=400,
+                detail="Provide date (YYYY-MM-DD) to settle football specialty market.",
+            )
+        fb_result = _fbespn.prop_check(
+            market=market_norm,
+            game_date=_date_only(date),
+            team=team or player,
+            opponent=opponent,
+            pick=pick,
+        )
+        if fb_result.get("found"):
+            if _result_is_void(fb_result):
+                return _canceled_void_response(
+                    market_norm, pick, line, fb_result, "espn_football"
+                )
+            stat_value = fb_result.get("stat_value")
+            settled = bool(fb_result.get("settled"))
+            outcome = "pending"
+            result_bool: bool | None = None
+            mini_event = {
+                "home_team": fb_result.get("home_team", ""),
+                "away_team": fb_result.get("away_team", ""),
+            }
+            if football_type == "first_team_to_score":
+                side = _resolve_pick_side(pick, mini_event)
+                if side == "home":
+                    result_bool = stat_value == 1.0
+                elif side == "away":
+                    result_bool = stat_value == 0.0
+                if result_bool is True:
+                    outcome = "win"
+                elif result_bool is False:
+                    outcome = "loss"
+            else:
+                if line is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"line is required for market '{market_norm}'",
+                    )
+                if pick_norm not in {"over", "under"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"pick must be over/under for market '{market_norm}'",
+                    )
+                if stat_value is None:
+                    outcome, result_bool = "pending", None
+                elif stat_value > line:
+                    outcome = "win" if pick_norm == "over" else "loss"
+                    result_bool = outcome == "win"
+                elif stat_value < line:
+                    outcome = "win" if pick_norm == "under" else "loss"
+                    result_bool = outcome == "win"
+                else:
+                    outcome, result_bool = "push", None
+            outcome, result_bool = _finalize_settlement_outcome(
+                outcome, result_bool, settled
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "found": True,
+                    "market": market_norm,
+                    "pick": pick,
+                    "line": line,
+                    "result": result_bool,
+                    "stat_value": stat_value,
+                    "outcome": outcome,
+                    "settled": settled,
+                    "source": fb_result.get("source", "espn_football"),
+                    "match_id": fb_result.get("match_id"),
+                    "game_status": fb_result.get("game_status"),
+                    "home_team": fb_result.get("home_team"),
+                    "away_team": fb_result.get("away_team"),
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "found": False,
+                "outcome": "pending",
+                "settled": False,
+                "source": "espn_football",
+                "note": fb_result.get("note"),
+            },
+        )
 
     # ── Normal event resolution for non-MLB or MLB not found ─────────────────
     event = _resolve_event(event_id, _date_only(date), sport, team, opponent)

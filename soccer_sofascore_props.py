@@ -60,6 +60,10 @@ SOCCER_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
     "first_goal_scorer":             ("full", "first_goal_scorer"),
     "last_goal_scorer":              ("full", "last_goal_scorer"),
     "anytime_card_receiver":         ("full", "anytime_card_receiver"),
+    "team_total_cards":              ("full", "team_total_cards"),
+    "total_card_points":             ("full", "total_card_points"),
+    "team_total_shots":              ("full", "team_total_shots"),
+    "to_advance":                    ("full", "to_advance"),
     # 1st half
     "1st_half_both_teams_to_score":      ("1h", "btts"),
     "1st_half_draw_bet":                 ("1h", "draw_bet"),
@@ -165,6 +169,7 @@ def find_match(
         "status_type": str((best.get("status") or {}).get("type") or "").lower(),
         "finished": finished,
         "canceled": canceled,
+        "winner_code": best.get("winnerCode"),
     }, source
 
 
@@ -223,6 +228,77 @@ def _get_corners(
     ) or {}
     stats: list[dict] = payload.get("statistics") or []
     return _extract_corners_from_stats(stats)
+
+
+_STAT_NAME_ALIASES: dict[str, frozenset[str]] = {
+    "yellow_cards": frozenset({"yellow cards", "yellow card"}),
+    "red_cards": frozenset({"red cards", "red card"}),
+    "shots": frozenset({"total shots", "shots", "shots total"}),
+}
+
+
+def _extract_named_stat(
+    statistics: list[dict[str, Any]],
+    aliases: frozenset[str],
+) -> dict[str, tuple[int, int]]:
+    period_map = {"ALL": "full", "1ST": "1h", "2ND": "2h"}
+    out: dict[str, tuple[int, int]] = {"full": (0, 0), "1h": (0, 0), "2h": (0, 0)}
+    found = False
+    for period_block in statistics:
+        raw_period = str(period_block.get("period") or "").upper()
+        scope = period_map.get(raw_period)
+        if scope is None:
+            continue
+        for group in period_block.get("groups") or []:
+            for item in group.get("statisticsItems") or []:
+                name = str(item.get("name") or "").lower().strip()
+                if name in aliases:
+                    out[scope] = (_to_int(item.get("home", 0)), _to_int(item.get("away", 0)))
+                    found = True
+    if found and out["2h"] == (0, 0) and out["full"] != (0, 0) and out["1h"] != (0, 0):
+        out["2h"] = (
+            max(0, out["full"][0] - out["1h"][0]),
+            max(0, out["full"][1] - out["1h"][1]),
+        )
+    return out
+
+
+def _get_match_statistics(
+    match_id: int,
+    *,
+    allow_live: bool = True,
+    force_live: bool = False,
+) -> list[dict[str, Any]]:
+    payload = sofascore_live_lookup.fetch_event_detail(
+        str(match_id), "statistics", allow_live=allow_live, force_live=force_live
+    ) or {}
+    return payload.get("statistics") or []
+
+
+def _card_points_from_incidents(incidents: list[dict[str, Any]]) -> tuple[int, int, int, int]:
+    """Return (home_cards, away_cards, home_points, away_points). Yellow=1, red=2."""
+    home_cards = away_cards = home_pts = away_pts = 0
+    for inc in incidents:
+        if str(inc.get("incidentType") or "").lower() != "card":
+            continue
+        cls = str(inc.get("incidentClass") or "").lower().replace(" ", "").replace("_", "")
+        is_home = bool(inc.get("isHome") if inc.get("isHome") is not None else inc.get("home"))
+        side = inc.get("side") or inc.get("teamSide")
+        if side is not None:
+            is_home = str(side).lower() in ("home", "1", "true")
+        if "yellowred" in cls or "secondyellow" in cls:
+            cards, pts = 1, 3
+        elif "red" in cls:
+            cards, pts = 1, 2
+        else:
+            cards, pts = 1, 1
+        if is_home:
+            home_cards += cards
+            home_pts += pts
+        else:
+            away_cards += cards
+            away_pts += pts
+    return home_cards, away_cards, home_pts, away_pts
 
 
 def _get_incidents(match_id: int, *, allow_live: bool = True) -> list[dict[str, Any]]:
@@ -562,6 +638,70 @@ def prop_check(
             stat_value = 1 if last and (
                 target_n == last or target_n in last or last in target_n
             ) else 0
+
+    elif market_type in ("team_total_cards", "total_card_points", "team_total_shots"):
+        stats = _get_match_statistics(
+            match_id,
+            allow_live=allow_live,
+            force_live=refresh_details,
+        )
+        if market_type == "team_total_shots":
+            shots = _extract_named_stat(stats, _STAT_NAME_ALIASES["shots"])
+            hs, aws = shots.get(scope, (0, 0))
+            if not team:
+                return {
+                    "found": False,
+                    "match_id": match_id,
+                    "settled": finished,
+                    "note": "team is required for team_total_shots.",
+                    "source": "sofascore",
+                }
+            is_home = _name_score(team, home_name) >= _name_score(team, away_name)
+            stat_value = hs if is_home else aws
+        else:
+            incidents = _get_incidents(match_id, allow_live=allow_live)
+            h_cards, a_cards, h_pts, a_pts = _card_points_from_incidents(incidents)
+            if h_cards + a_cards == 0:
+                yellow = _extract_named_stat(stats, _STAT_NAME_ALIASES["yellow_cards"])
+                red = _extract_named_stat(stats, _STAT_NAME_ALIASES["red_cards"])
+                hy, ay = yellow.get("full", (0, 0))
+                hr, ar = red.get("full", (0, 0))
+                h_cards, a_cards = hy + hr, ay + ar
+                h_pts, a_pts = hy + 2 * hr, ay + 2 * ar
+            if market_type == "total_card_points":
+                stat_value = h_pts + a_pts
+            else:
+                if not team:
+                    return {
+                        "found": False,
+                        "match_id": match_id,
+                        "settled": finished,
+                        "note": "team is required for team_total_cards.",
+                        "source": "sofascore",
+                    }
+                is_home = _name_score(team, home_name) >= _name_score(team, away_name)
+                stat_value = h_cards if is_home else a_cards
+
+    elif market_type == "to_advance":
+        winner_code = match_info.get("winner_code")
+        agg_h = match_info["home_score_raw"].get("aggregated")
+        agg_a = match_info["away_score_raw"].get("aggregated")
+        if agg_h is not None and agg_a is not None:
+            ah, aa = _to_int(agg_h), _to_int(agg_a)
+            if ah > aa:
+                stat_value = 1.0
+            elif aa > ah:
+                stat_value = 0.0
+            elif winner_code in (1, 2):
+                stat_value = 1.0 if int(winner_code) == 1 else 0.0
+            else:
+                stat_value = None
+        elif winner_code in (1, 2):
+            stat_value = 1.0 if int(winner_code) == 1 else 0.0
+        elif finished and h_full != a_full:
+            stat_value = 1.0 if h_full > a_full else 0.0
+        else:
+            stat_value = None
 
     elif market_type == "anytime_card_receiver":
         target = selection or pick or ""

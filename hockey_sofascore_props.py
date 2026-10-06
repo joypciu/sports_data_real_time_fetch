@@ -95,6 +95,8 @@ HOCKEY_PROP_STAT_MAP: dict[str, tuple[str, str]] = {
     "3rd_period_puck_line": ("p3", "puck_line"),
     "3rd_period_total_goals": ("p3", "total_goals"),
     "3rd_period_total_goals_odd_even": ("p3", "odd_even_goals"),
+    "3rd_period_team_total": ("p3", "team_total_goals"),
+    "team_total_reg_time": ("reg", "team_total_goals"),
 }
 
 # ---------------------------------------------------------------------------
